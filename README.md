@@ -49,10 +49,10 @@ The comparison of the inferred genomic marker effects with known key genome regi
    - Key gene region (tsv)
         - Columns: chromosome number, start location and end location, name and colour
         - Rows: genes
-   - Check the Data folder for the format details
+   - Check the Data folder for more details on formatting and examples
 4. Adjust settings and hyperparameters in the "main" function
    - Check the comments corresponding to each hyperparameter, explaining the meaning of each
-   - Change the value of each hyperparameter based on your prediction tasks and preference on visualisation of cricos plots
+   - Change the value of each hyperparameter based on your prediction tasks and preference on visualisation of circos plots
        - Set target traits, the training-test split ratio, the number of iterations, target populations, dataset name and genomic prediction models to run as the initial setting
        - Change the hyperparameters of the chosen models if needed
        - Set the scope of your cirpos plot (overall or population-wise), key genetic marker region file name, visualisation configuration and colour palette for circos plots
