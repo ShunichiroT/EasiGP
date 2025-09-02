@@ -1,7 +1,7 @@
 # Ensemble AnalySis with Interpretable Genomic Prediction (EasiGP): Computational Tool for Interpreting Ensembles of Genomic Prediction Models
 This code is used for "Ensemble AnalySis with Interpretable Genomic Prediction (EasiGP): Computational Tool for Interpreting Ensembles of Genomic Prediction Models".
 
-This tool analyses the ensemble of multiple diverse genomic prediction models at the genome level in crop breeding programs.
+EasiGP analyses the ensemble of multiple diverse genomic prediction models at the genome level in crop breeding programs.
 Circos plots are then constructed using the effect of each genomic marker region and the interactions of these genomic marker regions for a target trait.
 With a circos plot view, we can visually compare the inferred trait genetic architecture of each genomic prediction model to deepen the understanding of the predictive behaviour of each genomic prediction model at the genome level.
 The comparison of the inferred genomic marker effects with known key genome regions also enables the discovery of potential new genome regions that have not been well-investigated in previous studies.
