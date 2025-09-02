@@ -1,8 +1,8 @@
 # Ensemble AnalySis with Interpretable Genomic Prediction (EasiGP): Computational Tool for Interpreting Ensembles of Genomic Prediction Models
 This code is used for "Ensemble AnalySis with Interpretable Genomic Prediction (EasiGP): Computational Tool for Interpreting Ensembles of Genomic Prediction Models".
 
-This code aims to analyse the ensemble of multiple diverse genomic prediction models at the genome level in crop breeding programs.
-Circos plots are constructed for the analysis using the effect of each genomic marker region and the interactions of these genomic marker regions for a target trait.
+This code analyse the ensemble of multiple diverse genomic prediction models at the genome level in crop breeding programs.
+Circos plots are constructed using the effect of each genomic marker region and the interactions of these genomic marker regions for a target trait.
 With a circos plot view, we can visually compare the inferred trait genetic architecture of each genomic prediction model to deepen the understanding of the predictive behaviour of each genomic prediction model at the genome level.
 The comparison of the inferred genomic marker effects with known key genome regions also enables the discovery of potential new genome regions that have not been well-investigated in previous studies.
 
@@ -31,14 +31,33 @@ The comparison of the inferred genomic marker effects with known key genome regi
 
 ## Procedure
 1. Download this tool
+   - https://github.com/ShunichiroT/EasiGP/archive/refs/heads/main.zip
 2. Develop an environment using the "environment.yml" file
    - It is recommended to use Anaconda for the environment development
+        - Check "Creating an environment from an environment.yml file" for the procedure (https://docs.conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.html)
+        - Change the path of the prefix based on your folder location of Anaconda  
 3. Prepare the relevant data in the specified format
-   - Check "README.md" in the Data folder for the format details
+   - Genotype & phenotype data (csv)
+        - Columns: ID, population, markers and phenotype
+        - Rows: records
+   - Genomic marker effect (tsv)
+        - Columns: chromosome number, start location, end location, name and colour
+        - Rows: genomic markers
+   - Chromosome length (bed)
+        - Columns: Chromosome number, start location and end location
+        - Rows: chromosomes
+   - Key gene region (tsv)
+        - Columns: chromosome number, start location and end location, name and colour
+        - Rows: genes
+   - Check the Data folder for the format details
 4. Adjust settings and hyperparameters in the "main" function
-   - Check the explanations in the code for the details 
-6. Implement the code
-7. Check and analyse the generated output files in the Result folder 
+   - Check the comments corresponding to each hyperparameter, explaining the meaning of each
+   - Change the value of each hyperparameter based on your prediction tasks and preference on visualisation of cricos plots
+       - Set target traits, the training-test split ratio, the number of iterations, target populations, dataset name and genomic prediction models to run as the initial setting
+       - Change the hyperparameters of the chosen models if needed
+       - Set the scope of your cirpos plot (overall or population-wise), key genetic marker region file name, visualisation configuration and colour palette for circos plots
+5. Run the "main.py" file to implement the "GP" and "circos_plot" functions 
+6. Check and analyse the generated output files in the Result folder 
 
 ## References
 Chen Q, Yang CJ, York AM, Xue W, Daskalska LL, DeValk CA, Krueger KW, Lawton SB, Spiegelberg BG, Schnell JM et al. 2019. Teonam: A nested association mapping population for domestication and agronomic trait analysis in maize. Genetics. 213:1065–1078. 
