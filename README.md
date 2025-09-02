@@ -30,7 +30,7 @@ The comparison of the inferred genomic marker effects with known key genome regi
 - main.py: the top function that manages the implementation of this tool. Users can modify the settings and hyperparameters through this function to optimise this tool based on their requirements.
 
 ## Procedure
-1. Download this tool
+1. Download EasiGP
    - https://github.com/ShunichiroT/EasiGP/archive/refs/heads/main.zip
 2. Develop an environment using the "environment.yml" file
    - It is recommended to use Anaconda for the environment development
