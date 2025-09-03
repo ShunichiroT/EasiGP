@@ -5,7 +5,7 @@ This folder contains two folders containing example files to implement both geno
 
 ## Data structure
 1. Genotype & phenotype data
-  - TeoNAM folder: "TeoNAM_dataset.zip", "W22TIL01.csv", "W22TIL03.csv", "W22TIL11.csv", "W22TIL14.csv" and "W22TIL25.csv"
+  - TeoNAM folder: "TeoNAM_dataset.zip", "W22TIL01(_subset).csv", "W22TIL03.csv", "W22TIL11.csv", "W22TIL14.csv" and "W22TIL25.csv"
   - Arabidopsis folder: "Arabidopsis_dataset.csv"
   - Columns:
        - ID: identification code for each individual
