@@ -349,7 +349,7 @@ dependencies:
   - r-whisker=0.4.1=r43h6115d3f_0
   - r-withr=2.5.1=r43h6115d3f_0
   - r-xfun=0.40=r43h76d94ec_0
-  - r-xml2=1.3.6=r43h884c59f_0
+  - r-xml2=1.3.5=r43h884c59f_0
   - r-xtable=1.8_4=r43h6115d3f_0
   - r-xts=0.13.1=r43h76d94ec_0
   - r-yaml=2.3.7=r43h76d94ec_0
@@ -398,35 +398,35 @@ dependencies:
   - zlib=1.2.13=h5eee18b_1
   - zstd=1.5.6=hc292b87_0
   - pip:
-      - aiohappyeyeballs==2.6.1
-      - aiohttp==3.12.15
-      - aiosignal==1.4.0
-      - certifi==2022.12.7
-      - charset-normalizer==2.1.1
-      - filelock==3.13.1
-      - frozenlist==1.7.0
-      - fsspec==2024.6.1
-      - idna==3.4
-      - jinja2==3.1.4
-      - markupsafe==2.1.5
-      - matplotlib==3.10.5
-      - mpmath==1.3.0
-      - multidict==6.6.4
-      - networkx==3.3
-      - numpy==1.26.0
-      - pillow==11.0.0
-      - propcache==0.3.2
-      - requests==2.28.1
-      - seaborn==0.13.2
-      - sympy==1.13.1
-      - torch==2.1.1+cpu
-      - torch-cluster==1.6.3+pt21cpu
-      - torch-geometric==2.6.1
-      - torch-scatter==2.1.2+pt21cpu
-      - torch-sparse==0.6.18+pt21cpu
-      - torch-spline-conv==1.2.2+pt21cpu
-      - torchaudio==2.1.1+cpu
-      - torchvision==0.16.1+cpu
-      - urllib3==1.26.13
-      - yarl==1.20.1
+        - aiohappyeyeballs==2.6.1
+        - aiohttp==3.12.15
+        - aiosignal==1.4.0
+        - certifi==2022.12.7
+        - charset-normalizer==2.1.1
+        - filelock==3.13.1
+        - frozenlist==1.7.0
+        - fsspec==2024.6.1
+        - idna==3.4
+        - jinja2==3.1.4
+        - markupsafe==2.1.5
+        - matplotlib==3.10.5
+        - mpmath==1.3.0
+        - multidict==6.6.4
+        - networkx==3.3
+        - numpy==1.26.0
+        - pillow==11.0.0
+        - propcache==0.3.2
+        - requests==2.28.1
+        - seaborn==0.13.2
+        - sympy==1.13.1
+        - https://download.pytorch.org/whl/cpu/torch-2.1.0%2Bcpu-cp311-cp311-linux_x86_64.whl#sha256=5954924ce74bc7e6a6c811e3fa4bdda9936d9889f6369fd068420c444bfd1cae
+        - https://download.pytorch.org/whl/cpu/torchaudio-2.1.0%2Bcpu-cp311-cp311-linux_x86_64.whl#sha256=b78575dc4748e57046b396a85470bb3615fa7822b745ff091ded073bd036eb6e
+        - https://download.pytorch.org/whl/cpu/torchvision-0.16.0%2Bcpu-cp311-cp311-linux_x86_64.whl#sha256=be317c0b0b32d008309a1de6018e77b500d1cf966e158a5db1070da5c0cfea88
+        - https://data.pyg.org/whl/torch-2.1.0%2Bcpu/torch_cluster-1.6.2%2Bpt21cpu-cp311-cp311-linux_x86_64.whl
+        - https://data.pyg.org/whl/torch-2.1.0%2Bcpu/torch_scatter-2.1.2%2Bpt21cpu-cp311-cp311-linux_x86_64.whl
+        - https://data.pyg.org/whl/torch-2.1.0%2Bcpu/torch_sparse-0.6.18%2Bpt21cpu-cp311-cp311-linux_x86_64.whl
+        - https://data.pyg.org/whl/torch-2.1.0%2Bcpu/torch_spline_conv-1.2.2%2Bpt21cpu-cp311-cp311-linux_x86_64.whl
+        - torch-geometric==2.6.0
+        - urllib3==1.26.13
+        - yarl==1.20.1
 prefix: C:\Anaconda3\envs\EasiGP
