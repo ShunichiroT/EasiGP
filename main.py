@@ -9,14 +9,14 @@ from circos_plot import *
 R_PATH = None  #None # Assign path for R if causing an error
 
 TOTAL_PHENOTYPE = 1           # Total nummber of phenotype columns in your dataset
-PHENOTYPE = ['DTA']           #, ['DTA', 'RBN', 'RL' ,'DTF3','FT16', 'FT10'] # Your target phenotypes
+PHENOTYPE = ['DTA']           # Your target phenotypes. ['DTA', 'RBN', 'RL' ,'DTF3','FT16', 'FT10'] options for Arabidopsis
 
 MODEL = ['rrBLUP', 'BayesB', 'RKHS', 'RF', 'SVR', 'MLP', 'GAT', 'ensemble'] # Genomic prediction models to run
 
 POPULATION = ['W22TIL01']    # Your target population in your dataset
 RATIO = [0.8, 0.65, 0.5]     # training set ratio
 ITER_NUM = 1                 # Number of iterations with random sampling ror training & test sets
-DATA_NAME = 'TeoNAM_dataset' # Name of your genotype & phenotype dataset # Geno_pheno_adjusted_GRM_ver2'
+DATA_NAME = 'W22TIL01_subset' # Name of your genotype & phenotype dataset # Geno_pheno_adjusted_GRM_ver2'
 
 # Hyprparameters
 # rrBLUP: iteration number, burin-in
@@ -67,7 +67,7 @@ CIRCOS_CONFIG = {'space':3,
                  'scale':1000000}
 
 # adjust the end location of each marker for visualisation
-end_adjust = 1000
+end_adjust = 100000
 
 # colour palette for circos plot
 CYTOBAND_COLORMAP = {   
