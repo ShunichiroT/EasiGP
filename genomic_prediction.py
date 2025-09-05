@@ -55,7 +55,7 @@ def GP(DATA_NAME, MODEL, PHENOTYPE, POPULATION, RATIO, SAMPLE_NUM, HPARAMETERS, 
     RKHS = robjects.globalenv['RKHS']
     
     # Read genotype and phenotype data
-    data_original = pd.read_csv('./Data/'+DATA_NAME+'.csv')
+    data_original = pd.read_csv(DATA_NAME+'.csv')
     
     # Create the total number of combinations of prediction scenarios
     sample = pd.DataFrame({'population':[item for item in POPULATION for i in range(SAMPLE_NUM*len(PHENOTYPE)*len(RATIO))],
