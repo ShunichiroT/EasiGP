@@ -16,7 +16,7 @@ MODEL = ['rrBLUP', 'BayesB', 'RKHS', 'RF', 'SVR', 'MLP', 'GAT', 'ensemble'] # Ge
 POPULATION = ['W22TIL01']    # Your target population in your dataset
 RATIO = [0.8, 0.65, 0.5]     # training set ratio
 ITER_NUM = 1                 # Number of iterations with random sampling ror training & test sets
-DATA_NAME = 'W22TIL01_subset' # Name of your genotype & phenotype dataset # Geno_pheno_adjusted_GRM_ver2'
+DATA_NAME = './Data/TeoNAM/W22TIL01_subset' # Name of your genotype & phenotype dataset # Geno_pheno_adjusted_GRM_ver2'
 
 # Hyprparameters
 # rrBLUP: iteration number, burin-in
