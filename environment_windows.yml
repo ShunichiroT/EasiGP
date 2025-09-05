@@ -445,7 +445,6 @@ dependencies:
   - rpds-py=0.24.0=py39ha6b3726_0
   - rpy2=3.5.11=py39r41hd2bd0d5_3
   - scikit-learn=1.6.1=py39h585ebfc_0
-  - scipy=1.13.1=py39h8640f81_1
   - seaborn=0.13.2=py39haa95532_3
   - send2trash=1.8.3=pyh5737063_1
   - setuptools=72.1.0=py39haa95532_0
@@ -560,6 +559,7 @@ dependencies:
       - qtpy==2.4.3
       - rich==14.0.0
       - rtree==1.4.0
+      - scipy==1.13.1
       - sphinx==7.4.7
       - sympy==1.13.1
       - https://data.pyg.org/whl/torch-2.1.0%2Bcpu/torch_cluster-1.6.2%2Bpt21cpu-cp39-cp39-win_amd64.whl
