@@ -224,8 +224,6 @@ dependencies:
   - notebook-shim=0.2.4=pyhd8ed1ab_1
   - numba=0.60.0=py39h5da7b33_1
   - numexpr=2.10.1=py39h4cd664f_0
-  - numpy=1.26.4=py39h055cbcc_0
-  - numpy-base=1.26.4=py39h65a83cf_0
   - openjpeg=2.5.2=hae555c5_0
   - openssl=3.5.0=ha4e3fda_1
   - overrides=7.7.0=pyhd8ed1ab_1
@@ -543,6 +541,8 @@ dependencies:
       - more-itertools==10.6.0
       - multidict==6.4.3
       - numpydoc==1.8.0
+      - numpy==1.26.4
+      - numpy-base==1.26.4
       - pygithub==2.6.1
       - pylint==3.3.6
       - pylint-venv==3.0.4
