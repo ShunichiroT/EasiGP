@@ -222,8 +222,6 @@ dependencies:
   - nlohmann_json=3.11.3=he0c23c2_1
   - notebook=7.4.0=pyhd8ed1ab_0
   - notebook-shim=0.2.4=pyhd8ed1ab_1
-  - numba=0.60.0=py39h5da7b33_1
-  - numexpr=2.10.1=py39h4cd664f_0
   - openjpeg=2.5.2=hae555c5_0
   - openssl=3.5.0=ha4e3fda_1
   - overrides=7.7.0=pyhd8ed1ab_1
@@ -543,6 +541,8 @@ dependencies:
       - numpydoc==1.8.0
       - numpy==1.26.4
       - numpy-base==1.26.4
+      - numba==0.60.0
+      - numexpr==2.10.1
       - pygithub==2.6.1
       - pylint==3.3.6
       - pylint-venv==3.0.4
