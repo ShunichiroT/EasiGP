@@ -229,17 +229,12 @@ dependencies:
   - nest-asyncio=1.6.0=py39haa95532_0
   - networkx=3.2.1=py39haa95532_0
   - nlohmann_json=3.11.3=he0c23c2_1
-<<<<<<< Updated upstream
-  - notebook=7.4.0=pyhd8ed1ab_0
-  - notebook-shim=0.2.4=pyhd8ed1ab_1
-=======
   - notebook=7.4.5=py39haa95532_0
   - notebook-shim=0.2.4=py39haa95532_0
   - numba=0.60.0=py39h5da7b33_1
   - numexpr=2.10.1=py39h4cd664f_0
   - numpy=2.0.2=py39h055cbcc_0
   - numpy-base=2.0.2=py39h65a83cf_0
->>>>>>> Stashed changes
   - openjpeg=2.5.2=hae555c5_0
   - openssl=3.5.0=ha4e3fda_1
   - overrides=7.4.0=py39haa95532_0
@@ -562,10 +557,6 @@ dependencies:
       - more-itertools==10.6.0
       - multidict==6.4.3
       - numpydoc==1.8.0
-      - numpy==1.26.4
-      - numpy-base==1.26.4
-      - numba==0.60.0
-      - numexpr==2.10.1
       - pygithub==2.6.1
       - pylint==3.3.6
       - pylint-venv==3.0.4
@@ -583,11 +574,11 @@ dependencies:
       - rtree==1.4.0
       - sphinx==7.4.7
       - sympy==1.13.1
-      - torch-cluster==1.6.2+pt21cpu
+      - https://data.pyg.org/whl/torch-2.1.0%2Bcpu/torch_cluster-1.6.2%2Bpt21cpu-cp39-cp39-win_amd64.whl
+      - https://data.pyg.org/whl/torch-2.1.0%2Bcpu/torch_scatter-2.1.2%2Bpt21cpu-cp39-cp39-win_amd64.whl
+      - https://data.pyg.org/whl/torch-2.1.0%2Bcpu/torch_sparse-0.6.18%2Bpt21cpu-cp39-cp39-win_amd64.whl
+      - https://data.pyg.org/whl/torch-2.1.0%2Bcpu/torch_spline_conv-1.2.2%2Bpt21cpu-cp39-cp39-win_amd64.whl
       - torch-geometric==2.6.0
-      - torch-scatter==2.1.2+pt21cpu
-      - torch-sparse==0.6.18+pt21cpu
-      - torch-spline-conv==1.2.2+pt21cpu
       - watchdog==6.0.0
       - whatthepatch==1.0.7
       - wrapt==1.17.2
