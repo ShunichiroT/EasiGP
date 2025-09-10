@@ -37,7 +37,7 @@ The comparison of the inferred genomic marker effects with known key genome regi
           ```
           conda env create -f environment.yml
           ```
-        - It is recommended that the R version is 4.4.0 or higher, especially for Windows
+        - It is recommended that the R version is 4.4.0 or higher, especially for Windows (install R from here if needed: https://cran.r-project.org/)
         - Check "Creating an environment from an environment.yml file" for the procedure in detail (https://docs.conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.html)
         - Change the path of the prefix based on your folder location of Anaconda  
 3. Prepare the relevant data in the specified format
