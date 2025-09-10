@@ -39,16 +39,16 @@ HPARAMETERS = {'rrBLUP': [10000, 2000],
 SCOPE = 'overall' #overall or population
 
 # File name containing the information of all markers
-MARKER_INFO = 'marker_info'
+MARKER_INFO = './Data/TeoNAM/marker_info'
 
 # File name array containing the length of chromosome
-CHROMOSOME_INFO = ['chrom']
+CHROMOSOME_INFO = ['./Data/TeoNAM/chrom']
 
 # File name(s) nested array containing key known gene locations. 
 # Each subarray indicates key gene file(s) for phenotype(s) in each population
 # Each subsubarray (if there are more than one target phenotypes) indicates key gene files for a particular phenotype
 # The number of subarrays must be the same with the number of POPULATION
-GENE_INFO = [['Genes_leaf', 'Genes_SAM']]*len(POPULATION)
+GENE_INFO = [['./Data/TeoNAM/Genes_leaf', './Data/TeoNAM/Genes_SAM']]*len(POPULATION)
 
 # Parameters
 # space:           space size between rings

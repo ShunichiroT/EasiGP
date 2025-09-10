@@ -38,7 +38,7 @@ def quantile_conversion(effect, SCOPE, marker_info, PHENOTYPE, MODEL, end_adjust
                 
                 effect_selected_copy.columns = ['colour']
                 effect_selected_copy = effect_selected_copy.reset_index(drop=False)
-                marker = pd.read_csv('./Data/'+marker_info+'.csv')
+                marker = pd.read_csv(marker_info+'.csv')
                 merged = pd.merge(effect_selected_copy, marker, left_on=['index'], right_on=['name'])
                 merged = merged.loc[:,['chromosome','start','end','index','colour']]
                 merged['start'] = (merged['start'] - end_adjust).round().astype(int)
@@ -84,7 +84,7 @@ def quantile_conversion(effect, SCOPE, marker_info, PHENOTYPE, MODEL, end_adjust
                 effect_selected_copy.columns = ['colour']
                 effect_selected_copy = effect_selected_copy.reset_index(drop=False)
                 
-                marker = pd.read_csv('./Data/'+marker_info+'.csv')
+                marker = pd.read_csv(marker_info+'.csv')
                 merged = pd.merge(effect_selected_copy, marker, left_on=['index'], right_on=['name'])
                 merged = merged.loc[:,['chromosome','start','end','index','colour']]
                 merged['start'] = (merged['start'] - end_adjust).round().astype(int)
@@ -112,7 +112,7 @@ def interaction(interaction, SCOPE, marker_info, PHENOTYPE, circos_config, POPUL
         interaction_selected = interaction_selected[interaction_selected['value'] >= np.quantile(interaction_selected['value'], circos_config['interaction_top'])].reset_index(drop=True)
         interaction_selected['value'] = interaction_selected['value'] / interaction_selected['value'].sum()
         
-        loc_info = pd.read_csv('./Data/'+marker_info+'.csv')
+        loc_info = pd.read_csv(marker_info+'.csv')
         
         start = pd.merge(interaction_selected['from'], loc_info, 'inner', left_on='from', right_on='name')
         end = pd.merge(interaction_selected['to'], loc_info, 'inner', left_on='to', right_on='name')
@@ -134,7 +134,7 @@ def interaction(interaction, SCOPE, marker_info, PHENOTYPE, circos_config, POPUL
         interaction_selected = interaction_selected[interaction_selected['value'] >= np.quantile(interaction_selected['value'], circos_config['interaction_top'])].reset_index(drop=True)
         interaction_selected['value'] = interaction_selected['value'] / interaction_selected['value'].sum()
         
-        loc_info = pd.read_csv('./Data/'+marker_info+'.csv')
+        loc_info = pd.read_csv(marker_info+'.csv')
         
         start = pd.merge(interaction_selected['from'], loc_info, 'inner', left_on='from', right_on='name')
         end = pd.merge(interaction_selected['to'], loc_info, 'inner', left_on='to', right_on='name')
@@ -156,7 +156,7 @@ def plot(interactions, SCOPE, chrom_info, gene_info, PHENOTYPE, MODEL, circos_co
     # Generate a circos plot 
     if SCOPE == 'overall':
         cnt = 0
-        circos = Circos.initialize_from_bed("./Data/"+chrom_info+".bed", space=circos_config['space'], start=circos_config['start'], end=circos_config['end'])
+        circos = Circos.initialize_from_bed(chrom_info+".bed", space=circos_config['space'], start=circos_config['start'], end=circos_config['end'])
         
         # Add genomic marker effects
         for i in range(len(MODEL)):
@@ -166,8 +166,8 @@ def plot(interactions, SCOPE, chrom_info, gene_info, PHENOTYPE, MODEL, circos_co
         
         # Add known gene regions
         for i in range(len(gene_info)):
-            circos.add_cytoband_tracks((97-(3*cnt), 100-(3*cnt)), './Data/'+gene_info[i]+'.tsv', track_name=gene_info[i], cytoband_cmap=CYTOBAND_COLORMAP)
-            circos.text(gene_info[i], r=circos.tracks[-1].r_center-1, deg=0, size=8, color="black")
+            circos.add_cytoband_tracks((97-(3*cnt), 100-(3*cnt)), gene_info[i]+'.tsv', track_name=gene_info[i], cytoband_cmap=CYTOBAND_COLORMAP)
+            circos.text(gene_info[i].split("/")[-1], r=circos.tracks[-1].r_center-1, deg=0, size=8, color="black")
             cnt+=1
          
         # Add ticks to the outermost ring
@@ -198,7 +198,7 @@ def plot(interactions, SCOPE, chrom_info, gene_info, PHENOTYPE, MODEL, circos_co
     elif SCOPE == 'population':
         
         cnt = 0
-        circos = Circos.initialize_from_bed("./Data/"+chrom_info+"_"+POPULATION+".bed", space=circos_config['space'], start=circos_config['start'], end=circos_config['end'])
+        circos = Circos.initialize_from_bed(chrom_info+"_"+POPULATION+".bed", space=circos_config['space'], start=circos_config['start'], end=circos_config['end'])
         
         # Add genomic marker effects
         for i in range(len(MODEL)):
@@ -208,8 +208,8 @@ def plot(interactions, SCOPE, chrom_info, gene_info, PHENOTYPE, MODEL, circos_co
              
         # Add known gene regions
         for i in range(len(gene_info)):
-            circos.add_cytoband_tracks((97-(3*cnt), 100-(3*cnt)), './Data/'+gene_info[i]+'_'+POPULATION+'.tsv', track_name=gene_info[i], cytoband_cmap=CYTOBAND_COLORMAP)
-            circos.text(gene_info[i], r=circos.tracks[-1].r_center-1, deg=0, size=8, color="black")
+            circos.add_cytoband_tracks((97-(3*cnt), 100-(3*cnt)), gene_info[i]+'_'+POPULATION+'.tsv', track_name=gene_info[i], cytoband_cmap=CYTOBAND_COLORMAP)
+            circos.text(gene_info[i].split("/")[-1], r=circos.tracks[-1].r_center-1, deg=0, size=8, color="black")
             cnt+=1
          
         # Add ticks to the outermost ring
@@ -252,7 +252,3 @@ def circos_plot(effect, SCOPE, interactions, marker_info, chrom_info, gene_info,
                 MODEL = quantile_conversion(effect, SCOPE, marker_info, PHENOTYPE[i], MODEL, end_adjust, POPULATION[k])
                 interaction_selected = interaction(interactions, SCOPE, marker_info, PHENOTYPE[i], circos_config, POPULATION[k])
                 plot(interaction_selected, SCOPE, chrom_info[k], gene_info[k][i], PHENOTYPE[i], MODEL, circos_config, CYTOBAND_COLORMAP, POPULATION[k])
-            
-            
-            
-    
