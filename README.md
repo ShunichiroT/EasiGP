@@ -33,8 +33,11 @@ The comparison of the inferred genomic marker effects with known key genome regi
 1. Download EasiGP
    - https://github.com/ShunichiroT/EasiGP/archive/refs/heads/main.zip
 2. Develop an environment using the "environment.yml" file
-   - It is recommended to use Anaconda for the environment development
-        - Check "Creating an environment from an environment.yml file" for the procedure (https://docs.conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.html)
+   - It is recommended to use Anaconda for the environment development:
+          ```
+          conda env create -f environment.yml
+          ```
+        - Check "Creating an environment from an environment.yml file" for the procedure in detail (https://docs.conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.html)
         - Change the path of the prefix based on your folder location of Anaconda  
 3. Prepare the relevant data in the specified format
    - Genotype & phenotype data (csv)
