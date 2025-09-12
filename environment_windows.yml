@@ -261,6 +261,7 @@ dependencies:
   - r-crayon=1.5.2=r41hc72bb7e_1
   - r-data.table=1.15.4=r41h6d2157b_0
   - r-digest=0.6.36=r41he75b88d_0
+  - r-dplyr=1.1.4=r41ha856d6a_0
   - r-ellipsis=0.3.2=r41h6d2157b_2
   - r-fansi=1.0.6=r41h6d2157b_0
   - r-farver=2.1.2=r41he75b88d_0
