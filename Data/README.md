@@ -61,12 +61,12 @@ This folder contains two folders containing example files to implement both geno
 
 * Rows: genes
 
-5\. QTL data (optional. Create this file when QTL information needs to be added on a scatter plot matrix)
+5. QTL data (optional. Create this file when QTL information needs to be added on a scatter plot matrix)
 
-* Columns:
-
-  * phenotype: phenotype that QTL affects
-  * marker: name of QTL
-
-Rows: QTL
+ * Columns:
+ 
+   * phenotype: phenotype that QTL affects
+   * marker: name of QTL
+ 
+ * Rows: QTL
 
