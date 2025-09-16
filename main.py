@@ -1,4 +1,5 @@
 from genomic_prediction import *
+from scatter_plot import *
 from circos_plot import *
   
 
@@ -34,8 +35,21 @@ HPARAMETERS = {'rrBLUP': [10000, 2000],
                'MLP':[30, 0, 0.001, 5e-4, 30, 8, 10],
                'GAT':[20, 0.9, 0.005, 5e-4, 1, 8, 1, 30, False]} 
 
+# 2.Scatter plot matrix configuration
 
-# 2. Circos plot configuration
+# True if scatter plot is needed. False otherwise
+SCATTER_CREATE = True 
+
+# Write a file path if you want to add QTL information. None otherwise
+QTL = None 
+
+# Parameters
+# font_size:  font size for scatter plot matrix
+# fig_size:   size of scatter plot matrix
+SCATTER_CONFIG = {'font_size':2,
+                  'fig_size':30}
+
+# 3. Circos plot configuration
 SCOPE = 'overall' #overall or population
 
 # File name containing the information of all markers
@@ -111,6 +125,10 @@ CYTOBAND_COLORMAP = {
 # Run genomic prediction models
 metrics, predicted_result_train, predicted_result_test, effect, interactions = \
     GP(DATA_NAME, MODEL, PHENOTYPE, POPULATION, RATIO, ITER_NUM, HPARAMETERS, TOTAL_PHENOTYPE, R_PATH)
+
+# Generate scatter plot matrices if needed
+if SCATTER_CREATE:
+    scatter_plot(MODEL, PHENOTYPE, predicted_result_test, effect, QTL, SCATTER_CONFIG)
 
 # Generate circos plots
 circos_plot(effect, SCOPE, interactions, MARKER_INFO, CHROMOSOME_INFO, GENE_INFO, PHENOTYPE, MODEL, CIRCOS_CONFIG, end_adjust, CYTOBAND_COLORMAP, POPULATION) 
