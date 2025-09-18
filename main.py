@@ -20,20 +20,27 @@ ITER_NUM = 1                 # Number of iterations with random sampling ror tra
 DATA_NAME = './Data/TeoNAM/W22TIL01_subset' # Name of your genotype & phenotype dataset # Geno_pheno_adjusted_GRM_ver2'
 
 # Hyprparameters
-# rrBLUP: iteration number, burin-in
-# BayesB: iteration number, burin-in
-# RKHS:   iteration number, buin-in, number of samples for Shapley scores, return marker effect?
-# RF:     tree number, maximum fearures per tree, maximum samples per tree, number of samples for Shapley scores, return marker effect?
-# SVR:    kernel type, epsilon, regularisation, dimension for poly kernel, gamma, number of samples for Shapley scores, return marker effect?
-# MLP:    neuron numbers, dropout, learning rate, decay, epoch, batch size, number of samples for Shapley scores
-# GAT:    neuron numbers, dropout, learning rate, decay, epoch, batch size, number of heads, number of samples for Shapley scores, return marker effect?
+# rrBLUP:                          iteration number, burin-in
+# BayesB:                          iteration number, burin-in
+# RKHS:                            iteration number, buin-in, number of samples for Shapley scores, return marker effect?
+# RF:                              tree number, maximum fearures per tree, maximum samples per tree, number of samples for Shapley scores, return marker effect?
+# SVR:                             kernel type, epsilon, regularisation, dimension for poly kernel, gamma, number of samples for Shapley scores, return marker effect?
+# MLP:                             neuron numbers, dropout, learning rate, decay, epoch, batch size, number of samples for Shapley scores
+# GAT_infinitesimal_node_level:    neuron numbers, dropout, learning rate, decay, epoch, batch size, number of heads, number of samples for Shapley scores, return marker effect?
+# GAT_infinitesimal:               neuron numbers, dropout, learning rate, decay, epoch, batch size, number of heads, number of samples for Shapley scores, return marker effect?
+# GAT_fully_connected:             neuron numbers, dropout, learning rate, decay, epoch, batch size, number of heads, number of samples for Shapley scores, return marker effect?
+# GAT_prior_knowledge:             neuron numbers, dropout, learning rate, decay, epoch, batch size, number of heads, number of samples for Shapley scores, 
+#                                  selection rate for edges from RF (e.g. 0.1= selection the top 10% of the most important edges), return marker effect?
 HPARAMETERS = {'rrBLUP': [10000, 2000],     
                'BayesB': [12000, 2000],    
                'RKHS': [12000, 2000, 30, False],   
                'RF': [1000, 1.0, None, 30, True],           
                'SVR':['rbf', 0.5, 1.0, 3, 'scale', 30, False],      
                'MLP':[30, 0, 0.001, 5e-4, 30, 8, 10],
-               'GAT':[20, 0.9, 0.005, 5e-4, 1, 8, 1, 30, False]} 
+               'GAT_infinitesimal_node_level':[20, 0.9, 0.005, 5e-4, 1, 8, 1, 30, True],
+               'GAT_infinitesimal':[20, 0, 0.01, 5e-4, 40, 8, 1, 1, True],
+               'GAT_fully_connected':[20, 0, 0.01, 5e-4, 40, 8, 1, 1, True],
+               'GAT_prior_knowledge':[20, 0, 0.01, 5e-4, 40, 8, 1, 1, 0.2, True]} 
 
 # 2.Scatter plot matrix configuration
 

@@ -5,7 +5,10 @@ from sklearn.model_selection import train_test_split
 from models.RF import *
 from models.SVR import *
 from models.MLP import *
-from models.GAT import *
+from models.GAT_infinitesimal_node_level import *
+from models.GAT_infinitesimal import *
+from models.GAT_fully_connected import *
+from models.GAT_prior_knowledge import *
 from models.ensemble import *
 
 def metric_plot(record, MODEL):
@@ -116,10 +119,23 @@ def GP(DATA_NAME, MODEL, PHENOTYPE, POPULATION, RATIO, SAMPLE_NUM, HPARAMETERS, 
                 if HPARAMETERS[MODEL[jj]][-1] == 'all':
                     HPARAMETERS[MODEL[jj]][-1] = test.shape[0] 
                 sample_pearson, sample_mse, sample_effect, predicted_test, predicted_train = ML_Perceptron(train, test, HPARAMETERS[MODEL[jj]])
-            elif MODEL[jj]  == 'GAT':
+            elif MODEL[jj]  == 'GAT_infinitesimal_node_level':
                 if HPARAMETERS[MODEL[jj]][-1] == 'all':
                     HPARAMETERS[MODEL[jj]][-1] = test.shape[0] 
                 sample_pearson, sample_mse, sample_effect, predicted_test, predicted_train = GAT_model(train, test, HPARAMETERS[MODEL[jj]])
+            elif MODEL[jj]  == 'GAT_infinitesimal':
+                if HPARAMETERS[MODEL[jj]][-1] == 'all':
+                    HPARAMETERS[MODEL[jj]][-1] = test.shape[0] 
+                sample_pearson, sample_mse, sample_effect, predicted_test, predicted_train = GAT_infinitesimal(train, test, HPARAMETERS[MODEL[jj]])
+            elif MODEL[jj]  == 'GAT_fully_connected':
+                if HPARAMETERS[MODEL[jj]][-1] == 'all':
+                    HPARAMETERS[MODEL[jj]][-1] = test.shape[0] 
+                sample_pearson, sample_mse, sample_effect, predicted_test, predicted_train = GAT_fully_connected(train, test, HPARAMETERS[MODEL[jj]])
+            elif MODEL[jj]  == 'GAT_prior_knowledge':
+                if HPARAMETERS[MODEL[jj]][-1] == 'all':
+                    HPARAMETERS[MODEL[jj]][-1] = test.shape[0] 
+                sample_pearson, sample_mse, sample_effect, predicted_test, predicted_train = GAT_prior_knowledge(train, test, HPARAMETERS[MODEL[jj]])
+            
             
             # Store prediction results
             record_sample = pd.DataFrame([{'population': sample.loc[i,'population'],
