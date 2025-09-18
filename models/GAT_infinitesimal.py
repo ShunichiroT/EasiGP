@@ -23,12 +23,11 @@ def GAT_infinitesimal(data_train, data_test, params):
     samples = params[7]
     marker_effect = params[8]
 
-    ## Preprocess the data so that it caon be converted into a graph format    
+    ## Preprocess the data so that it can be converted into a graph format    
     data_QTL_train, data_QTL_test = data_train.iloc[:,:-1].reset_index(drop=True),data_test.iloc[:,:-1].reset_index(drop=True)
     data_QTL_melt_train, data_QTL_melt_test = data_QTL_train.T.melt(), data_QTL_test.T.melt()
     data_pheno_train, data_pheno_test = data_train.iloc[:,-1].reset_index(drop=True), data_test.iloc[:,-1].reset_index(drop=True)
         
-    
     ## Create graphs
     dummy = pd.get_dummies(pd.DataFrame(list(range(data_QTL_train.shape[1]))), columns=[0])
     dummy[dummy==False]=0
