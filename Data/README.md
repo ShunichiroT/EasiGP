@@ -22,30 +22,30 @@ This folder contains two folders containing example files to implement both geno
 
 2. Chromosome length data
 
-   * TeoNAM folder: "chrom.bed", "chrom\_W22TIL01.bed", "chrom\_W22TIL03.bed", "chrom\_W22TIL11.bed", "chrom\_W22TIL14.bed" and "chromW22TIL25.bed"
-   * Arabidopsis folder: "Arabidopsis\_chrom.bed"
-   * Columns:
+* TeoNAM folder: "chrom.bed", "chrom\_W22TIL01.bed", "chrom\_W22TIL03.bed", "chrom\_W22TIL11.bed", "chrom\_W22TIL14.bed" and "chromW22TIL25.bed"
+* Arabidopsis folder: "Arabidopsis\_chrom.bed"
+* Columns:
 
      * Chromosome: chromosome number ("chr"+NUMBER)
      * Start: the beginning location of the chromosome (the value should be 0 for the standard use)
      * End: the end location of the chromosome
 
-   * Rows:
+* Rows:
 
      * Each chromosome
 
 3. Marker information data
 
-   * TeoNAM folder: "marker\_info.csv"
-   * Arabidopsis folder: "Arabidopsis\_marker\_info.zip"
-   * Columns:
+* TeoNAM folder: "marker\_info.csv"
+* Arabidopsis folder: "Arabidopsis\_marker\_info.zip"
+* Columns:
 
      * chromosome: belonging chromosome number (NUMBER)
      * Start: the beginning location of the marker
      * Middle: the midpoint location of the marker
      * End: the end location of the marker
 
-   * Rows: markers
+* Rows: markers
 
 4. Key gene marker data
 
@@ -61,12 +61,12 @@ This folder contains two folders containing example files to implement both geno
 
 * Rows: genes
 
-5\. QTL data (optional. Create this file when QTL information needs to be added on a scatter plot matrix)
+5. QTL data (optional. Create this file when QTL information needs to be added on a scatter plot matrix)
 
-* Columns:
-
-  * phenotype: phenotype that QTL affects
-  * marker: name of QTL
-
-Rows: QTL
+ * Columns:
+ 
+   * phenotype: phenotype that QTL affects
+   * marker: name of QTL
+ 
+ * Rows: QTL
 
