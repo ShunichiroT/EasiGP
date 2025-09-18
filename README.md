@@ -12,7 +12,7 @@ The comparison of the inferred genomic marker effects with known key genome regi
    - ridge regression best linear unbiased prediction (rrBLUP), BayesB and reproducing kernel Hilbert Space (RKHS): BGLR (Pérez and de Los Campos, 2014) in R
    - Random forest (RF) and support vector regression (SVR): Sklearn (Pedregosa et al., 2012) in Python
    - Multilayer perceptron (MLP): PyTorch (Paszke et al., 2019) in Python
-   - Graph attention network (GAT): PyTorch Geometric (Fey et al., 2019) in Python 
+   - Graph attention network (GAT), GAT infinitesimal, GAT fully-connected & GAT prior-knowledge: PyTorch Geometric (Fey et al., 2019) in Python 
   
 - Data: example data files based on the TeoNAM dataset (Chen et al., 2019) to run this tool
   - Details are explained in "README.md" in the Data folder
