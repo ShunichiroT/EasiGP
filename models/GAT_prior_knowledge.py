@@ -28,11 +28,10 @@ def GAT_prior_knowledge(data_train, data_test, params):
     top_rate = params[8]
     marker_effect = params[9]
     
-    #train_id, test_id = data_train_original.iloc[:,0], data_test_original.iloc[:,0]
-    train_x, train_y = data_train.iloc[:,:-1], data_train.iloc[:,-1]
-    #test_x, test_y = data_test.iloc[:,:-1], data_test.iloc[:,-1]
-    
     ## Train RF & extract interactions
+
+    train_x, train_y = data_train.iloc[:,:-1], data_train.iloc[:,-1]
+
     rf = RandomForestRegressor(n_estimators = 500, random_state = 40)
     rf.fit(train_x, train_y)
     
@@ -49,7 +48,7 @@ def GAT_prior_knowledge(data_train, data_test, params):
     pair = pair[pair['value'] > 0].reset_index(drop=True)
     pair = pair[(pair['value'] >= np.quantile(pair['value'].to_numpy().flatten(), 1-top_rate))]
     
-    ## Preprocess the data so that it caon be converted into a graph format    
+    ## Preprocess the data so that it can be converted into a graph format    
     data_QTL_train, data_QTL_test = data_train.iloc[:,:-1].reset_index(drop=True),data_test.iloc[:,:-1].reset_index(drop=True)
     data_QTL_melt_train, data_QTL_melt_test = data_QTL_train.T.melt(), data_QTL_test.T.melt()
     data_pheno_train, data_pheno_test = data_train.iloc[:,-1].reset_index(drop=True), data_test.iloc[:,-1].reset_index(drop=True)    
