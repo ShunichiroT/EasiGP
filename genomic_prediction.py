@@ -74,7 +74,8 @@ def GP(DATA_NAME, MODEL, PHENOTYPE, POPULATION, RATIO, SAMPLE_NUM, HPARAMETERS, 
 
     for i in range(sample.shape[0]):
         # Convert the data structure
-        data = pd.concat([data_original.iloc[:,:-TOTAL_PHENOTYPE], data_original[sample.loc[i,'phenotype']]],axis=1).dropna()
+        data = data_original[data_original['population']==sample.loc[i,'population']].reset_index(drop=True)
+        data = pd.concat([data.iloc[:,:-TOTAL_PHENOTYPE], data[sample.loc[i,'phenotype']]],axis=1).dropna()
         train, test = train_test_split(data,train_size=sample.loc[i,'ratio'], random_state=sample.loc[i,'sample'])
         train, test = train.reset_index(drop=True), test.reset_index(drop=True)
         id_train, id_test = train.iloc[:,0], test.iloc[:,0]
