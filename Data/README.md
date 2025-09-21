@@ -2,8 +2,9 @@
 
 This folder contains two folders containing example files to implement both genomic prediction and circos plot generation functions.
 
-* TeoNAM folder contains adjusted example data from the TeoNAM dataset (Chen et al.,2019), accompanied by key genomic marker information for flowering (Dong et al., 2012)
+* TeoNAM folder contains adjusted example data from the TeoNAM dataset (Chen et al.,2019), accompanied by key genomic marker information for flowering (Dong et al., 2012; Wisser et al., 2019)
 * Arabidopsis folder contains adjusted example data from the 1001 Genomes Consortium (2016), Grimm et al. (2017) and Gibbs et al. (2025), accompanied by key genomic marker information for flowering and branching (Arabidopsis Information Resource (TAIR); https://www.arabidopsis.org/)
+* MaizeNAM folder contains adjusted example data from the MaizeNAM dataset (Buckler et al.,2009), accompanied by key genomic marker information for flowering (Dong et al., 2012; Wisser et al., 2019)
 
 ## Data structure
 
@@ -11,6 +12,7 @@ This folder contains two folders containing example files to implement both geno
 
 * TeoNAM folder: "TeoNAM\_dataset.zip", "W22TIL01(\_subset).csv", "W22TIL03.csv", "W22TIL11.csv", "W22TIL14.csv" and "W22TIL25.csv"
 * Arabidopsis folder: "Arabidopsis\_dataset.csv"
+* MaizeNAM folder: "MaizeNAM.zip" and "population\_n.csv"
 * Columns:
 
   * ID: identification code for each individual
@@ -24,6 +26,7 @@ This folder contains two folders containing example files to implement both geno
 
 * TeoNAM folder: "chrom.bed", "chrom\_W22TIL01.bed", "chrom\_W22TIL03.bed", "chrom\_W22TIL11.bed", "chrom\_W22TIL14.bed" and "chromW22TIL25.bed"
 * Arabidopsis folder: "Arabidopsis\_chrom.bed"
+* MaizeNAM folder: "chrom.bed" and "chrom\_population\_n.bed"
 * Columns:
 
      * Chromosome: chromosome number ("chr"+NUMBER)
@@ -38,6 +41,7 @@ This folder contains two folders containing example files to implement both geno
 
 * TeoNAM folder: "marker\_info.csv"
 * Arabidopsis folder: "Arabidopsis\_marker\_info.zip"
+* MaizeNAM folder: "marker\_info.csv"
 * Columns:
 
      * chromosome: belonging chromosome number (NUMBER)
@@ -49,8 +53,9 @@ This folder contains two folders containing example files to implement both geno
 
 4. Key gene marker data
 
-* TeoNAM folder: "QTL.tsv","QTL\_W22TIL01.tsv","QTL\_W22TIL03.tsv","QTL\_W22TIL11.tsv","QTL\_W22TIL14.tsv","QTL\_W22TIL25.tsv", "Genes\_leaf.tsv", "Genes\_leaf\_W22TIL01.tsv","Genes\_leaf\_W22TIL03.tsv","Genes\_leaf\_W22TIL11.tsv","Genes\_leaf\_W22TIL14.tsv","Genes\_leaf\_W22TIL25.tsv", "Genes\_SAM.tsv", "Genes\_SAM\_W22TIL01.tsv","Genes\_SAM\_W22TIL03.tsv","Genes\_SAM\_W22TIL11.tsv","Genes\_SAM\_W22TIL14.tsv" and "Genes\_SAM\_W22TIL25.tsv"
+* TeoNAM folder: "QTL\_TRAIT.tsv","QTL\_TRAIT\_W22TIL01.tsv","QTL\_TRAIT\_W22TIL03.tsv","QTL\_TRAIT\_W22TIL11.tsv","QTL\_TRAIT\_W22TIL14.tsv","QTL\_TRAIT\_W22TIL25.tsv", "Genes\_leaf.tsv", "Genes\_leaf\_W22TIL01.tsv","Genes\_leaf\_W22TIL03.tsv","Genes\_leaf\_W22TIL11.tsv","Genes\_leaf\_W22TIL14.tsv","Genes\_leaf\_W22TIL25.tsv", "Genes\_SAM.tsv", "Genes\_SAM\_W22TIL01.tsv","Genes\_SAM\_W22TIL03.tsv","Genes\_SAM\_W22TIL11.tsv","Genes\_SAM\_W22TIL14.tsv", "Genes\_SAM\_W22TIL25.tsv" and "Genes\_wisser\_et\_al.tsv"
 * Arabidopsis folder: "Arabidopsis\_branching.tsv" and "Arabidopsis\_flowering.tsv"
+* MaizeNAM folder: "QTL\_TRAIT.tsv", "QTL\_TRAIT\_population\_N.tsv", "Gene\_leaf.tsv", "Gene\_leaf\_population\_N.tsv", "Gene\_SAM.tsv", "Gene\_SAM\_population\_N.tsv" and "Genes\_wisser\_et\_al.tsv"
 * Columns:
 
   * chromosome: belonging chromosome number ("chr"+NUMBER)
