@@ -14,7 +14,7 @@ The comparison of the inferred genomic marker effects with known key genome regi
    - Multilayer perceptron (MLP): PyTorch (Paszke et al., 2019) in Python
    - Graph attention network (GAT), GAT infinitesimal, GAT fully-connected & GAT prior-knowledge: PyTorch Geometric (Fey et al., 2019) in Python 
   
-- Data: example data files based on the TeoNAM dataset (Chen et al., 2019) to run this tool
+- Data: example data files based on the TeoNAM dataset (Chen et al., 2019), MaizeNAM dataset (Buckler et al., 2009) and Arabidopsis dataset (the 1001 Genomes Consortium, 2016) to run this tool
   - Details are explained in "README.md" in the Data folder
 
 - Result: folder used as storage for output files from this tool
@@ -64,6 +64,8 @@ The comparison of the inferred genomic marker effects with known key genome regi
 6. Check and analyse the generated output files in the Result folder 
 
 ## References
+Buckler ES, Holland JB, Bradbury PJ, Acharya CB, Brown PJ, Browne C, Ersoz E, Flint-Garcia S, Garcia A, 464 Glaubitz JC et al. 2009. The genetic architecture of maize flowering time. Science. 325:714–718.
+
 Chen Q, Yang CJ, York AM, Xue W, Daskalska LL, DeValk CA, Krueger KW, Lawton SB, Spiegelberg BG, Schnell JM et al. 2019. Teonam: A nested association mapping population for domestication and agronomic trait analysis in maize. Genetics. 213:1065–1078. 
 
 Dominik G. Grimm, Damian Roqueiro, Patrice A. Salomé, Stefan Kleeberger, Bastian Greshake, Wangsheng Zhu, Chang Liu, Christoph Lippert, Oliver Stegle, Bernhard Schölkopf, Detlef Weigel, Karsten M. Borgwardt. 2017. easyGWAS: A Cloud-Based Platform for Comparing the Results of Genome-Wide Association Studies. The Plant Cell. 29. 5-19.
@@ -85,3 +87,5 @@ Pérez P, de Los Campos G. 2014. Genome-wide regression and prediction with the 
 The 1001 Genomes Consortium. 2016. 1,135 Genomes Reveal the Global Pattern of Polymorphism in Arabidopsis thaliana. Cell. 166(2). 481-491.
 
 Tomura S, Wilkinson MJ, Cooper M, Powell O. 2025. Improved genomic prediction performance with ensembles of diverse models. G3: Genes, Genomes, Genetics. p. jkaf048. 
+
+Wisser RJ, Fang Z, Holland JB, Teixeira JE, Dougherty J, Weldekidan T, de Leon N, Flint-Garcia S, Lauter N, 583 Murray SC et al. 2019. The genomic basis for short-term evolution of environmental adaptation in 584 maize. Genetics. 213:1479–1494.
