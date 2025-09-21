@@ -11,7 +11,7 @@ from torch_geometric.loader import HGTLoader
 from torch_geometric.explain import Explainer, CaptumExplainer
 
 
-def GAT_model(data_train, data_test, params):
+def GAT_infinitesimal_node_level(data_train, data_test, params):
     
     neuron = params[0]
     dropout = params[1]

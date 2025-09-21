@@ -122,7 +122,7 @@ def GP(DATA_NAME, MODEL, PHENOTYPE, POPULATION, RATIO, SAMPLE_NUM, HPARAMETERS, 
             elif MODEL[jj]  == 'GAT_infinitesimal_node_level':
                 if HPARAMETERS[MODEL[jj]][-1] == 'all':
                     HPARAMETERS[MODEL[jj]][-1] = test.shape[0] 
-                sample_pearson, sample_mse, sample_effect, predicted_test, predicted_train = GAT_model(train, test, HPARAMETERS[MODEL[jj]])
+                sample_pearson, sample_mse, sample_effect, predicted_test, predicted_train = GAT_infinitesimal_node_level(train, test, HPARAMETERS[MODEL[jj]])
             elif MODEL[jj]  == 'GAT_infinitesimal':
                 if HPARAMETERS[MODEL[jj]][-1] == 'all':
                     HPARAMETERS[MODEL[jj]][-1] = test.shape[0] 
