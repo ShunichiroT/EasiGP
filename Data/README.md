@@ -12,7 +12,7 @@ This folder contains two folders containing example files to implement both geno
 
 * TeoNAM folder: "TeoNAM\_dataset.zip", "W22TIL01(\_subset).csv", "W22TIL03.csv", "W22TIL11.csv", "W22TIL14.csv" and "W22TIL25.csv"
 * Arabidopsis folder: "Arabidopsis\_dataset.csv"
-* MaizeNAM folder: "MaizeNAM.zip" and "population\_n.csv"
+* MaizeNAM folder: "MaizeNAM.zip" and "population\_N.csv"
 * Columns:
 
   * ID: identification code for each individual
@@ -26,7 +26,7 @@ This folder contains two folders containing example files to implement both geno
 
 * TeoNAM folder: "chrom.bed", "chrom\_W22TIL01.bed", "chrom\_W22TIL03.bed", "chrom\_W22TIL11.bed", "chrom\_W22TIL14.bed" and "chromW22TIL25.bed"
 * Arabidopsis folder: "Arabidopsis\_chrom.bed"
-* MaizeNAM folder: "chrom.bed" and "chrom\_population\_n.bed"
+* MaizeNAM folder: "chrom.bed" and "chrom\_population\_N.bed"
 * Columns:
 
      * Chromosome: chromosome number ("chr"+NUMBER)
