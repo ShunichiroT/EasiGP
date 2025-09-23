@@ -70,11 +70,11 @@ This folder contains two folders containing example files to implement both geno
 5\. Marker data (marker\_info.csv)
 
 * Columns:
-* Chromosome: belonging chromosome number (NUMBER)
-* Name: name of each marker
-* Middle: the midpoint location of the marker
-* Start: the beginning location of the marker
-* End: the end location of the marker
+  * Chromosome: belonging chromosome number (NUMBER)
+  * Name: name of each marker
+  * Middle: the midpoint location of the marker
+  * Start: the beginning location of the marker
+  * End: the end location of the marker
 * Rows: markers
 
 
