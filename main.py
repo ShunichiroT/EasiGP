@@ -8,10 +8,10 @@ from circos_plot import *
 # 1. Genomic prediction configuration
 
 # Assign path for R if causing an error
-R_PATH = 'C:\Program Files\R\R-4.4.0'  #None 
+R_PATH = None   #'C:\Program Files\R\R-4.4.0'
 
 # Your target phenotypes
-PHENOTYPE = ['days2anthesis', 'asi']  #or 'all' for selecting all phenotypes in your phenotype file  
+PHENOTYPE = ['days2anthesis', 'asi']  #or 'all' 
 
 # Genomic prediction models to run
 MODEL = ['rrBLUP', 'BayesB', 'RF', 'ensemble']  
