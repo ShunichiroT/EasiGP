@@ -26,18 +26,18 @@ ITER_NUM = 1
 GENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_genotype_population_1' 
 PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1' 
 
-# Hyprparameters
-# rrBLUP:                          iteration number, burin-in
-# BayesB:                          iteration number, burin-in
-# RKHS:                            iteration number, buin-in, number of samples for Shapley scores, return marker effect?
-# RF:                              tree number, maximum fearures per tree, maximum samples per tree, number of samples for Shapley scores, return marker effect?
+# Hyperparameters
+# rrBLUP:                          iteration number, burn-in
+# BayesB:                          iteration number, burn-in
+# RKHS:                            iteration number, burn-in, number of samples for Shapley scores, return marker effect?
+# RF:                              tree number, maximum features per tree, maximum samples per tree, number of samples for Shapley scores, return marker effect?
 # SVR:                             kernel type, epsilon, regularisation, dimension for poly kernel, gamma, number of samples for Shapley scores, return marker effect?
 # MLP:                             neuron numbers, dropout, learning rate, decay, epoch, batch size, number of samples for Shapley scores
 # GAT_infinitesimal_node_level:    neuron numbers, dropout, learning rate, decay, epoch, batch size, number of heads, number of samples for Shapley scores, return marker effect?
 # GAT_infinitesimal:               neuron numbers, dropout, learning rate, decay, epoch, batch size, number of heads, number of samples for Shapley scores, return marker effect?
 # GAT_fully_connected:             neuron numbers, dropout, learning rate, decay, epoch, batch size, number of heads, number of samples for Shapley scores, return marker effect?
 # GAT_prior_knowledge:             neuron numbers, dropout, learning rate, decay, epoch, batch size, number of heads, number of samples for Shapley scores, 
-#                                  selection rate for edges from RF (e.g. 0.1= selection the top 10% of the most important edges), return marker effect?
+#                                  selection rate for edges from RF (e.g. 0.1= selection of the top 10% of the most important edges), return marker effect?
 HPARAMETERS = {'rrBLUP': [10000, 2000],     
                'BayesB': [12000, 2000],    
                'RKHS': [12000, 2000, 30, False],   
@@ -70,7 +70,7 @@ MARKER_INFO = './Data/MaizeNAM/marker_info'
 # File path for the information of chromosomes
 CHROMOSOME_INFO = './Data/MaizeNAM/chrom'
 
-# File path for the information of gene information
+# File path for the gene information
 GENE_INFO = './Data/MaizeNAM/gene_info'
 
 # Parameters
