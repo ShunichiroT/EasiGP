@@ -41,25 +41,25 @@ The comparison of the inferred genomic marker effects with known key genome regi
         - Check "Creating an environment from an environment.yml file" for the procedure in detail (https://docs.conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.html)
         - Change the path of the prefix based on your folder location of Anaconda  
 3. Prepare the relevant data in the specified format
-   - Genotype & phenotype data (csv)
-        - Columns: ID, population, markers and phenotype
+   - Genotype & data (csv)
+        - Columns: ID, population and markers
         - Rows: records
-   - Genomic marker effect (tsv)
-        - Columns: chromosome number, start location, end location, name and colour
-        - Rows: genomic markers
-   - Chromosome length (bed)
-        - Columns: Chromosome number, start location and end location
+   - Phenotype data (csv)
+        - Columns: ID, population and phenotypes
+        - Rows: records
+   - Chromosome data (csv)
+        - Columns: Chromosome number, start location, end location and population
         - Rows: chromosomes
-   - Key gene region (tsv)
-        - Columns: chromosome number, start location and end location, name and colour
+   - Key gene region (csv)
+        - Columns: chromosome number, start location, end location, name, colour, source, population and phenotype
         - Rows: genes
    - Check the Data folder for more details on formatting and examples
 4. Adjust settings and hyperparameters in the "main" function
    - Check the comments corresponding to each hyperparameter, explaining the meaning of each
-   - Change the value of each hyperparameter based on your prediction tasks and preference on visualisation of circos plots
+   - Change the value of each hyperparameter based on your prediction tasks and preference for the visualisation of circos plots
        - Set target traits, the training-test split ratio, the number of iterations, target populations, dataset name and genomic prediction models to run as the initial setting
        - Change the hyperparameters of the chosen models if needed
-       - Set the scope of your cirpos plot (overall or population-wise), key genetic marker region file name, visualisation configuration and colour palette for circos plots
+       - Set paths for relevant geneomic marker information datasets, visualisation configuration and colour palette for circos plots
 5. Run the "main.py" file to implement the "GP" and "circos_plot" functions 
 6. Check and analyse the generated output files in the Result folder 
 
