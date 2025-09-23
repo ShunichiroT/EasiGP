@@ -7,17 +7,24 @@ from circos_plot import *
 ### ============= ###
 # 1. Genomic prediction configuration
 
-R_PATH = None  #None # Assign path for R if causing an error
+# Assign path for R if causing an error
+R_PATH = 'C:\Program Files\R\R-4.4.0'  #None 
 
-TOTAL_PHENOTYPE = 1           # Total nummber of phenotype columns in your dataset
-PHENOTYPE = ['DTA']           # Your target phenotypes. ['DTA', 'RBN', 'RL' ,'DTF3','FT16', 'FT10'] options for Arabidopsis
+# Your target phenotypes
+PHENOTYPE = ['days2anthesis', 'asi']  #or 'all' for selecting all phenotypes in your phenotype file  
 
-MODEL = ['rrBLUP', 'BayesB', 'RKHS', 'RF', 'SVR', 'MLP', 'GAT', 'ensemble'] # Genomic prediction models to run
+# Genomic prediction models to run
+MODEL = ['rrBLUP', 'BayesB', 'RF', 'ensemble']  
 
-POPULATION = ['W22TIL01']    # Your target population in your dataset
-RATIO = [0.8, 0.65, 0.5]     # training set ratio
-ITER_NUM = 1                 # Number of iterations with random sampling ror training & test sets
-DATA_NAME = './Data/TeoNAM/W22TIL01_subset' # Name of your genotype & phenotype dataset # Geno_pheno_adjusted_GRM_ver2'
+# training set ratio
+RATIO = [0.8]     
+
+# Number of iterations with random sampling for training & test sets
+ITER_NUM = 1
+
+# File paths for your genotype & phenotype files
+GENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_genotype_population_1' 
+PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1' 
 
 # Hyprparameters
 # rrBLUP:                          iteration number, burin-in
@@ -57,19 +64,14 @@ SCATTER_CONFIG = {'font_size':2,
                   'fig_size':30}
 
 # 3. Circos plot configuration
-SCOPE = 'overall' #overall or population
+# File path for the information of all markers
+MARKER_INFO = './Data/MaizeNAM/marker_info'
 
-# File name containing the information of all markers
-MARKER_INFO = './Data/TeoNAM/marker_info'
+# File path for the information of chromosomes
+CHROMOSOME_INFO = './Data/MaizeNAM/chrom'
 
-# File name array containing the length of chromosome
-CHROMOSOME_INFO = ['./Data/TeoNAM/chrom']
-
-# File name(s) nested array containing key known gene locations. 
-# Each subarray indicates key gene file(s) for phenotype(s) in each population
-# Each subsubarray (if there are more than one target phenotypes) indicates key gene files for a particular phenotype
-# The number of subarrays must be the same with the number of POPULATION
-GENE_INFO = [['./Data/TeoNAM/Genes_leaf', './Data/TeoNAM/Genes_SAM']]*len(POPULATION)
+# File path for the information of gene information
+GENE_INFO = './Data/MaizeNAM/gene_info'
 
 # Parameters
 # space:           space size between rings
@@ -85,10 +87,10 @@ CIRCOS_CONFIG = {'space':3,
                  'link_width':10,
                  'interaction_top':0.9999,
                  'label_size':6,
-                 'scale':1000000}
+                 'scale':10000}
 
 # adjust the end location of each marker for visualisation
-end_adjust = 100000
+end_adjust = 10
 
 # colour palette for circos plot
 CYTOBAND_COLORMAP = {   
@@ -130,12 +132,12 @@ CYTOBAND_COLORMAP = {
 ### ============= ###
 
 # Run genomic prediction models
-metrics, predicted_result_train, predicted_result_test, effect, interactions = \
-    GP(DATA_NAME, MODEL, PHENOTYPE, POPULATION, RATIO, ITER_NUM, HPARAMETERS, TOTAL_PHENOTYPE, R_PATH)
+metrics, predicted_result_train, predicted_result_test, effect, interactions, POPULATION, PHENOTYPE = \
+    GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, ITER_NUM, HPARAMETERS, R_PATH)
 
 # Generate scatter plot matrices if needed
 if SCATTER_CREATE:
     scatter_plot(MODEL, PHENOTYPE, predicted_result_test, effect, QTL, SCATTER_CONFIG)
 
 # Generate circos plots
-circos_plot(effect, SCOPE, interactions, MARKER_INFO, CHROMOSOME_INFO, GENE_INFO, PHENOTYPE, MODEL, CIRCOS_CONFIG, end_adjust, CYTOBAND_COLORMAP, POPULATION) 
+circos_plot(effect, interactions, MARKER_INFO, CHROMOSOME_INFO, GENE_INFO, POPULATION, PHENOTYPE, MODEL, CIRCOS_CONFIG, end_adjust, CYTOBAND_COLORMAP) 

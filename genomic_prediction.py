@@ -39,7 +39,7 @@ def metric_plot(record, MODEL):
         g.savefig("./Result/"+metrics[i]+".png") 
 
     
-def GP(DATA_NAME, MODEL, PHENOTYPE, POPULATION, RATIO, SAMPLE_NUM, HPARAMETERS, TOTAL_PHENOTYPE, R_PATH):
+def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_NUM, HPARAMETERS, R_PATH):
     
     # Import R modules
     if R_PATH != None:
@@ -58,7 +58,13 @@ def GP(DATA_NAME, MODEL, PHENOTYPE, POPULATION, RATIO, SAMPLE_NUM, HPARAMETERS, 
     RKHS = robjects.globalenv['RKHS']
     
     # Read genotype and phenotype data
-    data_original = pd.read_csv(DATA_NAME+'.csv')
+    data_genotype_original = pd.read_csv(GENOTYPE_FILE_NAME+'.csv')
+    data_phenotype_original = pd.read_csv(PHENOTYPE_FILE_NAME+'.csv')
+    
+    POPULATION = pd.unique(data_genotype_original['population'])
+    
+    if (type(PHENOTYPE) is not list) and (PHENOTYPE == 'all'):
+        PHENOTYPE = list(data_phenotype_original.columns[2:])
     
     # Create the total number of combinations of prediction scenarios
     sample = pd.DataFrame({'population':[item for item in POPULATION for i in range(SAMPLE_NUM*len(PHENOTYPE)*len(RATIO))],
@@ -66,16 +72,18 @@ def GP(DATA_NAME, MODEL, PHENOTYPE, POPULATION, RATIO, SAMPLE_NUM, HPARAMETERS, 
                             'ratio':[item for item in RATIO for i in range(SAMPLE_NUM)]*len(POPULATION)*len(PHENOTYPE),
                             'sample':list(range(1,SAMPLE_NUM+1)) *len(PHENOTYPE)*len(POPULATION)*len(RATIO)})
         
-    record = pd.DataFrame()  #store performance metrics
+    record = pd.DataFrame()       #store performance metrics
     result_train = pd.DataFrame() #store predicted phenotypes for train set
-    result_test = pd.DataFrame() #store predicted phenotypes for test set
-    effect = pd.DataFrame() #store genomic marker effects
+    result_test = pd.DataFrame()  #store predicted phenotypes for test set
+    effect = pd.DataFrame()       #store genomic marker effects
     interactions = pd.DataFrame() #store marker interaction effects
 
     for i in range(sample.shape[0]):
         # Convert the data structure
-        data = data_original[data_original['population']==sample.loc[i,'population']].reset_index(drop=True)
-        data = pd.concat([data.iloc[:,:-TOTAL_PHENOTYPE], data[sample.loc[i,'phenotype']]],axis=1).dropna()
+        data_genotype = data_genotype_original[data_genotype_original['population']==sample.loc[i,'population']].reset_index(drop=True)
+        data_phenotype = data_phenotype_original.loc[data_phenotype_original['population']==sample.loc[i,'population'], ['ID','population',sample.loc[i,'phenotype']]].reset_index(drop=True)
+        data = data_genotype.merge(data_phenotype, on=['ID','population']).dropna().reset_index(drop=True)
+        
         train, test = train_test_split(data,train_size=sample.loc[i,'ratio'], random_state=sample.loc[i,'sample'])
         train, test = train.reset_index(drop=True), test.reset_index(drop=True)
         id_train, id_test = train.iloc[:,0], test.iloc[:,0]
@@ -176,7 +184,7 @@ def GP(DATA_NAME, MODEL, PHENOTYPE, POPULATION, RATIO, SAMPLE_NUM, HPARAMETERS, 
                 result_train_sample = pd.concat([result_train_sample,
                                                 pd.DataFrame({MODEL[jj]:predicted_train})
                                               ], axis=1)  
-                
+            
             if sample_effect.shape[0] != 0:
                 sample_effect.columns = train.columns.tolist()[:-1]
                 effect_sample = pd.DataFrame([{'population': sample.loc[i,'population'],
@@ -224,4 +232,4 @@ def GP(DATA_NAME, MODEL, PHENOTYPE, POPULATION, RATIO, SAMPLE_NUM, HPARAMETERS, 
     # Store violin plots
     metric_plot(record.copy(), MODEL)
     
-    return record, result_train, result_test, effect, interactions
+    return record, result_train, result_test, effect, interactions, POPULATION, PHENOTYPE
