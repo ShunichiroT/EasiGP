@@ -9,18 +9,18 @@ from circos_plot import *
 
 # Assign path for R if causing an error
 # e.g.'C:\Program Files\R\R-4.4.0'
-R_PATH = 'C:\Program Files\R\R-4.4.0'
+R_PATH = None
 
 # Your target phenotypes
 # Write 'all' to select all phenotypes in your phenotype file  
-PHENOTYPE = ['days2anthesis','asi'] 
+PHENOTYPE = ['days2anthesis', 'asi'] 
 
 # Name of genomic prediction models to run
-MODEL = ['rrBLUP', 'BayesB', 'RKHS', 'RF', 'SVR','MLP', 'ensemble'] 
+MODEL = ['rrBLUP', 'BayesB', 'RKHS', 'RF', 'SVR', 'MLP', 'ensemble'] 
 
-# Data spliting ratio
-# If elements are in float values, they are used to as training set ratio when 
-# spliting the data into training and test sets
+# Data splitting ratio
+# If elements are in float values, they are used as the training set ratio when 
+# splitting the data into training and test sets
     # e.g. [0.8, 0.65, 0.5]
 
 # If elements are in tuple formats, they are used to split the data into 
@@ -32,16 +32,16 @@ MODEL = ['rrBLUP', 'BayesB', 'RKHS', 'RF', 'SVR','MLP', 'ensemble']
 # The element of each tuple shows the ratio of the training, 
 # validation and test set, respectively
 
-RATIO = [(0.5,0.25,0.25)]  #[(0.5,0.25,0.25)]     #[0.8]     
+RATIO = [0.8]
 
 # Number of iterations with random sampling for training & test sets
-ITER_NUM = 2
+ITER_NUM = 1
 
 # File paths for your genotype & phenotype files
 GENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_genotype_population_1.csv' 
 PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1.csv' 
 
-# Hyprparameters
+# Hyperparameters
 # rrBLUP:                          
     # iteration number, burin-in
 # BayesB:                          
@@ -50,7 +50,7 @@ PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1.c
     # iteration number, buin-in, number of samples for Shapley scores, 
     # return marker effect?
 # RF:                              
-    # tree number, maximum fearures per tree, maximum samples per tree, 
+    # tree number, maximum features per tree, maximum samples per tree, 
     # number of samples for Shapley scores, return marker effect?
 # SVR:                             
     # kernel type, epsilon, regularisation, dimension for poly kernel, gamma, 
@@ -85,7 +85,7 @@ HPARAMETERS = {'rrBLUP': [10000, 2000],
 
 # Method names for weight optimisation in ensembles 
 # The current available methods 
-# ['Nelder_Mead','Linear transformation', 'Bayesian_optimisation']
+# ['Nelder_Mead', 'Linear transformation', 'Bayesian_optimisation']
 
 # Write "None" if you implement naive ensemble approach 
 W_OPT = ['Nelder Mead', 'Bayesian optimisation', 'Linear transformation'] 
@@ -125,11 +125,11 @@ CHROMOSOME_INFO = './Data/MaizeNAM/chrom.csv'
 # File path for the information of all markers
 MARKER_INFO = './Data/MaizeNAM/marker_info.csv'
 
-# File path for key gene region information for comaprison
+# File path for key gene region information for comparison
 # Write 'None' if no key gene region information needs to be included
 GENE_INFO = './Data/MaizeNAM/gene_info.csv'
 
-# Configuration for ciscos plots
+# Configuration for circos plots
 # space:           space size between rings
 # start:           start angle of a ring
 # end:             end angle of a ring
