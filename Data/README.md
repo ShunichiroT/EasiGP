@@ -41,7 +41,7 @@ This folder contains two folders containing example files to implement both geno
   * Chromosome: chromosome number ("chr"+NUMBER)
   * Start: the beginning location of the chromosome (the value should be 0 for the standard use)
   * End: the end location of the chromosome
-  * Population: target population
+  * Population: target population (write "all" for across all populations)
 
 * Rows:
 
@@ -61,7 +61,7 @@ This folder contains two folders containing example files to implement both geno
   * Colour: allocated colour of each gene
   * Source: information source of each gene. Used as the name of each ring section for a circos plot
   * Phenotype: target phenotype of each gene
-  * Population: target population of each gene
+  * Population: target population of each gene (write "all" for across all populations)
 
 * Rows: markers
 
