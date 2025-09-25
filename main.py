@@ -4,51 +4,104 @@ from circos_plot import *
   
 
 # Change below
-### ============= ###
+### ======================================================================= ###
 # 1. Genomic prediction configuration
 
 # Assign path for R if causing an error
-R_PATH = None   #'C:\Program Files\R\R-4.4.0'
+# e.g.'C:\Program Files\R\R-4.4.0'
+R_PATH = 'C:\Program Files\R\R-4.4.0'
 
 # Your target phenotypes
-PHENOTYPE = ['days2anthesis', 'asi']  #or 'all' 
+# Write 'all' to select all phenotypes in your phenotype file  
+PHENOTYPE = ['days2anthesis','asi'] 
 
-# Genomic prediction models to run
-MODEL = ['rrBLUP', 'BayesB', 'RF', 'ensemble']  
+# Name of genomic prediction models to run
+MODEL = ['rrBLUP', 'BayesB', 'RKHS', 'RF', 'SVR','MLP', 'ensemble'] 
 
-# training set ratio
-RATIO = [0.8]     
+# Data spliting ratio
+# If elements are in float values, they are used to as training set ratio when 
+# spliting the data into training and test sets
+    # e.g. [0.8, 0.65, 0.5]
+
+# If elements are in tuple formats, they are used to split the data into 
+# training, validation and test sets
+
+# The data needs to be split into training, validation and test sets for 
+# weight optimisation
+    # e.g. [(0.5,0.25,0.25),(0.8,0.1,0.1)] 
+# The element of each tuple shows the ratio of the training, 
+# validation and test set, respectively
+
+RATIO = [(0.5,0.25,0.25)]  #[(0.5,0.25,0.25)]     #[0.8]     
 
 # Number of iterations with random sampling for training & test sets
-ITER_NUM = 1
+ITER_NUM = 2
 
 # File paths for your genotype & phenotype files
-GENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_genotype_population_1' 
-PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1' 
+GENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_genotype_population_1.csv' 
+PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1.csv' 
 
-# Hyperparameters
-# rrBLUP:                          iteration number, burn-in
-# BayesB:                          iteration number, burn-in
-# RKHS:                            iteration number, burn-in, number of samples for Shapley scores, return marker effect?
-# RF:                              tree number, maximum features per tree, maximum samples per tree, number of samples for Shapley scores, return marker effect?
-# SVR:                             kernel type, epsilon, regularisation, dimension for poly kernel, gamma, number of samples for Shapley scores, return marker effect?
-# MLP:                             neuron numbers, dropout, learning rate, decay, epoch, batch size, number of samples for Shapley scores
-# GAT_infinitesimal_node_level:    neuron numbers, dropout, learning rate, decay, epoch, batch size, number of heads, number of samples for Shapley scores, return marker effect?
-# GAT_infinitesimal:               neuron numbers, dropout, learning rate, decay, epoch, batch size, number of heads, number of samples for Shapley scores, return marker effect?
-# GAT_fully_connected:             neuron numbers, dropout, learning rate, decay, epoch, batch size, number of heads, number of samples for Shapley scores, return marker effect?
-# GAT_prior_knowledge:             neuron numbers, dropout, learning rate, decay, epoch, batch size, number of heads, number of samples for Shapley scores, 
-#                                  selection rate for edges from RF (e.g. 0.1= selection of the top 10% of the most important edges), return marker effect?
+# Hyprparameters
+# rrBLUP:                          
+    # iteration number, burin-in
+# BayesB:                          
+    # iteration number, burin-in
+# RKHS:                            
+    # iteration number, buin-in, number of samples for Shapley scores, 
+    # return marker effect?
+# RF:                              
+    # tree number, maximum fearures per tree, maximum samples per tree, 
+    # number of samples for Shapley scores, return marker effect?
+# SVR:                             
+    # kernel type, epsilon, regularisation, dimension for poly kernel, gamma, 
+    # number of samples for Shapley scores, return marker effect?
+# MLP:                             
+    # neuron numbers, dropout, learning rate, decay, epoch, batch size, 
+    # number of samples for Shapley scores
+# GAT_infinitesimal_node_level:    
+    # neuron numbers, dropout, learning rate, decay, epoch, batch size, 
+    # number of heads, number of samples for Shapley scores, return marker effect?
+# GAT_infinitesimal:               
+    # neuron numbers, dropout, learning rate, decay, epoch, batch size, 
+    # number of heads, number of samples for Shapley scores, return marker effect?
+# GAT_fully_connected:             
+    # neuron numbers, dropout, learning rate, decay, epoch, batch size, 
+    # number of heads, number of samples for Shapley scores, return marker effect?
+# GAT_prior_knowledge:             
+    # neuron numbers, dropout, learning rate, decay, epoch, batch size, 
+    # number of heads, number of samples for Shapley scores, 
+    # selection rate for edges from RF (e.g. 0.1 = selection the top 10% of the 
+    # most important edges), return marker effect?
 HPARAMETERS = {'rrBLUP': [10000, 2000],     
                'BayesB': [12000, 2000],    
                'RKHS': [12000, 2000, 30, False],   
-               'RF': [1000, 1.0, None, 30, True],           
+               'RF': [1000, 1.0, None, 30, False],           
                'SVR':['rbf', 0.5, 1.0, 3, 'scale', 30, False],      
-               'MLP':[30, 0, 0.001, 5e-4, 30, 8, 10],
-               'GAT_infinitesimal_node_level':[20, 0.9, 0.005, 5e-4, 1, 8, 1, 30, True],
+               'MLP':[30, 0, 0.0001, 5e-4, 100, 8, 10],
+               'GAT_infinitesimal_node_level':[20, 0.9, 0.005, 5e-4, 1, 8, 1, 3, False],
                'GAT_infinitesimal':[20, 0, 0.01, 5e-4, 40, 8, 1, 1, True],
                'GAT_fully_connected':[20, 0, 0.01, 5e-4, 40, 8, 1, 1, True],
-               'GAT_prior_knowledge':[20, 0, 0.01, 5e-4, 40, 8, 1, 1, 0.2, True]} 
+               'GAT_prior_knowledge':[20, 0, 0.01, 5e-4, 1, 8, 1, 1, 0.2, True]} 
 
+# Method names for weight optimisation in ensembles 
+# The current available methods 
+# ['Nelder_Mead','Linear transformation', 'Bayesian_optimisation']
+
+# Write "None" if you implement naive ensemble approach 
+W_OPT = ['Nelder Mead', 'Bayesian optimisation', 'Linear transformation'] 
+
+# Hyperparameters for weight optimisation
+# Linear transformation:
+    # learning rate, epochs, decay, batch size, patience value, number of MLP models  
+# Nelder_Mead:
+    # initial value, minimum boundary, maximum boundary, fatol, xatol, adaptive
+# Bayesian:
+    # minimum boundary, maximum boundary, iterations, point numbers, allow duplicate points
+HYPERPARAMETERS_OPT = {'Linear transformation':[0.005, 150, 0.01, 2, 10, 30],
+                       'Nelder Mead': [5, 0, 10, 1e-8, 1e-8, False],
+                       'Bayesian optimisation': [0.0001, 10.0, 200, 1, True]}
+
+# ---------------------------------------------------------------------------- #
 # 2.Scatter plot matrix configuration
 
 # True if scatter plot is needed. False otherwise
@@ -63,17 +116,20 @@ QTL = None
 SCATTER_CONFIG = {'font_size':2,
                   'fig_size':30}
 
+# ---------------------------------------------------------------------------- #
 # 3. Circos plot configuration
-# File path for the information of all markers
-MARKER_INFO = './Data/MaizeNAM/marker_info'
 
 # File path for the information of chromosomes
-CHROMOSOME_INFO = './Data/MaizeNAM/chrom'
+CHROMOSOME_INFO = './Data/MaizeNAM/chrom.csv'
 
-# File path for the gene information
-GENE_INFO = './Data/MaizeNAM/gene_info'
+# File path for the information of all markers
+MARKER_INFO = './Data/MaizeNAM/marker_info.csv'
 
-# Parameters
+# File path for key gene region information for comaprison
+# Write 'None' if no key gene region information needs to be included
+GENE_INFO = './Data/MaizeNAM/gene_info.csv'
+
+# Configuration for ciscos plots
 # space:           space size between rings
 # start:           start angle of a ring
 # end:             end angle of a ring
@@ -89,7 +145,7 @@ CIRCOS_CONFIG = {'space':3,
                  'label_size':6,
                  'scale':10000}
 
-# adjust the end location of each marker for visualisation
+# adjust the edge location of each marker for visualisation
 end_adjust = 10
 
 # colour palette for circos plot
@@ -129,15 +185,18 @@ CYTOBAND_COLORMAP = {
        "red9": "#874001",
        "red10": "#610901"
    }
-### ============= ###
+
+### ======================================================================= ###
 
 # Run genomic prediction models
-metrics, predicted_result_train, predicted_result_test, effect, interactions, POPULATION, PHENOTYPE = \
-    GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, ITER_NUM, HPARAMETERS, R_PATH)
+metrics, predicted_result_train, predicted_result_test, effect, interactions, \
+    POPULATION, PHENOTYPE = GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, 
+                               PHENOTYPE, RATIO, ITER_NUM, HPARAMETERS, R_PATH, W_OPT, HYPERPARAMETERS_OPT)
 
 # Generate scatter plot matrices if needed
 if SCATTER_CREATE:
     scatter_plot(MODEL, PHENOTYPE, predicted_result_test, effect, QTL, SCATTER_CONFIG)
 
 # Generate circos plots
-circos_plot(effect, interactions, MARKER_INFO, CHROMOSOME_INFO, GENE_INFO, POPULATION, PHENOTYPE, MODEL, CIRCOS_CONFIG, end_adjust, CYTOBAND_COLORMAP) 
+circos_plot(effect, interactions, MARKER_INFO, CHROMOSOME_INFO, GENE_INFO, 
+            POPULATION, PHENOTYPE, CIRCOS_CONFIG, end_adjust, CYTOBAND_COLORMAP) 

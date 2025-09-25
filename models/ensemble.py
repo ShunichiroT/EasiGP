@@ -22,26 +22,35 @@ def metric(data):
     
     return pd.Series(dict(Pearson = r, MSE = mse))
 
-def ensemble(train, test, effect, MODEL):
+def ensemble(train, valid, test, effect, MODEL):
     # Load prediction result from individual prediction models
     result_train = train
+    result_valid = valid
     result_test = test
     
-    result_test['ensemble'] = result_test.iloc[:,-len(MODEL)+1:].mean(axis=1)
-    result_train['ensemble'] = result_train.iloc[:,-len(MODEL)+1:].mean(axis=1)
+    model_selected = MODEL.copy()
+    if 'ensemble' in MODEL:
+        model_selected.remove('ensemble')
+    
+    # Arithmetic mean calculation & perfomrance metrics
+    result_test['ensemble'] = result_test.loc[:,model_selected].mean(axis=1)
+    if valid.shape[0] != 0:
+        result_valid['ensemble'] = result_valid.loc[:,model_selected].mean(axis=1)
+    result_train['ensemble'] = result_train.loc[:,model_selected].mean(axis=1)
     
     record = result_test.loc[:,list(result_test.columns[1:6])+['ensemble']].groupby(list(result_test.columns[1:5]), as_index=False).apply(metric).reset_index(drop=True)
     record = record.rename(columns={"Pearson": "Pearson correlation"})
     record['type'] = 'ensemble'
     
+    # Extract genomic marker effects
     effect = pd.concat([effect.iloc[:,:5],
-                        effect.iloc[:,5:].abs().div(effect.iloc[:,5:].abs().sum(axis=1),axis=0)
+                        effect.iloc[:,5:].abs().reset_index(drop=True).div(effect.iloc[:,5:].abs().sum(axis=1).reset_index(drop=True),axis=0)
                        ], axis=1)
     
     effect_ensemble = pd.DataFrame()
     cnt = 0
-    for kkk in range(len(MODEL)):
-        selected = effect[effect['type']==MODEL[kkk]].reset_index(drop=True)
+    for kkk in range(len(model_selected)):
+        selected = effect[effect['type']==model_selected[kkk]].reset_index(drop=True)
         if selected.shape[0] != 0:
             if effect_ensemble.shape[0] == 0:
                 effect_ensemble = selected
@@ -53,5 +62,5 @@ def ensemble(train, test, effect, MODEL):
     effect_ensemble.iloc[:,5:] = effect_ensemble.iloc[:,5:] / cnt
     effect_ensemble['type'] = 'ensemble'
         
-    return result_train, result_test, record, effect_ensemble
+    return result_train, result_valid, result_test, record, effect_ensemble
 

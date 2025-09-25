@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 
 def data_conversion(chrom_info, gene_info, PHENOTYPE):
-    chromosome = pd.read_csv(chrom_info+'.csv')
+    chromosome = pd.read_csv(chrom_info)
     chromosome_population = pd.unique(chromosome['population'])
     
     for i in range(len(chromosome_population)):
@@ -11,18 +11,23 @@ def data_conversion(chrom_info, gene_info, PHENOTYPE):
         chromosome_selected = chromosome_selected.drop(['population'],axis=1)
         chromosome_selected.to_csv('./Result/chrom_'+str(chromosome_population[i])+'.bed', sep='\t', index=False)
     
-    gene = pd.read_csv(gene_info+'.csv')
-    gene_population = pd.unique(gene['population'])
-    gene_source = pd.unique(gene['source'])
-    for i in range(len(PHENOTYPE)):
-        for j in range(len(gene_population)):
-            for k in range(len(gene_source)):
-                gene_selected = gene[(gene['population']==gene_population[j]) & (gene['phenotype']==PHENOTYPE[i]) & (gene['source']==gene_source[k])]
-                gene_selected = gene_selected.drop(['source','population','phenotype'],axis=1)
-                gene_selected.to_csv('./Result/gene_info_'+str(PHENOTYPE[i])+'_'+str(gene_source[k])+'_'+str(chromosome_population[j])+'.tsv', sep='\t', index=False)
+    if gene_info is not None:
+        gene = pd.read_csv(gene_info)
+        gene_population = pd.unique(gene['population'])
+        gene_source = pd.unique(gene['source'])
+        for i in range(len(PHENOTYPE)):
+            for j in range(len(gene_population)):
+                for k in range(len(gene_source)):
+                    gene_selected = gene[(gene['population']==gene_population[j]) & (gene['phenotype']==PHENOTYPE[i]) & (gene['source']==gene_source[k])]
+                    gene_selected = gene_selected.drop(['source','population','phenotype'],axis=1)
+                    if gene_selected.shape[0] != 0:
+                        gene_selected.to_csv('./Result/gene_info_'+str(PHENOTYPE[i])+'_'+str(gene_source[k])+'_'+str(chromosome_population[j])+'.tsv', sep='\t', index=False)
+        
+        pop_source = gene.loc[:,['phenotype','population','source']].drop_duplicates()
     
-    pop_source = gene.loc[:,['population','source']].drop_duplicates()
-
+    else:
+        pop_source = None
+        
     return pop_source
 
 def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_adjust, POPULATION):
@@ -30,19 +35,21 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
     chromosome = pd.read_csv('./Result/chrom_'+str(POPULATION)+'.bed', delimiter='\t')
     
     # Convert genomic marker effects into ten level quantiles
-    effect.iloc[:,5:] = effect.iloc[:,5:].abs()
+    effect.iloc[:,5:] = effect.iloc[:,5:].abs().astype(float)
+    effect = effect.drop('ratio', axis=1)
     if POPULATION == 'all':
         effect_grouped = effect.iloc[:,1:].groupby(['phenotype','type']).mean()
     else:
         effect_grouped = effect.groupby(['population','phenotype','type']).mean()
     effect_grouped = effect_grouped.reset_index(drop=False)
     REMOVE = []
+
     for iii in range(len(MODEL)):
-        colour = 'red' if MODEL[iii] == 'ensemble' else 'blue'
+        colour = 'red' if MODEL[iii] in ['ensemble', 'Linear transformation', 'Nelder Mead', 'Bayesian optimisation'] else 'blue'
         if POPULATION == 'all':
-            effect_selected = effect_grouped[(effect_grouped['type']==MODEL[iii]) & (effect_grouped['phenotype']==PHENOTYPE)].iloc[:,4:].T
+            effect_selected = effect_grouped[(effect_grouped['type']==MODEL[iii]) & (effect_grouped['phenotype']==PHENOTYPE)].iloc[:,3:].T
         else:
-            effect_selected = effect_grouped[(effect_grouped['type']==MODEL[iii]) & (effect_grouped['phenotype']==PHENOTYPE) & (effect_grouped['population']==POPULATION)].iloc[:,4:].T
+            effect_selected = effect_grouped[(effect_grouped['type']==MODEL[iii]) & (effect_grouped['phenotype']==PHENOTYPE) & (effect_grouped['population']==POPULATION)].iloc[:,3:].T
         if effect_selected.shape[1] != 0:
             effect_selected_copy = effect_selected.copy()
             effect_selected_copy.iloc[:,0] = colour+'1'
@@ -67,7 +74,7 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
             
             effect_selected_copy.columns = ['colour']
             effect_selected_copy = effect_selected_copy.reset_index(drop=False)
-            marker = pd.read_csv(marker_info+'.csv')
+            marker = pd.read_csv(marker_info)
             merged = pd.merge(effect_selected_copy, marker, left_on=['index'], right_on=['name'])
             merged = merged.loc[:,['chromosome','start','end','index','colour']]
             merged['start'] = (merged['start'] - end_adjust).round().astype(int)
@@ -100,13 +107,13 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION):
         return pd.DataFrame()
     
     interaction = interaction[(interaction['from'] != 'factor') & (interaction['to'] != 'factor')]
-    interaction_total = interaction.groupby(['phenotype','from','to'], as_index=False).mean()
+    interaction_total = interaction.groupby(['phenotype','from','to'], as_index=False).mean(numeric_only=True)
     
     interaction_selected = interaction_total[interaction_total['phenotype'] == PHENOTYPE]
     interaction_selected = interaction_selected[interaction_selected['value'] >= np.quantile(interaction_selected['value'], circos_config['interaction_top'])].reset_index(drop=True)
     interaction_selected['value'] = interaction_selected['value'] / interaction_selected['value'].sum()
     
-    loc_info = pd.read_csv(marker_info+'.csv')
+    loc_info = pd.read_csv(marker_info)
     
     start = pd.merge(interaction_selected['from'], loc_info, 'inner', left_on='from', right_on='name')
     end = pd.merge(interaction_selected['to'], loc_info, 'inner', left_on='to', right_on='name')
@@ -132,15 +139,16 @@ def plot(interactions, chrom_info, gene_info, pop_source, PHENOTYPE, MODEL, circ
          cnt+=1
     
     # Add known gene regions
-    gene_source = pd.unique(pop_source.loc[pop_source['population']==str(POPULATION),'source'])
-    for i in range(len(gene_source)):    
-        circos.add_cytoband_tracks((97-(3*cnt), 100-(3*cnt)), './Result/gene_info_'+str(PHENOTYPE)+'_'+str(gene_source[i])+'_'+str(POPULATION)+'.tsv', track_name=gene_source[i], cytoband_cmap=CYTOBAND_COLORMAP)
-        circos.text(gene_source[i], r=circos.tracks[-1].r_center-1, deg=0, size=8, color="black")
-        cnt+=1
+    if gene_info is not None:
+        gene_source = pd.unique(pop_source.loc[(pop_source['population']==str(POPULATION)) & (pop_source['phenotype']==str(PHENOTYPE)),'source'])
+        for i in range(len(gene_source)):    
+            circos.add_cytoband_tracks((97-(3*cnt), 100-(3*cnt)), './Result/gene_info_'+str(PHENOTYPE)+'_'+str(gene_source[i])+'_'+str(POPULATION)+'.tsv', track_name=gene_source[i], cytoband_cmap=CYTOBAND_COLORMAP)
+            circos.text(gene_source[i], r=circos.tracks[-1].r_center-1, deg=0, size=8, color="black")
+            cnt+=1
     
     # Add ticks to the outermost ring
     for sector in circos.sectors:
-        sector.text(sector.name, r=110, size=10)
+        sector.text(sector.name, r=105, size=10)
         sector.get_track(MODEL[0]).xticks_by_interval(
             circos_config['scale'],
             label_size=circos_config['label_size'],
@@ -163,10 +171,14 @@ def plot(interactions, chrom_info, gene_info, pop_source, PHENOTYPE, MODEL, circ
     fig = circos.plotfig()
     fig.savefig('./Result/circos_'+str(PHENOTYPE)+'_'+str(POPULATION)+'.png',dpi=600) 
 
-def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULATION, PHENOTYPE, MODEL, circos_config, end_adjust, CYTOBAND_COLORMAP):
-
+def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULATION, PHENOTYPE, circos_config, end_adjust, CYTOBAND_COLORMAP):
+    
+    #if 'Linear transformation' in effect['type'].values:
+    #     effect = effect[effect['type']!='Linear transformation'].reset_index(drop=True)
+         
     pop_source =  data_conversion(chrom_info, gene_info, PHENOTYPE)
     POPULATION = ('all',) + tuple(POPULATION)
+    MODEL = pd.unique(effect['type'])
 
     for i in range(len(PHENOTYPE)):
         for j in range(len(POPULATION)):

@@ -6,6 +6,20 @@ import pandas as pd
 
 def scatter_plot(MODEL, PHENOTYPE, predicted_result_test, effect, QTL, SCATTER_CONFIG):
     
+    #if 'Linear transformation' in list(predicted_result_test.columns):
+    #    predicted_result_test = predicted_result_test.drop('Linear transformation', axis=1)
+    #elif 'Nelder_Mead' in list(predicted_result_test.columns):
+    #    predicted_result_test = predicted_result_test.drop('Nelder Mead', axis=1)
+    
+    #if 'Linear transformation' in effect['type'].values:
+    #     effect = effect[effect['type']!='Linear transformation'].reset_index(drop=True)
+    #elif 'Nelder_Mead' in effect['type'].values:
+    #     effect = effect[effect['type']!='Nelder_Mead'].reset_index(drop=True)
+    
+    model_selected = MODEL.copy()
+    if 'ensemble' in MODEL:
+        model_selected.remove('ensemble')
+        
     # Setting
     sns.set_theme(style="whitegrid", font_scale = SCATTER_CONFIG['font_size'], rc={"figure.dpi":300, 'savefig.dpi':300})
     markers = {"non-QTL": "s", "QTL": "v", "phenotype": "o"}
@@ -45,35 +59,37 @@ def scatter_plot(MODEL, PHENOTYPE, predicted_result_test, effect, QTL, SCATTER_C
         effect_formatted['level'] = 'non-QTL'
         
         if QTL:
-            QTL_info_selected = QTL_info[QTL_info['phenotype']==MODEL[k]]
+            QTL_info_selected = QTL_info[QTL_info['phenotype']==PHENOTYPE[k]]
             effect_formatted.loc[effect_formatted['marker'].isin(QTL_info_selected['marker'].tolist()),'level']='QTL'   
         
         # Combine both predicted phenotype and marker effect information
         data_scatter = pd.concat([predicted_test_formatted,
                                   effect_formatted.iloc[:,1:]]).fillna(0)
-        data_scatter = data_scatter.drop('ensemble',axis=1)
+        
+        #if 'ensemble' in list(data_scatter.columns):
+        #    data_scatter = data_scatter.drop('ensemble',axis=1)
         
         # Set the matrix size
-        fig, axes = plt.subplots(data_scatter.shape[1]-1, data_scatter.shape[1]-1, figsize=(figsize, figsize))
+        fig, axes = plt.subplots(len(model_selected), len(model_selected), figsize=(figsize, figsize))
         
         # Determine which subplots show marker effects 
-        lower = np.arange(0, (data_scatter.shape[1]-1)*(data_scatter.shape[1]-1)).reshape((data_scatter.shape[1]-1),(data_scatter.shape[1]-1))
-        lower = list(lower[np.tril_indices(data_scatter.shape[1]-1, k = -1)])
+        lower = np.arange(0, (len(model_selected))*(len(model_selected))).reshape(len(model_selected),len(model_selected))
+        lower = list(lower[np.tril_indices(len(model_selected), k = -1)])
         
         # Generate a subplot per model combination in both types
-        for i in range(data_scatter.shape[1]-1):
-            for j in range(data_scatter.shape[1]-1):
+        for i in range(len(model_selected)):
+            for j in range(len(model_selected)):
                 if i == j:
                     continue
-                elif ((data_scatter.shape[1]-1)*i)+j in lower:
+                elif (len(model_selected)*i)+j in lower:
                     extracted = data_scatter[data_scatter['level'] != 'phenotype']
-                    sns.scatterplot(ax=axes[i, j], data=extracted, x=MODEL[j], y=MODEL[i],hue=extracted['level'],
+                    sns.scatterplot(ax=axes[i, j], data=extracted, x=model_selected[j], y=model_selected[i],hue=extracted['level'],
                                     style=extracted['level'],
                                     markers=markers,
                                     palette={'non-QTL':'#377eb8','QTL':'#ff7f00',"phenotype":'g'})
                 else:
                     extracted = data_scatter[data_scatter['level'] == 'phenotype']
-                    sns.scatterplot(ax=axes[i, j], data=extracted, x=MODEL[j], y=MODEL[i],
+                    sns.scatterplot(ax=axes[i, j], data=extracted, x=model_selected[j], y=model_selected[i],
                                     hue=extracted['level'],
                                     palette={'non-QTL':'#377eb8','QTL':'#ff7f00',"phenotype":'g'}) 
                 try:
