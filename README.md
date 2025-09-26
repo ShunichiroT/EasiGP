@@ -61,7 +61,7 @@ The comparison of the inferred genomic marker effects with known key genome regi
        - Change the hyperparameters of the chosen models if needed
        - Set paths for relevant geneomic marker information datasets, visualisation configuration and colour palette for circos plots
 5. Run the "main.py" file to implement the "GP" and "circos_plot" functions
-       - If you want to run genomic prediction models in a parallel way, run the "main_parallel_1.py" and "main_parallel_2.py" in a sequential order
+   - If you want to run genomic prediction models in a parallel way, run the "main_parallel_1.py" and "main_parallel_2.py" in a sequential order
 6. Check and analyse the generated output files in the Result folder 
 
 ## References
