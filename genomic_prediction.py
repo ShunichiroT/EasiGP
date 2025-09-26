@@ -14,36 +14,8 @@ from models.ensemble import *
 from models.Linear_transformation import *
 from models.Nelder_Mead import *
 from models.Bayesian_optimisation import *
-
-def metric_plot(record, MODEL):
     
-    import seaborn as sns
-    import matplotlib.pyplot as plt
-    
-    metrics = ['Pearson correlation', 'MSE']
-    record['models'] = 'models'
-    sns.set_theme(style="ticks",font_scale = 1, rc={"figure.dpi":300, 'savefig.dpi':300})
-    
-    for i in range(len(metrics)):
-        ax_share = False if metrics[i] == 'MSE' else True
-        
-        g = sns.FacetGrid(record, col="phenotype", row='population', sharey=ax_share)
-        
-        for axis in g.axes.flat:
-            axis.tick_params(labelleft=True) 
-                    
-        g.map(sns.violinplot,'models', metrics[i], 'type', palette='colorblind', hue_order=MODEL)    
-        
-        for axis in g.axes.flat:
-            axis.set_ylabel(metrics[i])  
-            axis.set_xlabel("")  
-        
-        plt.tight_layout()
-        g.add_legend()
-        g.savefig("./Result/"+metrics[i]+".png") 
-
-    
-def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_NUM, HPARAMETERS, R_PATH, W_OPT, HYPERPARAMETERS_OPT):
+def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_NUM, HPARAMETERS, R_PATH, W_OPT, HYPERPARAMETERS_OPT, PARALLEL=None):
     
     # Import R modules
     if R_PATH != None:
@@ -83,8 +55,19 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
     effect = pd.DataFrame()       #store genomic marker effects
     interactions = pd.DataFrame() #store marker interaction effects
     weight = pd.DataFrame()
-
-    for i in range(sample.shape[0]):
+    
+    if PARALLEL is not None:
+        idx = PARALLEL['batch_id']
+        interval = PARALLEL['batch_size']
+    else:
+        idx = 0
+        interval = sample.shape[0]
+        
+    for i in range(idx*interval, idx*interval+interval):
+        
+        if i >= sample.shape[0]:
+            break
+        
         # Convert the data structure
         data_genotype = data_genotype_original[data_genotype_original['population']==sample.loc[i,'population']].reset_index(drop=True)
         data_phenotype = data_phenotype_original.loc[data_phenotype_original['population']==sample.loc[i,'population'], ['ID','population',sample.loc[i,'phenotype']]].reset_index(drop=True)
@@ -259,8 +242,6 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
         if type(sample.loc[i,'ratio']) is tuple:
             result_valid = result_valid.sort_values(['id']).reset_index(drop=True)
         result_test = result_test.sort_values(['id']).reset_index(drop=True)
-       
-
         
     # Run the ensemble model in the end
     if 'ensemble' in MODEL:
@@ -269,22 +250,31 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
         effect = pd.concat([effect, sample_effect])
     
     # Store the results
-    record.to_csv('./Result/Metric.csv', index=False)
-    result_train.to_csv('./Result/Prediction_result_train.csv', index=False)
-    result_valid.to_csv('./Result/Prediction_result_valid.csv', index=False)
-    result_test.to_csv('./Result/Prediction_result_test.csv', index=False)
+    if PARALLEL is None:
+        record.to_csv('./Result/Metric.csv', index=False)
+        result_train.to_csv('./Result/Prediction_result_train.csv', index=False)
+        result_valid.to_csv('./Result/Prediction_result_valid.csv', index=False)
+        result_test.to_csv('./Result/Prediction_result_test.csv', index=False)
+    else:
+        record.to_csv('./Result/Metric_'+str(idx)+'.csv', index=False)
+        result_train.to_csv('./Result/Prediction_result_train_'+str(idx)+'.csv', index=False)
+        result_valid.to_csv('./Result/Prediction_result_valid_'+str(idx)+'.csv', index=False)
+        result_test.to_csv('./Result/Prediction_result_test_'+str(idx)+'.csv', index=False)
     
     if effect.shape[0] != 0:
-        effect.to_csv('./Result/Marker_effect.csv', index=False)
+        if PARALLEL is None:
+            effect.to_csv('./Result/Marker_effect.csv', index=False)
+        else:
+            effect.to_csv('./Result/Marker_effect_'+str(idx)+'.csv', index=False)
     if 'RF' in MODEL:
-        interactions.to_csv('./Result/Interaction.csv', index=False)
-    if W_OPT is not None:  
-        weight.to_csv('./Result/Weight.csv', index=False)
-    
-    # Store violin plots
+        if PARALLEL is None:
+            interactions.to_csv('./Result/Interaction.csv', index=False)
+        else:
+            interactions.to_csv('./Result/Interaction_'+str(idx)+'.csv', index=False)
     if W_OPT is not None:
-        metric_plot(record.copy(), MODEL+W_OPT)
-    else:
-        metric_plot(record.copy(), MODEL)
+        if PARALLEL is None:
+            weight.to_csv('./Result/Weight.csv', index=False)
+        else:
+            weight.to_csv('./Result/Weight_'+str(idx)+'.csv', index=False)
         
     return record, result_train, result_test, effect, interactions, POPULATION, PHENOTYPE
