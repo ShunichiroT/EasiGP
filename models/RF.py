@@ -6,7 +6,7 @@ import numpy as np
 import shap
 
 
-def RF(train, test, params):
+def RF(train, valid, test, params):
     
     estimators = params[0]
     features_max = params[1]
@@ -15,7 +15,9 @@ def RF(train, test, params):
     get_interaction = params[4]
     
     #Split the data sets into x and y here as specified in the original code
-    train_x, train_y = train.iloc[:,:-1], train.iloc[:,-1]
+    train_x, train_y = train.iloc[:,:-1], train.iloc[:,-1]    
+    if valid.shape[0] != 0:
+        valid_x, valid_y = valid.iloc[:,:-1], valid.iloc[:,-1]
     test_x, test_y = test.iloc[:,:-1], test.iloc[:,-1]
     
     #Develop & evaluate a model here as specified in the original code
@@ -23,6 +25,10 @@ def RF(train, test, params):
     rf.fit(train_x, train_y)
     
     predicted = rf.predict(test_x)
+    if valid.shape[0] != 0:
+        predicted_valid = rf.predict(valid_x)
+    else:
+        predicted_valid = []
     predicted_train = rf.predict(train_x)
 
     ## Calculate the metrics
@@ -42,6 +48,6 @@ def RF(train, test, params):
     else:
         interaction_sample = pd.DataFrame()
     
-    return r, mse, pd.DataFrame(rf.feature_importances_).T, interaction_sample, predicted, predicted_train
+    return r, mse, pd.DataFrame(rf.feature_importances_).T, interaction_sample, predicted, predicted_valid, predicted_train
 
     

@@ -47,7 +47,7 @@ class MLP(Module):
         return X
     
 
-def ML_Perceptron(train, test, params):
+def ML_Perceptron(train, valid, test, params):
     
     neurons = int(params[0])
     dout = params[1]
@@ -58,17 +58,20 @@ def ML_Perceptron(train, test, params):
     shapley_num = params[6]
     
     train_data = CSVDataset(train)
+    if valid.shape[0] != 0:
+        valid_data = CSVDataset(valid)
     test_data = CSVDataset(test)
                      
     train_loader = DataLoader(train_data, batch_size=bsize, shuffle=True)
+    if valid.shape[0] != 0:
+        valid_loader = DataLoader(valid_data, batch_size=bsize, shuffle=False)
     test_loader = DataLoader(test_data, batch_size=bsize, shuffle=False)
     
-        
     model = MLP(train.shape[1]-1, neurons, dout)
    
     optimizer = torch.optim.Adam(model.parameters(), lr=lrate, weight_decay=decay) #0.0005
    
-    for epoch in range(ep):  #50
+    for epoch in range(ep):
          loss_train_sum = 0
          for inputs, targets in train_loader:
              optimizer.zero_grad()
@@ -89,32 +92,33 @@ def ML_Perceptron(train, test, params):
          actual = targets.detach().tolist()
          predicted.append([item for sublist in yhat for item in sublist])
          actuals.append([item for sublist in actual for item in sublist])
-   
     predicted = [item for sublist in predicted for item in sublist]
     actuals = [item for sublist in actuals for item in sublist]
      
     mse = mean_squared_error(actuals, predicted)
-     # r
     r = scipy.stats.pearsonr(actuals, predicted)[0]
     
     train_loader = DataLoader(train_data, batch_size=bsize, shuffle=False)
     predicted_train = []
-    #actuals_train = []
     for inputs, targets in train_loader:
-         #inputs = inputs.to(device)
          yhat = model(inputs)
          yhat = yhat.detach().tolist()
-         #actual = targets.detach().tolist()
          predicted_train.append([item for sublist in yhat for item in sublist])
-         #actuals.append([item for sublist in actual for item in sublist])
-   
     predicted_train = [item for sublist in predicted_train for item in sublist]
-    #actuals = [item for sublist in actuals for item in sublist]
+    
+    predicted_valid = []
+    if valid.shape[0] != 0:
+        for inputs, targets in valid_loader:
+             yhat = model(inputs)
+             yhat = yhat.detach().tolist()
+             predicted_valid.append([item for sublist in yhat for item in sublist])
+        predicted_valid = [item for sublist in predicted_valid for item in sublist] 
     
     d_train = torch.tensor(train.iloc[:,:-1].values, dtype=torch.float32)
+    #d_valid = torch.tensor(valid.iloc[:,:-1].values, dtype=torch.float32)
     d_test = torch.tensor(test.iloc[:,:-1].values, dtype=torch.float32)
     
     explainer = shap.DeepExplainer(model,shap.sample(d_train, shapley_num))
     effect = abs(explainer.shap_values(shap.sample(d_test, shapley_num),check_additivity=False)).sum(axis=0)
 
-    return r, mse, pd.DataFrame(effect).T, predicted, predicted_train
+    return r, mse, pd.DataFrame(effect).T, predicted, predicted_valid, predicted_train

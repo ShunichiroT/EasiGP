@@ -11,8 +11,13 @@ from torch_geometric.loader import HGTLoader
 from torch_geometric.explain import Explainer, CaptumExplainer
 
 
-def GAT_infinitesimal_node_level(data_train, data_test, params):
+def GAT_infinitesimal_node_level(data_train, data_valid, data_test, params):
     
+    if data_valid.shape[0] != 0:
+        VALID = True
+    else:
+        VALID = False
+        
     neuron = params[0]
     dropout = params[1]
     lrate = params[2]
@@ -23,9 +28,8 @@ def GAT_infinitesimal_node_level(data_train, data_test, params):
     samples = params[7]
     marker_effect = params[8]
     
-    ## Preprocess the data so that it caon be converted into a graph format
-    tr_id, te_id = data_train.iloc[:,0], data_test.iloc[:,0]
-    data = pd.concat([data_train,data_test])
+    ## Preprocess the data so that it can be converted into a graph format
+    data = pd.concat([data_train, data_valid, data_test])
     data_QTL, data_pheno = data.iloc[:,:-1].reset_index(drop=True), data.iloc[:,-1].reset_index(drop=True)
     
     x_qtl = []
@@ -47,26 +51,32 @@ def GAT_infinitesimal_node_level(data_train, data_test, params):
         data['qtl_'+str(i+1)].x = torch.tensor(x_qtl[i], dtype=torch.float)  
         data['qtl_'+str(i+1),'affect','pheno'].edge_index = torch.stack([torch.from_numpy(edges).to(torch.long),torch.from_numpy(edges).to(torch.long)], dim=0)
         data['qtl_'+str(i+1),'self','qtl_'+str(i+1)].edge_index = torch.stack([torch.from_numpy(edges).to(torch.long),torch.from_numpy(edges).to(torch.long)], dim=0)
-    ## Add masks to distinguish between train and test data
+    
+    ## Add masks to distinguish between train, validation and test data
     ids = list(range(data_pheno.shape[0]))
-    train_id = list(range(data_train.shape[0]))
-    test_id = list(range(data_train.shape[0], (data_train.shape[0]+data_train.shape[1])))
+    train_id = list(range(0,data_train.shape[0]))
+    valid_id = list(range(data_train.shape[0],(data_train.shape[0]+data_valid.shape[0])))
+    test_id = list(range((data_train.shape[0]+data_valid.shape[0]),(data_train.shape[0]+data_valid.shape[0]+data_test.shape[0])))
     
     mask_train = np.array([])
-    #mask_valid = np.array([])
+    mask_valid = np.array([])
     mask_test = np.array([])
     for i in range(len(ids)):
         if i in train_id:
             mask_train = np.append(mask_train, True)
-            #mask_valid = np.append(mask_valid, False)
+            mask_valid = np.append(mask_valid, False)
+            mask_test = np.append(mask_test,False)   
+        elif i in valid_id:
+            mask_train = np.append(mask_train, False)
+            mask_valid = np.append(mask_valid, True)
             mask_test = np.append(mask_test,False)   
         else:
             mask_train = np.append(mask_train, False)
-            #mask_valid = np.append(mask_valid, False)
-            mask_test = np.append(mask_test,True) 
+            mask_valid = np.append(mask_valid, False)
+            mask_test = np.append(mask_test,True)
     
     data['pheno'].train_mask = torch.from_numpy(mask_train).to(torch.bool)
-    #data['pheno'].val_mask = torch.from_numpy(mask_valid).to(torch.bool)
+    data['pheno'].valid_mask = torch.from_numpy(mask_valid).to(torch.bool)
     data['pheno'].test_mask = torch.from_numpy(mask_test).to(torch.bool)
     
     ## Define GAT class
@@ -142,6 +152,11 @@ def GAT_infinitesimal_node_level(data_train, data_test, params):
                             shuffle=True,
                             batch_size=bsize,
                             input_nodes=('pheno', data['pheno'].train_mask))
+    if VALID:
+        valid_loader = HGTLoader(data, 
+                                 num_samples={key:[1064] * 4 for key in data.node_types},
+                                 batch_size=bsize,shuffle=False,
+                                 input_nodes=('pheno', data['pheno'].valid_mask))
     test_loader = HGTLoader(data, 
                              num_samples={key:[1064] * 4 for key in data.node_types},
                              batch_size=bsize,shuffle=False,
@@ -165,9 +180,17 @@ def GAT_infinitesimal_node_level(data_train, data_test, params):
     mse = mean_squared_error(actual_test,predicted_test)
     r = pearsonr(actual_test, predicted_test)[0]
     
-    ## Store prediction result for the test data
-    result_prediction_test = pd.concat([pd.DataFrame(te_id), pd.DataFrame(predicted_test),pd.DataFrame(actual_test)],axis=1)
-    result_prediction_test.columns = ['id','predicted','actual']  
+    ## Store prediction result for the validation data
+    predicted_valid = []
+    actual_valid = []
+    if VALID:
+        for valid in valid_loader:
+            valid = valid.to(device)
+            result = model(valid.x_dict, valid.edge_index_dict)
+            predicted_valid.append(result[valid['pheno'].valid_mask].tolist())
+            actual_valid.append([item for sublist in valid['pheno'].y[valid['pheno'].valid_mask].tolist() for item in sublist])
+        predicted_valid = [item for sublist in predicted_valid for item in sublist]
+        actual_valid = [item for sublist in actual_valid for item in sublist] 
     
     ## Store prediction result for the train data
     predicted_train = []
@@ -177,11 +200,9 @@ def GAT_infinitesimal_node_level(data_train, data_test, params):
     actual_train.append([item for sublist in data['pheno'].y[data['pheno'].train_mask].tolist() for item in sublist])
     predicted_train = [k for i in predicted_train for k in i]
     actual_train = [k for i in actual_train for k in i]
-    result_prediction_train = pd.concat([pd.DataFrame(tr_id), pd.DataFrame(predicted_train),pd.DataFrame(actual_train)],axis=1)
-    result_prediction_train.columns = ['id','predicted','actual']  
     
+    ## Extract marker effects
     if marker_effect == True:
-        ## Extract marker effects
         explainer = Explainer(
             model = model,
             algorithm=CaptumExplainer('IntegratedGradients'),
@@ -212,5 +233,5 @@ def GAT_infinitesimal_node_level(data_train, data_test, params):
     else:
         effect = pd.DataFrame()
         
-    return r, mse, effect, predicted_test, predicted_train
+    return r, mse, effect, predicted_test, predicted_valid, predicted_train
  

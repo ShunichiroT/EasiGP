@@ -10,8 +10,13 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.explain import Explainer, CaptumExplainer
 
 
-def GAT_fully_connected(data_train, data_test, params):
+def GAT_fully_connected(data_train, data_valid, data_test, params):
  
+    if data_valid.shape[0] != 0:
+        VALID = True
+    else:
+        VALID = False
+        
     neuron = params[0]
     dropout = params[1]
     lrate = params[2]
@@ -23,12 +28,17 @@ def GAT_fully_connected(data_train, data_test, params):
     marker_effect = params[8]
     
     ## Preprocess the data so that it can be converted into a graph format    
-    data_QTL_train, data_QTL_test = data_train.iloc[:,:-1].reset_index(drop=True),data_test.iloc[:,:-1].reset_index(drop=True)
-    data_QTL_melt_train, data_QTL_melt_test = data_QTL_train.T.melt(), data_QTL_test.T.melt()
-    data_pheno_train, data_pheno_test = data_train.iloc[:,-1].reset_index(drop=True), data_test.iloc[:,-1].reset_index(drop=True)     
+    if VALID:
+        data_QTL_train,data_QTL_valid, data_QTL_test = data_train.iloc[:,:-1].reset_index(drop=True), data_valid.iloc[:,:-1].reset_index(drop=True), data_test.iloc[:,:-1].reset_index(drop=True)
+        data_QTL_melt_train, data_QTL_melt_valid, data_QTL_melt_test = data_QTL_train.T.melt(), data_QTL_valid.T.melt(), data_QTL_test.T.melt()
+        data_pheno_train, data_pheno_valid, data_pheno_test = data_train.iloc[:,-1].reset_index(drop=True), data_valid.iloc[:,-1].reset_index(drop=True), data_test.iloc[:,-1].reset_index(drop=True)
+    else:
+        data_QTL_train,data_QTL_test = data_train.iloc[:,:-1].reset_index(drop=True), data_test.iloc[:,:-1].reset_index(drop=True)
+        data_QTL_melt_train, data_QTL_melt_test = data_QTL_train.T.melt(), data_QTL_test.T.melt()
+        data_pheno_train, data_pheno_test = data_train.iloc[:,-1].reset_index(drop=True), data_test.iloc[:,-1].reset_index(drop=True)
 
     ## Change the data structure to create graphs
-    edges_from_train = [ele for ele in range(data_QTL_melt_train.shape[0]) for i in range(data_QTL_train.shape[1])]
+    edges_from_train = [edge for edge in range(data_QTL_melt_train.shape[0]) for i in range(data_QTL_train.shape[1])]
     edges_to_train = []
     for ii in range(0,int(len(edges_from_train)/data_QTL_train.shape[1]),data_QTL_train.shape[1]):
         for kk in range(data_QTL_train.shape[1]):
@@ -36,7 +46,16 @@ def GAT_fully_connected(data_train, data_test, params):
                 edges_to_train += [jj]
     edges_from_train, edges_to_train = np.array(edges_from_train), np.array(edges_to_train)
     
-    edges_from_test = [ele for ele in range(data_QTL_melt_test.shape[0]) for i in range(data_QTL_test.shape[1])]
+    if VALID:
+        edges_from_valid = [edge for edge in range(data_QTL_melt_valid.shape[0]) for i in range(data_QTL_valid.shape[1])]
+        edges_to_valid = []
+        for ii in range(0,int(len(edges_from_valid)/data_QTL_valid.shape[1]),data_QTL_valid.shape[1]):
+            for kk in range(data_QTL_valid.shape[1]):
+                for jj in range(ii,ii+data_QTL_valid.shape[1]):
+                    edges_to_valid += [jj]
+        edges_from_valid, edges_to_valid = np.array(edges_from_valid), np.array(edges_to_valid)
+    
+    edges_from_test = [edge for edge in range(data_QTL_melt_test.shape[0]) for i in range(data_QTL_test.shape[1])]
     edges_to_test = []
     for ii in range(0,int(len(edges_from_test)/data_QTL_test.shape[1]),data_QTL_test.shape[1]):
         for kk in range(data_QTL_test.shape[1]):
@@ -48,6 +67,8 @@ def GAT_fully_connected(data_train, data_test, params):
     dummy[dummy==False]=0
     dummy[dummy==True]=1
     data_QTL_melt_train = pd.concat([data_QTL_melt_train,pd.concat([dummy]*int(data_QTL_melt_train.shape[0]/dummy.shape[0])).reset_index(drop=True)],axis=1)
+    if data_valid.shape[0] != 0:
+        data_QTL_melt_valid = pd.concat([data_QTL_melt_valid,pd.concat([dummy]*int(data_QTL_melt_valid.shape[0]/dummy.shape[0])).reset_index(drop=True)],axis=1)
     data_QTL_melt_test = pd.concat([data_QTL_melt_test,pd.concat([dummy]*int(data_QTL_melt_test.shape[0]/dummy.shape[0])).reset_index(drop=True)],axis=1)
  
     ## Create graphs
@@ -62,6 +83,19 @@ def GAT_fully_connected(data_train, data_test, params):
         tmp.y = torch.from_numpy(data_pheno_train_tmp).to(torch.float)
         tmp.edge_index = torch.stack([torch.from_numpy(edges_from_train_tmp).to(torch.long),torch.from_numpy(edges_to_train_tmp).to(torch.long)], dim=0)
         data_train += [tmp]
+    
+    if VALID:
+        data_valid = []
+        for kk in range(data_pheno_valid.shape[0]):
+            tmp = Data()
+            data_QTL_melt_valid_tmp = data_QTL_melt_valid.loc[data_QTL_melt_valid['variable']==kk].iloc[:,1:]
+            data_pheno_valid_tmp = np.expand_dims(np.array(data_pheno_valid[kk]),axis=0)
+            edges_from_valid_tmp = edges_from_valid[:data_QTL_valid.shape[1]*data_QTL_valid.shape[1]]
+            edges_to_valid_tmp = edges_to_valid[:data_QTL_valid.shape[1]*data_QTL_valid.shape[1]]
+            tmp.x = torch.from_numpy(data_QTL_melt_valid_tmp.to_numpy(dtype=float)).to(torch.float)
+            tmp.y = torch.from_numpy(data_pheno_valid_tmp).to(torch.float)
+            tmp.edge_index = torch.stack([torch.from_numpy(edges_from_valid_tmp).to(torch.long),torch.from_numpy(edges_to_valid_tmp).to(torch.long)], dim=0)        
+            data_valid += [tmp]
     
     data_test = []
     for kk in range(data_pheno_test.shape[0]):
@@ -100,7 +134,9 @@ def GAT_fully_connected(data_train, data_test, params):
     train_loader = DataLoader(data_train, 
                              shuffle=True,
                              batch_size=bsize)
-    
+    if VALID:
+        valid_loader = DataLoader(data_valid, 
+                                 batch_size=bsize)
     test_loader = DataLoader(data_test, 
                              batch_size=bsize)
     
@@ -154,6 +190,15 @@ def GAT_fully_connected(data_train, data_test, params):
         #actual_train += train.y.tolist()
     
     predicted_train = [k for i in predicted_train for k in i]
+    
+    predicted_valid = []
+    #actual_valid = []
+    if VALID:
+        for valid in valid_loader:
+            result = model(valid.x,valid.edge_index,valid.batch)
+            predicted_valid += result.tolist()
+            #actual_valid += train.y.tolist()
+        predicted_valid = [item for sublist in predicted_valid for item in sublist] 
 
     ## Extract genomic marker effects
     if marker_effect == True:
@@ -170,13 +215,13 @@ def GAT_fully_connected(data_train, data_test, params):
                 ),
         )
         
-        train_loader = DataLoader(data_train, 
+        test_loader = DataLoader(data_test, 
                                 shuffle=True,
                                 batch_size=1)
         
         explanation = pd.DataFrame()
         cnt = 0
-        for batch in train_loader:
+        for batch in test_loader:
             t = explainer(
                 batch.x,
                 batch.edge_index,
@@ -193,8 +238,8 @@ def GAT_fully_connected(data_train, data_test, params):
                 break
         
         effect = pd.DataFrame(explanation/cnt).T
-        effect.columns = list(data_QTL_train.columns)
+        effect.columns = list(data_QTL_test.columns)
     else:
         effect = pd.DataFrame()
         
-    return r, mse, effect, predicted_test, predicted_train
+    return r, mse, effect, predicted_test, predicted_valid, predicted_train

@@ -5,7 +5,7 @@ import pandas as pd
 import shap
 
 
-def SV_Regression(train, test, params):
+def SV_Regression(train, valid, test, params):
     
     ker = params[0]
     eps = params[1]
@@ -17,6 +17,8 @@ def SV_Regression(train, test, params):
     
     #Split the data sets into x and y here as specified in the original code
     train_x, train_y = train.iloc[:,:-1], train.iloc[:,-1]
+    if valid.shape[0] != 0:
+        valid_x, valid_y = valid.iloc[:,:-1], valid.iloc[:,-1]
     test_x, test_y = test.iloc[:,:-1], test.iloc[:,-1]
     
     #Develop & evaluate a model here as specified in the original code
@@ -24,6 +26,10 @@ def SV_Regression(train, test, params):
     svr.fit(train_x, train_y)
     
     predicted = svr.predict(test_x)
+    if valid.shape[0] != 0:
+        predicted_valid = svr.predict(valid_x)
+    else:
+        predicted_valid = []
     predicted_train = svr.predict(train_x)
 
     ## Calculate the metrics
@@ -37,5 +43,4 @@ def SV_Regression(train, test, params):
     else:
         effect = pd.DataFrame()
     
-    
-    return r, mse, pd.DataFrame(effect).T, predicted, predicted_train
+    return r, mse, pd.DataFrame(effect).T, predicted, predicted_valid, predicted_train
