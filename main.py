@@ -92,7 +92,7 @@ HPARAMETERS = {'rrBLUP': [10000, 2000],
 # ['Nelder_Mead','Linear transformation', 'Bayesian_optimisation']
 
 # Write "None" if you implement naive ensemble approach 
-W_OPT = ['Nelder Mead', 'Bayesian optimisation', 'Linear transformation'] 
+W_OPT = None 
 
 # Hyperparameters for weight optimisation
 # Linear transformation:
@@ -102,7 +102,7 @@ W_OPT = ['Nelder Mead', 'Bayesian optimisation', 'Linear transformation']
 # Bayesian:
     # minimum boundary, maximum boundary, iterations, point numbers, allow duplicate points
 HYPERPARAMETERS_OPT = {'Linear transformation':[0.005, 150, 0.01, 2, 10, 30],
-                       'Nelder Mead': [5, 0, 10, 1e-8, 1e-8, False],
+                       'Nelder Mead': [5, 0.0001, 10, 1e-8, 1e-8, False],
                        'Bayesian optimisation': [0.0001, 10.0, 200, 1, True]}
 
 # ---------------------------------------------------------------------------- #
