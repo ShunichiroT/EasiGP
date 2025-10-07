@@ -51,7 +51,13 @@ CIRCOS_CONFIG = {'space':3,
                  'scale':10000}
 
 # adjust the edge location of each marker for visualisation
-end_adjust = 10
+END_ADJUST = 0
+
+# Choose a method of how you aggregate genomic marker effect
+# Assign if you do not wish to introduce a window to average the effects in each window interval
+# Otherwise, assign a window size here
+# If circos plot does not show with WINDOWS > 0, you can increase the size of the window
+WINDOW = 30
 
 # colour palette for circos plot
 CYTOBAND_COLORMAP = {   
@@ -106,4 +112,4 @@ if SCATTER_CREATE:
 
 # Generate circos plots
 circos_plot(effect, interactions, MARKER_INFO, CHROMOSOME_INFO, GENE_INFO, 
-            POPULATION, PHENOTYPE, CIRCOS_CONFIG, end_adjust, CYTOBAND_COLORMAP) 
+            POPULATION, PHENOTYPE, CIRCOS_CONFIG, END_ADJUST, WINDOW, CYTOBAND_COLORMAP) 
