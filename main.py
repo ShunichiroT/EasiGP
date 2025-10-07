@@ -152,11 +152,11 @@ CIRCOS_CONFIG = {'space':3,
 # adjust the edge location of each marker for visualisation
 END_ADJUST = 0
 
-# Choose a method of how you aggregate genomic marker effect
+# Choose a method for how you aggregate genomic marker effects
 # Assign if you do not wish to introduce a window to average the effects in each window interval
 # Otherwise, assign a window size here
 # If circos plot does not show with WINDOWS > 0, you can increase the size of the window
-WINDOW = 30
+WINDOW = 0
 
 # colour palette for circos plot
 CYTOBAND_COLORMAP = {   
