@@ -86,7 +86,7 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
             
             for k in range(len(chromosome_total)):
                 merged.loc[(merged['chromosome']==chromosome_total[k]) & 
-                           (merged['end'] > chromosome.loc[chromosome['Chromosome']==chromosome_total[k],'End'].values[0]),'end'] = int(chromosome.loc[chromosome['Chromosome']==chromosome_total[k], 'End'].values)
+                           (merged['end'] > chromosome.loc[chromosome['chromosome']==chromosome_total[k],'end'].values[0]),'end'] = int(chromosome.loc[chromosome['chromosome']==chromosome_total[k], 'end'].values)
             merged.to_csv('./Result/marker_effect_'+str(MODEL[iii])+'_'+str(PHENOTYPE)+'_'+str(POPULATION)+'.tsv', sep ='\t',index=False)
         else:
             REMOVE += [MODEL[iii]]
