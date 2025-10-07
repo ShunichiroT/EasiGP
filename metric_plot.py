@@ -23,4 +23,8 @@ def metric_plot(record, MODEL):
         
         plt.tight_layout()
         g.add_legend()
-        g.savefig("./Result/"+metrics[i]+".png") 
+	
+	if i == 0:
+	    g.savefig("./Result/Pearson_correlation.png")
+ 	elif i == 1:
+            g.savefig("./Result/MSE.png")
