@@ -22,7 +22,7 @@ This folder contains two folders containing example files to implement both geno
 
 
 
-2\. Genotype data
+2\. Phenotype data
 
 * Columns:
 

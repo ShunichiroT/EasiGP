@@ -41,18 +41,21 @@ The comparison of the inferred genomic marker effects with known key genome regi
         - Check "Creating an environment from an environment.yml file" for the procedure in detail (https://docs.conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.html)
         - Change the path of the prefix based on your folder location of Anaconda  
 3. Prepare the relevant data in the specified format
-   - Genotype & data (csv)
-        - Columns: ID, population and markers
-        - Rows: records
+   - Genotype data (csv)
+        - Columns: ID, Population and Genomic markers
+        - Rows: Records
    - Phenotype data (csv)
-        - Columns: ID, population and phenotypes
-        - Rows: records
+        - Columns: ID, Population and Phenotypes
+        - Rows: Records
    - Chromosome data (csv)
-        - Columns: Chromosome number, start location, end location and population
-        - Rows: chromosomes
+        - Columns: Chromosome, Start, End and Population
+        - Rows: Chromosomes
    - Key gene region (csv)
-        - Columns: chromosome number, start location, end location, name, colour, source, population and phenotype
-        - Rows: genes
+        - Columns: Chromosome, Start, Middle, End, Name, Colour, Source, Phenotype and Population
+        - Rows: Genes
+   - Marker data (csv)
+        - Columns: Chromosome, Name, Middle, Start, End
+        - Rows: Markers
    - Check the Data folder for more details on formatting and examples
 4. Adjust settings and hyperparameters in the "main" function
    - Check the comments corresponding to each hyperparameter, explaining the meaning of each
