@@ -54,7 +54,7 @@ The comparison of the inferred genomic marker effects with known key genome regi
         - Columns: Chromosome, Start, Middle, End, Name, Colour, Source, Phenotype and Population
         - Rows: Genes
    - Marker data (csv)
-        - Columns: Chromosome, Name, Middle, Start, End
+        - Columns: chromosome, name, start, end
         - Rows: Markers
    - Check the Data folder for more details on formatting and examples
 4. Adjust settings and hyperparameters in the "main" function
