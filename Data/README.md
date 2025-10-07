@@ -15,8 +15,8 @@ This folder contains two folders containing example files to implement both geno
 * Columns:
 
   * ID: identification code for each individual
-  * Population: the name of the affiliated population
-  * Genomic markers: SNP information in numerical format (0,1 or 2)
+  * population: the name of the affiliated population
+  * genomic markers: SNP information in numerical format (0,1 or 2)
 
 * Rows: records of each individual
 
@@ -27,8 +27,8 @@ This folder contains two folders containing example files to implement both geno
 * Columns:
 
   * ID: identification code for each individual
-  * Population: the name of the affiliated population
-  * Phenotype: recorded phenotypes of each individual
+  * population: the name of the affiliated population
+  * phenotype: recorded phenotypes of each individual
 
 * Rows: records of each individual
 
@@ -38,10 +38,10 @@ This folder contains two folders containing example files to implement both geno
 
 * Columns:
 
-  * Chromosome: chromosome number ("chr"+NUMBER)
-  * Start: the beginning location of the chromosome (the value should be 0 for the standard use)
-  * End: the end location of the chromosome
-  * Population: target population (write "all" for across all populations)
+  * chromosome: chromosome number ("chr"+NUMBER)
+  * start: the beginning location of the chromosome (the value should be 0 for the standard use)
+  * end: the end location of the chromosome
+  * population: target population (write "all" for across all populations)
 
 * Rows:
 
@@ -54,14 +54,13 @@ This folder contains two folders containing example files to implement both geno
 * Columns:
 
   * chromosome: belonging chromosome number ('chr'+number)
-  * Start: the beginning location of the marker
-  * Middle: the midpoint location of the marker
-  * End: the end location of the marker
-  * Name: name of each gene
-  * Colour: allocated colour of each gene
-  * Source: information source of each gene. Used as the name of each ring section for a circos plot
-  * Phenotype: target phenotype of each gene
-  * Population: target population of each gene (write "all" for across all populations)
+  * start: the beginning location of the marker
+  * end: the end location of the marker
+  * name: name of each gene
+  * colour: allocated colour of each gene
+  * source: information source of each gene. Used as the name of each ring section for a circos plot
+  * phenotype: target phenotype of each gene
+  * population: target population of each gene (write "all" for across all populations)
 
 * Rows: markers
 
@@ -70,11 +69,10 @@ This folder contains two folders containing example files to implement both geno
 5\. Marker data (marker\_info.csv)
 
 * Columns:
-  * Chromosome: belonging chromosome number (NUMBER)
-  * Name: name of each marker
-  * Middle: the midpoint location of the marker
-  * Start: the beginning location of the marker
-  * End: the end location of the marker
+  * chromosome: belonging chromosome number (NUMBER)
+  * name: name of each marker
+  * start: the beginning location of the marker
+  * end: the end location of the marker
 * Rows: markers
 
 
