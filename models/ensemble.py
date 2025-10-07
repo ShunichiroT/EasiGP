@@ -42,6 +42,8 @@ def ensemble(train, valid, test, effect, MODEL):
     record = record.rename(columns={"Pearson": "Pearson correlation"})
     record['type'] = 'ensemble'
     
+    effect = effect.reset_index(drop=True)
+
     # Extract genomic marker effects
     effect = pd.concat([effect.iloc[:,:5],
                         effect.iloc[:,5:].abs().reset_index(drop=True).div(effect.iloc[:,5:].abs().sum(axis=1).reset_index(drop=True),axis=0)
