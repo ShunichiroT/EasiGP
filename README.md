@@ -42,20 +42,20 @@ The comparison of the inferred genomic marker effects with known key genome regi
         - Change the path of the prefix based on your folder location of Anaconda  
 3. Prepare the relevant data in the specified format
    - Genotype data (csv)
-        - Columns: ID, Population and Genomic markers
+        - Columns: ID, population and genomic markers
         - Rows: Records
    - Phenotype data (csv)
-        - Columns: ID, Population and Phenotypes
-        - Rows: Records
+        - Columns: ID, population and phenotypes
+        - Rows: records
    - Chromosome data (csv)
-        - Columns: Chromosome, Start, End and Population
-        - Rows: Chromosomes
+        - Columns: chromosome, start, end and population
+        - Rows: chromosomes
    - Key gene region (csv)
-        - Columns: Chromosome, Start, Middle, End, Name, Colour, Source, Phenotype and Population
-        - Rows: Genes
+        - Columns: chromosome, start, end, name, colour, source, phenotype and population
+        - Rows: genes
    - Marker data (csv)
         - Columns: chromosome, name, start, end
-        - Rows: Markers
+        - Rows: markers
    - Check the Data folder for more details on formatting and examples
 4. Adjust settings and hyperparameters in the "main" function
    - Check the comments corresponding to each hyperparameter, explaining the meaning of each
