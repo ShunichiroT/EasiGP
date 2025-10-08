@@ -17,6 +17,7 @@ R_PATH = None
 PHENOTYPE = ['days2anthesis', 'asi'] 
 
 # Name of genomic prediction models to run
+# Genomic prediction models assigned to this variable will be implemented  
 # Available models
   # ['rrBLUP', 'BayesB', 'RKHS', 'RF', 'SVR', 'MLP', 'ensemble']
   # ['GAT_infinitesimal', 'GAT_fully_connected', 'GAT_prior_knowledge']
