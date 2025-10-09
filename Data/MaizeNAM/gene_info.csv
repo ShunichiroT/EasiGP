@@ -1,4 +1,4 @@
-Chromosome,start,end,name,colour,source,phenotype,population
+chromosome,start,end,name,colour,source,phenotype,population
 chr1,1842,1862,PhyA1,transduction,leaf,days2anthesis,1
 chr1,324,345,PhyB1,transduction,leaf,days2anthesis,1
 chr1,1894,1914,PhyC1,transduction,leaf,days2anthesis,1

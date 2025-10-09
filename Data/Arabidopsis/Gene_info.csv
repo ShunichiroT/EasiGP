@@ -1,4 +1,4 @@
-Chromosome,start,end,Name,colour,source,phenotype,population
+chromosome,start,end,Name,colour,source,phenotype,population
 chr1,13352962,13375172,TPPD,acen,branching,RBN,1
 chr1,27649673,27673253,PIN1,acen,branching,RBN,1
 chr1,28960714,28984805,PIN6,acen,branching,RBN,1

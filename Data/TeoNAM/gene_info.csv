@@ -1,4 +1,4 @@
-Chromosome,start,end,Name,colour,source,phenotype,population
+chromosome,start,end,name,colour,source,phenotype,population
 chr3,7390000,8140000,3@77.8,acen,QTL,DTA,W22TIL01
 chr3,11070000,12120000,3@115.8,acen,QTL,DTA,W22TIL01
 chr3,15690000,16490000,3@160.7,acen,QTL,DTA,W22TIL01

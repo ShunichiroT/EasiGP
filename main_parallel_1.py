@@ -96,10 +96,10 @@ HPARAMETERS = {'rrBLUP': [10000, 2000],
 
 # Method names for weight optimisation in ensembles 
 # The current available methods 
-# ['Nelder_Mead','Linear transformation', 'Bayesian_optimisation']
+# ['Nelder Mead','Linear transformation', 'Bayesian_optimisation']
 
 # Write "None" if you implement naive ensemble approach 
-W_OPT = ['Nelder Mead', 'Bayesian optimisation', 'Linear transformation'] 
+W_OPT = None 
 
 # Hyperparameters for weight optimisation
 # Linear transformation:
