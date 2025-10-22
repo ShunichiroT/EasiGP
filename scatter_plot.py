@@ -101,5 +101,5 @@ def scatter_plot(MODEL, PHENOTYPE, predicted_result_test, effect, QTL, SCATTER_C
                 except:
                     continue
         plt.tight_layout()
-        plt.savefig('.\Result\Scatter_plot_'+PHENOTYPE[k]+'.png')
+        plt.savefig('./Result/Scatter_plot_'+PHENOTYPE[k]+'.png')
         
