@@ -35,8 +35,13 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
     chromosome = pd.read_csv('./Result/chrom_'+str(POPULATION)+'.bed', delimiter='\t')
     
     if WINDOW != 0:
-        division = int(chromosome['end'].max() / WINDOW)
-    
+        division = []
+        cnt = 0
+        for n in range(int(chromosome['end'].max())):
+            division += [WINDOW*cnt]
+            cnt += 1
+            if WINDOW*cnt > int(chromosome['end'].max()):
+                break
     # Convert genomic marker effects into ten level quantiles
     effect.iloc[:,5:] = effect.iloc[:,5:].abs().astype(float)
     effect = effect.drop('ratio', axis=1)
@@ -100,13 +105,10 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
                 marker = pd.read_csv(marker_info)
                 effect_selected = pd.merge(effect_selected, marker, left_on=['index'], right_on=['name'])
                 effect_selected = effect_selected.loc[:,['chromosome','start','end','index','effect']]
-                effect_selected['start'] = (effect_selected['start'] - end_adjust).round().astype(int)
-                effect_selected.loc[effect_selected['start'] < 0, 'start'] = 0
-                effect_selected['end'] = (effect_selected['end'] + end_adjust).round().astype(int)
+
                 effect_selected['chromosome'] = 'chr' + effect_selected['chromosome'].astype(int).astype(str)
                 
                 effect_selected['range'] = (effect_selected['start'] + effect_selected['end'])/2
-                effect_selected.loc[effect_selected['start']== 0,'range']= 0
                 
                 chromosome_total = pd.unique(effect_selected['chromosome'])
                 
@@ -114,7 +116,7 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
                     effect_selected.loc[(effect_selected['chromosome']==chromosome_total[k]) & 
                                (effect_selected['range'] > chromosome.loc[chromosome['chromosome']==chromosome_total[k],'end'].values[0]),'range'] = int(chromosome.loc[chromosome['chromosome']==chromosome_total[k], 'end'].values)
 
-                effect_selected = effect_selected.groupby(['chromosome',pd.cut((effect_selected['range']), division)]).sum().drop(['start','end', 'range'],axis=1).reset_index(drop=False)
+                effect_selected = effect_selected.groupby(['chromosome',pd.cut((effect_selected['range']), bins=division)]).sum().drop(['start','end', 'range'],axis=1).reset_index(drop=False)
                 effect_selected = effect_selected.rename(columns={'range':'interval'})
                 effect_selected['start'] =[int(round(effect_selected['interval'][k].left)) for k in range(effect_selected['interval'].shape[0])]
                 effect_selected['end'] =[int((effect_selected['interval'][k].right)) for k in range(effect_selected['interval'].shape[0])]
@@ -237,10 +239,7 @@ def plot(interactions, chrom_info, gene_info, pop_source, PHENOTYPE, MODEL, circ
     fig.savefig('./Result/circos_'+str(PHENOTYPE)+'_'+str(POPULATION)+'.png',dpi=600) 
 
 def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULATION, PHENOTYPE, circos_config, end_adjust, WINDOW, CYTOBAND_COLORMAP):
-    
-    #if 'Linear transformation' in effect['type'].values:
-    #     effect = effect[effect['type']!='Linear transformation'].reset_index(drop=True)
-         
+
     pop_source =  data_conversion(chrom_info, gene_info, PHENOTYPE)
     POPULATION = ('all',) + tuple(POPULATION)
     MODEL = pd.unique(effect['type'])
