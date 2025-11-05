@@ -1,7 +1,7 @@
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-def metric_plot(record, MODEL):
+def metric_plot(record, MODEL, RESULT_NAME):
     
     metrics = ['Pearson correlation', 'MSE']
     record['models'] = 'models'
@@ -23,8 +23,4 @@ def metric_plot(record, MODEL):
         
         plt.tight_layout()
         g.add_legend()
-        
-        if i == 0:
-            g.savefig("./Result/Pearson_correlation.png")
-        elif i == 1:
-            g.savefig("./Result/MSE.png")
+        g.savefig('./Result/'+RESULT_NAME+'/'+metrics[i]+'.png') 

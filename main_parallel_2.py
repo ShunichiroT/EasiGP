@@ -21,6 +21,9 @@ QTL = None
 SCATTER_CONFIG = {'font_size':2,
                   'fig_size':30}
 
+# Folder name that store prediction results (inside Result folder) 
+RESULT_NAME = 'MaizeNAM'
+
 # ---------------------------------------------------------------------------- #
 # 3. Circos plot configuration
 
@@ -30,11 +33,11 @@ CHROMOSOME_INFO = './Data/MaizeNAM/chrom.csv'
 # File path for the information of all markers
 MARKER_INFO = './Data/MaizeNAM/marker_info.csv'
 
-# File path for key gene region information for comparison
+# File path for key gene region information for comaprison
 # Write 'None' if no key gene region information needs to be included
 GENE_INFO = './Data/MaizeNAM/gene_info.csv'
 
-# Configuration for circos plots
+# Configuration for ciscos plots
 # space:           space size between rings
 # start:           start angle of a ring
 # end:             end angle of a ring
@@ -54,7 +57,7 @@ CIRCOS_CONFIG = {'space':3,
 END_ADJUST = 0
 
 # Choose a method of how you aggregate genomic marker effect
-# Assign if you do not wish to introduce a window to average the effects in each window interval
+# Assign 0 if you do not wish to introduce a window to average the effects in each window interval
 # Otherwise, assign a window size here
 # If circos plot does not show with WINDOWS > 0, you can increase the size of the window
 WINDOW = 30
@@ -101,15 +104,15 @@ CYTOBAND_COLORMAP = {
 
 # Assemble files
 metrics, predicted_result_train, predicted_result_test, effect, interactions, \
-    POPULATION, PHENOTYPE, MODEL = assemble()
+    POPULATION, PHENOTYPE, MODEL = assemble(RESULT_NAME)
 
 # Store violin plots
-metric_plot(metrics.copy(), MODEL)
+metric_plot(metrics.copy(), MODEL, RESULT_NAME)
 
 # Generate scatter plot matrices if needed
 if SCATTER_CREATE:
-    scatter_plot(MODEL, PHENOTYPE, predicted_result_test, effect, QTL, SCATTER_CONFIG)
+    scatter_plot(MODEL, PHENOTYPE, predicted_result_test, effect, QTL, SCATTER_CONFIG, RESULT_NAME)
 
 # Generate circos plots
 circos_plot(effect, interactions, MARKER_INFO, CHROMOSOME_INFO, GENE_INFO, 
-            POPULATION, PHENOTYPE, CIRCOS_CONFIG, END_ADJUST, WINDOW, CYTOBAND_COLORMAP) 
+            POPULATION, PHENOTYPE, CIRCOS_CONFIG, END_ADJUST, WINDOW, CYTOBAND_COLORMAP, RESULT_NAME) 

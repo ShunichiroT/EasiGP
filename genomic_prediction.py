@@ -15,7 +15,7 @@ from models.Linear_transformation import *
 from models.Nelder_Mead import *
 from models.Bayesian_optimisation import *
     
-def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_NUM, HPARAMETERS, R_PATH, W_OPT, HYPERPARAMETERS_OPT, PARALLEL=None):
+def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_NUM, HPARAMETERS, R_PATH, W_OPT, RESULT_NAME, HYPERPARAMETERS_OPT, PARALLEL=None):
     
     # Import R modules
     if R_PATH != None:
@@ -251,30 +251,30 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
     
     # Store the results
     if PARALLEL is None:
-        record.to_csv('./Result/Metric.csv', index=False)
-        result_train.to_csv('./Result/Prediction_result_train.csv', index=False)
-        result_valid.to_csv('./Result/Prediction_result_valid.csv', index=False)
-        result_test.to_csv('./Result/Prediction_result_test.csv', index=False)
+        record.to_csv('./Result/'+RESULT_NAME+'/Metric.csv', index=False)
+        result_train.to_csv('./Result/'+RESULT_NAME+'/Prediction_result_train.csv', index=False)
+        result_valid.to_csv('./Result/'+RESULT_NAME+'/Prediction_result_valid.csv', index=False)
+        result_test.to_csv('./Result/'+RESULT_NAME+'/Prediction_result_test.csv', index=False)
     else:
-        record.to_csv('./Result/Metric_'+str(idx)+'.csv', index=False)
-        result_train.to_csv('./Result/Prediction_result_train_'+str(idx)+'.csv', index=False)
-        result_valid.to_csv('./Result/Prediction_result_valid_'+str(idx)+'.csv', index=False)
-        result_test.to_csv('./Result/Prediction_result_test_'+str(idx)+'.csv', index=False)
+        record.to_csv('./Result/'+RESULT_NAME+'/Metric_'+str(idx)+'.csv', index=False)
+        result_train.to_csv('./Result/'+RESULT_NAME+'/Prediction_result_train_'+str(idx)+'.csv', index=False)
+        result_valid.to_csv('./Result/'+RESULT_NAME+'/Prediction_result_valid_'+str(idx)+'.csv', index=False)
+        result_test.to_csv('./Result/'+RESULT_NAME+'/Prediction_result_test_'+str(idx)+'.csv', index=False)
     
     if effect.shape[0] != 0:
         if PARALLEL is None:
-            effect.to_csv('./Result/Marker_effect.csv', index=False)
+            effect.to_csv('./Result/'+RESULT_NAME+'/Marker_effect.csv', index=False)
         else:
-            effect.to_csv('./Result/Marker_effect_'+str(idx)+'.csv', index=False)
+            effect.to_csv('./Result/'+RESULT_NAME+'/Marker_effect_'+str(idx)+'.csv', index=False)
     if 'RF' in MODEL:
         if PARALLEL is None:
-            interactions.to_csv('./Result/Interaction.csv', index=False)
+            interactions.to_csv('./Result/'+RESULT_NAME+'/Interaction.csv', index=False)
         else:
-            interactions.to_csv('./Result/Interaction_'+str(idx)+'.csv', index=False)
+            interactions.to_csv('./Result/'+RESULT_NAME+'/Interaction_'+str(idx)+'.csv', index=False)
     if W_OPT is not None:
         if PARALLEL is None:
-            weight.to_csv('./Result/Weight.csv', index=False)
+            weight.to_csv('./Result/'+RESULT_NAME+'/Weight.csv', index=False)
         else:
-            weight.to_csv('./Result/Weight_'+str(idx)+'.csv', index=False)
+            weight.to_csv('./Result/'+RESULT_NAME+'/Weight_'+str(idx)+'.csv', index=False)
         
     return record, result_train, result_test, effect, interactions, POPULATION, PHENOTYPE

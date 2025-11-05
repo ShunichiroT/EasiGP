@@ -2,14 +2,14 @@ from pycirclize import Circos
 import numpy as np
 import pandas as pd
 
-def data_conversion(chrom_info, gene_info, PHENOTYPE):
+def data_conversion(chrom_info, gene_info, PHENOTYPE, RESULT_NAME):
     chromosome = pd.read_csv(chrom_info)
     chromosome_population = pd.unique(chromosome['population'])
     
     for i in range(len(chromosome_population)):
         chromosome_selected = chromosome[chromosome['population']==chromosome_population[i]]
         chromosome_selected = chromosome_selected.drop(['population'],axis=1)
-        chromosome_selected.to_csv('./Result/chrom_'+str(chromosome_population[i])+'.bed', sep='\t', index=False)
+        chromosome_selected.to_csv('./Result/'+RESULT_NAME+'/chrom_'+str(chromosome_population[i])+'.bed', sep='\t', index=False)
     
     if gene_info is not None:
         gene = pd.read_csv(gene_info)
@@ -21,7 +21,7 @@ def data_conversion(chrom_info, gene_info, PHENOTYPE):
                     gene_selected = gene[(gene['population']==gene_population[j]) & (gene['phenotype']==PHENOTYPE[i]) & (gene['source']==gene_source[k])]
                     gene_selected = gene_selected.drop(['source','population','phenotype'],axis=1)
                     if gene_selected.shape[0] != 0:
-                        gene_selected.to_csv('./Result/gene_info_'+str(PHENOTYPE[i])+'_'+str(gene_source[k])+'_'+str(chromosome_population[j])+'.tsv', sep='\t', index=False)
+                        gene_selected.to_csv('./Result/'+RESULT_NAME+'/gene_info_'+str(PHENOTYPE[i])+'_'+str(gene_source[k])+'_'+str(chromosome_population[j])+'.tsv', sep='\t', index=False)
         
         pop_source = gene.loc[:,['phenotype','population','source']].drop_duplicates()
     
@@ -30,9 +30,9 @@ def data_conversion(chrom_info, gene_info, PHENOTYPE):
         
     return pop_source
 
-def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_adjust, POPULATION, WINDOW):
+def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_adjust, POPULATION, WINDOW, RESULT_NAME):
     
-    chromosome = pd.read_csv('./Result/chrom_'+str(POPULATION)+'.bed', delimiter='\t')
+    chromosome = pd.read_csv('./Result/'+RESULT_NAME+'/chrom_'+str(POPULATION)+'.bed', delimiter='\t')
     
     if WINDOW != 0:
         division = []
@@ -98,7 +98,7 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
                 for k in range(len(chromosome_total)):
                     merged.loc[(merged['chromosome']==chromosome_total[k]) & 
                                (merged['end'] > chromosome.loc[chromosome['chromosome']==chromosome_total[k],'end'].values[0]),'end'] = int(chromosome.loc[chromosome['chromosome']==chromosome_total[k], 'end'].values)
-                merged.to_csv('./Result/marker_effect_'+str(MODEL[iii])+'_'+str(PHENOTYPE)+'_'+str(POPULATION)+'.tsv', sep ='\t',index=False)
+                merged.to_csv('./Result/'+RESULT_NAME+'/marker_effect_'+str(MODEL[iii])+'_'+str(PHENOTYPE)+'_'+str(POPULATION)+'.tsv', sep ='\t',index=False)
             else:
                 effect_selected.columns = ['effect']
                 effect_selected = effect_selected.reset_index(drop=False)
@@ -154,7 +154,7 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
                     merged.loc[(merged['chromosome']==chromosome_total[k]) & 
                                (merged['end'] > chromosome.loc[chromosome['chromosome']==chromosome_total[k],'end'].values[0]),'end'] = int(chromosome.loc[chromosome['chromosome']==chromosome_total[k], 'end'].values)
 
-                merged.to_csv('./Result/marker_effect_'+str(MODEL[iii])+'_'+str(PHENOTYPE)+'_'+str(POPULATION)+'.tsv', sep ='\t',index=False)
+                merged.to_csv('./Result/'+RESULT_NAME+'/marker_effect_'+str(MODEL[iii])+'_'+str(PHENOTYPE)+'_'+str(POPULATION)+'.tsv', sep ='\t',index=False)
         else:
             REMOVE += [MODEL[iii]]
     
@@ -162,7 +162,7 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
     
     return MODEL
 
-def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION):
+def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, RESULT_NAME):
     
     # Extract key gmarker-by-marker interaction patterns
     if POPULATION == 'all' and interaction.shape[0]!=0:
@@ -194,14 +194,14 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION):
 
     return interaction_selected
 
-def plot(interactions, chrom_info, gene_info, pop_source, PHENOTYPE, MODEL, circos_config, CYTOBAND_COLORMAP, POPULATION):
+def plot(interactions, chrom_info, gene_info, pop_source, PHENOTYPE, MODEL, circos_config, CYTOBAND_COLORMAP, POPULATION, RESULT_NAME):
   
     cnt = 0
-    circos = Circos.initialize_from_bed('./Result/chrom_'+str(POPULATION)+".bed", space=circos_config['space'], start=circos_config['start'], end=circos_config['end'])
+    circos = Circos.initialize_from_bed('./Result/'+RESULT_NAME+'/chrom_'+str(POPULATION)+".bed", space=circos_config['space'], start=circos_config['start'], end=circos_config['end'])
     
     # Add genomic marker effects
     for i in range(len(MODEL)):
-         circos.add_cytoband_tracks((97-(3*cnt), 100-(3*cnt)), './Result/marker_effect_'+MODEL[i]+'_'+PHENOTYPE+'_'+str(POPULATION)+'.tsv', track_name=MODEL[i], cytoband_cmap=CYTOBAND_COLORMAP)
+         circos.add_cytoband_tracks((97-(3*cnt), 100-(3*cnt)), './Result/'+RESULT_NAME+'/marker_effect_'+MODEL[i]+'_'+PHENOTYPE+'_'+str(POPULATION)+'.tsv', track_name=MODEL[i], cytoband_cmap=CYTOBAND_COLORMAP)
          circos.text(MODEL[i], r=circos.tracks[-1].r_center-1, deg=0, size=8, color="black")
          cnt+=1
     
@@ -209,7 +209,7 @@ def plot(interactions, chrom_info, gene_info, pop_source, PHENOTYPE, MODEL, circ
     if gene_info is not None:
         gene_source = pd.unique(pop_source.loc[(pop_source['population']==str(POPULATION)) & (pop_source['phenotype']==str(PHENOTYPE)),'source'])
         for i in range(len(gene_source)):    
-            circos.add_cytoband_tracks((97-(3*cnt), 100-(3*cnt)), './Result/gene_info_'+str(PHENOTYPE)+'_'+str(gene_source[i])+'_'+str(POPULATION)+'.tsv', track_name=gene_source[i], cytoband_cmap=CYTOBAND_COLORMAP)
+            circos.add_cytoband_tracks((97-(3*cnt), 100-(3*cnt)), './Result/'+RESULT_NAME+'/gene_info_'+str(PHENOTYPE)+'_'+str(gene_source[i])+'_'+str(POPULATION)+'.tsv', track_name=gene_source[i], cytoband_cmap=CYTOBAND_COLORMAP)
             circos.text(gene_source[i], r=circos.tracks[-1].r_center-1, deg=0, size=8, color="black")
             cnt+=1
     
@@ -236,16 +236,16 @@ def plot(interactions, chrom_info, gene_info, pop_source, PHENOTYPE, MODEL, circ
             
     # Store the circos plot
     fig = circos.plotfig()
-    fig.savefig('./Result/circos_'+str(PHENOTYPE)+'_'+str(POPULATION)+'.png',dpi=600) 
+    fig.savefig('./Result/'+RESULT_NAME+'/circos_'+str(PHENOTYPE)+'_'+str(POPULATION)+'.png',dpi=600) 
 
-def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULATION, PHENOTYPE, circos_config, end_adjust, WINDOW, CYTOBAND_COLORMAP):
+def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULATION, PHENOTYPE, circos_config, end_adjust, WINDOW, CYTOBAND_COLORMAP,RESULT_NAME):
 
-    pop_source =  data_conversion(chrom_info, gene_info, PHENOTYPE)
+    pop_source =  data_conversion(chrom_info, gene_info, PHENOTYPE,RESULT_NAME)
     POPULATION = ('all',) + tuple(POPULATION)
     MODEL = pd.unique(effect['type'])
 
     for i in range(len(PHENOTYPE)):
         for j in range(len(POPULATION)):
-            MODEL = quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE[i], MODEL, end_adjust, POPULATION[j], WINDOW)
-            interaction_selected = interaction(interactions, marker_info, PHENOTYPE[i], circos_config, POPULATION[j])
-            plot(interaction_selected, chrom_info, gene_info, pop_source, PHENOTYPE[i], MODEL, circos_config, CYTOBAND_COLORMAP, POPULATION[j])
+            MODEL = quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE[i], MODEL, end_adjust, POPULATION[j], WINDOW,RESULT_NAME)
+            interaction_selected = interaction(interactions, marker_info, PHENOTYPE[i], circos_config, POPULATION[j],RESULT_NAME)
+            plot(interaction_selected, chrom_info, gene_info, pop_source, PHENOTYPE[i], MODEL, circos_config, CYTOBAND_COLORMAP, POPULATION[j],RESULT_NAME)

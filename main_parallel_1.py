@@ -12,17 +12,14 @@ R_PATH = None
 
 # Your target phenotypes
 # Write 'all' to select all phenotypes in your phenotype file  
-PHENOTYPE = ['days2anthesis', 'asi'] 
+PHENOTYPE = ['days2anthesis','asi'] 
 
 # Name of genomic prediction models to run
-# Available models
-  # ['rrBLUP', 'BayesB', 'RKHS', 'RF', 'SVR', 'MLP', 'ensemble']
-  # ['GAT_infinitesimal', 'GAT_fully_connected', 'GAT_prior_knowledge']
-MODEL = ['rrBLUP', 'BayesB', 'RKHS', 'ensemble'] 
+MODEL = ['rrBLUP', 'BayesB', 'RF','ensemble'] 
 
-# Data splitting ratio
-# If elements are in float values, they are used as a training set ratio when 
-# splitting the data into training and test sets
+# Data spliting ratio
+# If elements are in float values, they are used to as training set ratio when 
+# spliting the data into training and test sets
     # e.g. [0.8, 0.65, 0.5]
 
 # If elements are in tuple formats, they are used to split the data into 
@@ -34,10 +31,13 @@ MODEL = ['rrBLUP', 'BayesB', 'RKHS', 'ensemble']
 # The element of each tuple shows the ratio of the training, 
 # validation and test set, respectively
 
-RATIO = [0.8]   
+RATIO = [0.8]  #[(0.5,0.25,0.25)]     
 
 # Number of iterations with random sampling for training & test sets
 ITER_NUM = 2
+
+# Folder name that store prediction results (inside Result folder) 
+RESULT_NAME = 'MaizeNAM'
 
 # File paths for your genotype & phenotype files
 GENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_genotype_population_1.csv' 
@@ -49,10 +49,10 @@ PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1.c
     # It is possible to automate id assignment using a job array in HPC if any
     # e.g. int(os.environ["SLURM_ARRAY_TASK_ID"])
 # Batch size: the total number of prediction scenarios in each batch
-PARALLEL = {'batch_id': 1,
+PARALLEL = {'batch_id': 0,
             'batch_size': 2}
 
-# Hyperparameters
+# Hyprparameters
 # rrBLUP:                          
     # iteration number, burin-in
 # BayesB:                          
@@ -61,8 +61,8 @@ PARALLEL = {'batch_id': 1,
     # iteration number, buin-in, number of samples for Shapley scores, 
     # return marker effect?
 # RF:                              
-    # tree number, maximum features per tree, maximum samples per tree, 
-    # number of samples for Shapley scores, return marker interactions?
+    # tree number, maximum fearures per tree, maximum samples per tree, 
+    # number of samples for Shapley scores, return marker effect?
 # SVR:                             
     # kernel type, epsilon, regularisation, dimension for poly kernel, gamma, 
     # number of samples for Shapley scores, return marker effect?
@@ -96,10 +96,10 @@ HPARAMETERS = {'rrBLUP': [10000, 2000],
 
 # Method names for weight optimisation in ensembles 
 # The current available methods 
-# ['Nelder Mead','Linear transformation', 'Bayesian_optimisation']
+# ['Nelder_Mead','Linear transformation', 'Bayesian_optimisation']
 
 # Write "None" if you implement naive ensemble approach 
-W_OPT = None 
+W_OPT = ['Nelder Mead', 'Bayesian optimisation', 'Linear transformation'] 
 
 # Hyperparameters for weight optimisation
 # Linear transformation:
@@ -117,4 +117,4 @@ HYPERPARAMETERS_OPT = {'Linear transformation':[0.005, 150, 0.01, 2, 10, 30],
 # Run genomic prediction models
 metrics, predicted_result_train, predicted_result_test, effect, interactions, \
     POPULATION, PHENOTYPE = GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, 
-                               PHENOTYPE, RATIO, ITER_NUM, HPARAMETERS, R_PATH, W_OPT, HYPERPARAMETERS_OPT, PARALLEL)
+                               PHENOTYPE, RATIO, ITER_NUM, HPARAMETERS, R_PATH, W_OPT, RESULT_NAME, HYPERPARAMETERS_OPT, PARALLEL)

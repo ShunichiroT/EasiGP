@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 
-def scatter_plot(MODEL, PHENOTYPE, predicted_result_test, effect, QTL, SCATTER_CONFIG):
+def scatter_plot(MODEL, PHENOTYPE, predicted_result_test, effect, QTL, SCATTER_CONFIG, RESULT_NAME):
     
     #if 'Linear transformation' in list(predicted_result_test.columns):
     #     predicted_result_test = predicted_result_test.drop('Linear transformation', axis=1)
@@ -101,5 +101,5 @@ def scatter_plot(MODEL, PHENOTYPE, predicted_result_test, effect, QTL, SCATTER_C
                 except:
                     continue
         plt.tight_layout()
-        plt.savefig('./Result/Scatter_plot_'+PHENOTYPE[k]+'.png')
+        plt.savefig('./Result/'+RESULT_NAME+'/Scatter_plot_'+PHENOTYPE[k]+'.png')
         
