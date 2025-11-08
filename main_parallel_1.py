@@ -39,6 +39,9 @@ ITER_NUM = 2
 # Folder name that store prediction results (inside Result folder) 
 RESULT_NAME = 'MaizeNAM'
 
+if not os.path.exists('./Result/'+RESULT_NAME):
+    os.makedirs('./Result/'+RESULT_NAME)
+
 # File paths for your genotype & phenotype files
 GENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_genotype_population_1.csv' 
 PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1.csv' 

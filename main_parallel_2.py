@@ -1,3 +1,5 @@
+import os
+
 from assemble import *
 from metric_plot import *
 from scatter_plot import *
@@ -23,6 +25,9 @@ SCATTER_CONFIG = {'font_size':2,
 
 # Folder name that store prediction results (inside Result folder) 
 RESULT_NAME = 'MaizeNAM'
+
+if not os.path.exists('./Result/'+RESULT_NAME):
+    os.makedirs('./Result/'+RESULT_NAME)
 
 # ---------------------------------------------------------------------------- #
 # 3. Circos plot configuration
