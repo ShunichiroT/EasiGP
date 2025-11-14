@@ -4,7 +4,7 @@ library(data.table)
 library(dplyr)
 
 
-rrBLUP <- function(train, valid, test, params){
+rrBLUP <- function(train, valid, test, params, RESULT_NAME){
   
   params <- unlist(params)
   nIter <- params[1]
@@ -23,7 +23,7 @@ rrBLUP <- function(train, valid, test, params){
   y_test[(nrow(data)-(nrow(valid)+nrow(test))+1):nrow(data)] <- NA
   
   fm <- BGLR(y=y_test,ETA=list(mrk=list(X=X,model='BRR')),
-             nIter=nIter,burnIn=burnIn,verbose=FALSE,saveAt='./Result/brr_')
+             nIter=nIter,burnIn=burnIn,verbose=FALSE,saveAt=paste('./Result/',RESULT_NAME,'/brr_', sep = ""))
   
   y_predicted <- fm$yHat[(nrow(data)-nrow(test)+1):nrow(data)]
   y_actual <- y[(nrow(data)-nrow(test)+1):nrow(data)]

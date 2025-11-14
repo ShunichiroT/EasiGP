@@ -5,7 +5,7 @@ library(dplyr)
 library(iml)
 
 
-RKHS <- function(train, valid, test, params){
+RKHS <- function(train, valid, test, params, RESULT_NAME){
   
   params <- unlist(params)
   nIter <- params[1]
@@ -28,7 +28,7 @@ RKHS <- function(train, valid, test, params){
   y_test[(nrow(data)-(nrow(valid)+nrow(test))+1):nrow(data)] <- NA
   
   fm <- BGLR(y=y_test,ETA=list(list(K=K,model='RKHS')),
-             nIter=nIter,burnIn=burnIn,verbose=FALSE,saveAt='./Result/eig_')
+             nIter=nIter,burnIn=burnIn,verbose=FALSE,saveAt=paste('./Result/',RESULT_NAME,'/eig_', sep = ""))
   
   y_predicted <- fm$yHat[(nrow(data)-nrow(test)+1):nrow(data)]
   y_actual <- y[(nrow(data)-nrow(test)+1):nrow(data)]
