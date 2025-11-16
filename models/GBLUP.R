@@ -2,33 +2,33 @@ library(BGLR)
 library(stringr)
 library(data.table)
 library(dplyr)
-library(iml)
 
 
-RKHS <- function(train, valid, test, params, RESULT_NAME){
+GBLUP <- function(train, valid, test, params, RESULT_NAME){
   
   params <- unlist(params)
   nIter <- params[1]
   burnIn <-  params[2]
   Shapley_num <- params[3]
   get_effect <- params[4]
-
+  
   data <- rbind(train, valid, test)
   data_qtl <- data.frame(lapply(data[,1:(ncol(data)-1)], as.numeric))
   data_pheno <- data[,ncol(data):ncol(data)]
   
-  D <- as.matrix(dist(data_qtl,method="euclidean"))^2
-  D <- D/mean(D)
-  h <- 1
-  K <- exp(-h*D)
-  
+  X <- scale(data_qtl, center = T, scale = T)
+  G <- as.matrix((X %*% t(X)) / ncol(data_qtl))  # same as tcrossprod(X) / p
+
+  #X <- scale(data_qtl)/sqrt(ncol(data_qtl))
+  #X <- X[ , colSums(is.na(X)) == 0]
+  #X[is.na(X)] <- -1
   y <- as.numeric(unlist(data_pheno))
   
   y_test <- y
   y_test[(nrow(data)-(nrow(valid)+nrow(test))+1):nrow(data)] <- NA
   
-  fm <- BGLR(y=y_test,ETA=list(list(K=K,model='RKHS')),
-             nIter=nIter,burnIn=burnIn,verbose=FALSE,saveAt=paste('./Result/',RESULT_NAME,'/eig_', sep = ""))
+  fm <- BGLR(y=y_test,ETA=list(list(K = G, model = "RKHS")),
+             nIter=nIter,burnIn=burnIn,verbose=FALSE,saveAt=paste('./Result/',RESULT_NAME,'/GBLUP_', sep = ""))
   
   y_predicted <- fm$yHat[(nrow(data)-nrow(test)+1):nrow(data)]
   y_actual <- y[(nrow(data)-nrow(test)+1):nrow(data)]
@@ -54,13 +54,11 @@ RKHS <- function(train, valid, test, params, RESULT_NAME){
       len_beg <- nrow(data_qtl)+ 1
       len_end <- nrow(data_qtl)+ nrow(newdata)
       
-      D <- as.matrix(dist(qtl,method="euclidean"))^2
-      D <- D/mean(D)
-      h <- 1
-      K <- exp(-h*D)
-      
-      f <- BGLR(y=pred,ETA=list(list(K=K,model='RKHS')),
-                nIter=nIter,burnIn=burnIn,verbose=FALSE,saveAt=paste('./Result/',RESULT_NAME,'/eig_', sep = ""))
+      X <- scale(qtl, center = T, scale = T)
+      G <- as.matrix((X %*% t(X)) / ncol(qtl))  # same as tcrossprod(X) / p
+
+      f <- BGLR(y=pred,ETA=list(list(K = G, model = "RKHS")),
+                nIter=nIter,burnIn=burnIn,verbose=FALSE,saveAt=paste('./Result/',RESULT_NAME,'/GBLUP_', sep = ""))
       
       return(f[["yHat"]][len_beg:len_end])
     }

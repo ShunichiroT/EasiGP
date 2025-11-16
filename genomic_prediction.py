@@ -28,6 +28,8 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
     r_source = robjects.r['source']
     r_source('./models/rrBLUP.R')
     rrBLUP = robjects.globalenv['rrBLUP']
+    r_source('./models/GBLUP.R')
+    GBLUP = robjects.globalenv['GBLUP']
     r_source('./models/BayesB.R')
     BayesB = robjects.globalenv['BayesB']
     r_source('./models/RKHS.R')
@@ -96,6 +98,13 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
                 continue
             elif MODEL[jj] == 'rrBLUP':
                 sample_pearson, sample_mse, sample_effect, predicted_test, predicted_valid, predicted_train = rrBLUP(train, valid, test, HPARAMETERS[MODEL[jj]], RESULT_NAME)
+                sample_pearson, sample_mse = sample_pearson[0], sample_mse[0]
+                sample_effect = robjects.conversion.rpy2py(sample_effect)
+                predicted_test = robjects.conversion.rpy2py(predicted_test)
+                predicted_valid = robjects.conversion.rpy2py(predicted_valid)
+                predicted_train = robjects.conversion.rpy2py(predicted_train)
+            elif MODEL[jj] == 'GBLUP':
+                sample_pearson, sample_mse, sample_effect, predicted_test, predicted_valid, predicted_train = GBLUP(train, valid, test, HPARAMETERS[MODEL[jj]], RESULT_NAME)
                 sample_pearson, sample_mse = sample_pearson[0], sample_mse[0]
                 sample_effect = robjects.conversion.rpy2py(sample_effect)
                 predicted_test = robjects.conversion.rpy2py(predicted_test)

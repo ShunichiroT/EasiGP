@@ -19,7 +19,7 @@ PHENOTYPE = ['days2anthesis']
 
 # Name of genomic prediction models to run
 # Available models
-  # ['rrBLUP', 'BayesB', 'RKHS', 'RF', 'SVR', 'MLP', 'ensemble']
+  # ['rrBLUP', 'GBLUP', 'BayesB', 'RKHS', 'RF', 'SVR', 'MLP', 'ensemble']
   # ['GAT_infinitesimal', 'GAT_fully_connected', 'GAT_prior_knowledge']
 MODEL = ['rrBLUP', 'BayesB', 'RF','ensemble'] 
 
@@ -83,7 +83,8 @@ PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1.c
     # number of heads, number of samples for Shapley scores, 
     # selection rate for edges from RF (e.g. 0.1 = selection the top 10% of the 
     # most important edges), return marker effect?
-HPARAMETERS = {'rrBLUP': [10000, 2000],     
+HPARAMETERS = {'rrBLUP': [10000, 2000], 
+               'GBLUP': [12000, 2000, 30, False], 
                'BayesB': [12000, 2000],    
                'RKHS': [12000, 2000, 30, False],   
                'RF': [1000, 1.0, None, 30, True],           

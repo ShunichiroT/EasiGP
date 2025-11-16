@@ -15,6 +15,9 @@ R_PATH = None
 PHENOTYPE = ['days2anthesis','asi'] 
 
 # Name of genomic prediction models to run
+# Available models
+  # ['rrBLUP', 'GBLUP', 'BayesB', 'RKHS', 'RF', 'SVR', 'MLP', 'ensemble']
+  # ['GAT_infinitesimal', 'GAT_fully_connected', 'GAT_prior_knowledge']
 MODEL = ['rrBLUP', 'BayesB', 'RF','ensemble'] 
 
 # Data spliting ratio
@@ -86,7 +89,8 @@ PARALLEL = {'batch_id': 0,
     # number of heads, number of samples for Shapley scores, 
     # selection rate for edges from RF (e.g. 0.1 = selection the top 10% of the 
     # most important edges), return marker effect?
-HPARAMETERS = {'rrBLUP': [10000, 2000],     
+HPARAMETERS = {'rrBLUP': [10000, 2000],
+               'GBLUP': [12000, 2000, 30, False], 
                'BayesB': [12000, 2000],    
                'RKHS': [12000, 2000, 30, False],   
                'RF': [1000, 1.0, None, 30, False],           
