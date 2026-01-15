@@ -23,7 +23,7 @@ QTL = None
 SCATTER_CONFIG = {'font_size':2,
                   'fig_size':30}
 
-# Folder name that store prediction results (inside Result folder) 
+# Folder name that stores prediction results (insidethe  Result folder) 
 RESULT_NAME = 'MaizeNAM'
 
 if not os.path.exists('./Result/'+RESULT_NAME):
@@ -38,18 +38,18 @@ CHROMOSOME_INFO = './Data/MaizeNAM/chrom.csv'
 # File path for the information of all markers
 MARKER_INFO = './Data/MaizeNAM/marker_info.csv'
 
-# File path for key gene region information for comaprison
+# File path for key gene region information for comparison
 # Write 'None' if no key gene region information needs to be included
 GENE_INFO = './Data/MaizeNAM/gene_info.csv'
 
-# Configuration for ciscos plots
+# Configuration for circos plots
 # space:           space size between rings
 # start:           start angle of a ring
 # end:             end angle of a ring
 # link_width:      the thickness of links
 # interaction_top: select only the top N% of strongest links in the ratio form
 # label_size:      size of font
-# scale:           scale of circos plot  
+# scale:           scale of the circos plot  
 CIRCOS_CONFIG = {'space':3,
                  'start':15,
                  'end':345,
@@ -61,10 +61,10 @@ CIRCOS_CONFIG = {'space':3,
 # adjust the edge location of each marker for visualisation
 END_ADJUST = 0
 
-# Choose a method of how you aggregate genomic marker effect
+# Choose a method for aggregating genomic marker effects
 # Assign 0 if you do not wish to introduce a window to average the effects in each window interval
 # Otherwise, assign a window size here
-# If circos plot does not show with WINDOWS > 0, you can increase the size of the window
+# If the circos plot does not show with WINDOWS > 0, you can increase the size of the window
 WINDOW = 30
 
 # colour palette for circos plot
