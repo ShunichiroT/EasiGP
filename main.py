@@ -21,11 +21,11 @@ PHENOTYPE = ['days2anthesis']
 # Available models
   # ['rrBLUP', 'GBLUP', 'BayesB', 'RKHS', 'RF', 'SVR', 'MLP', 'ensemble']
   # ['GAT_infinitesimal', 'GAT_fully_connected', 'GAT_prior_knowledge']
-MODEL = ['rrBLUP', 'BayesB', 'RF','ensemble'] 
+MODEL = ['rrBLUP', 'BayesB', 'RF', 'ensemble'] 
 
-# Data spliting ratio
-# If elements are in float values, they are used as training set ratio when 
-# spliting the data into training and test sets
+# Data splitting ratio
+# If elements are in float values, they are used as the training set ratio when 
+# splitting the data into training and test sets
     # e.g. [0.8, 0.65, 0.5]
 
 # If elements are in tuple formats, they are used to split the data into 
@@ -42,7 +42,7 @@ RATIO = [0.8]#[(0.5,0.25,0.25)]  #[(0.5,0.25,0.25)]     #[0.8]
 # Number of iterations with random sampling for training & test sets
 ITER_NUM = 2
 
-# Folder name that store prediction results (inside Result folder) 
+# Folder name that stores prediction results (inside the Result folder) 
 RESULT_NAME = 'MaizeNAM'
 
 if not os.path.exists('./Result/'+RESULT_NAME):
@@ -61,7 +61,7 @@ PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1.c
     # iteration number, buin-in, number of samples for Shapley scores, 
     # return marker effect?
 # RF:                              
-    # tree number, maximum fearures per tree, maximum samples per tree, 
+    # tree number, maximum features per tree, maximum samples per tree, 
     # number of samples for Shapley scores, return marker effect interactions?
 # SVR:                             
     # kernel type, epsilon, regularisation, dimension for poly kernel, gamma, 
@@ -97,9 +97,9 @@ HPARAMETERS = {'rrBLUP': [10000, 2000],
 
 # Method names for weight optimisation in ensembles 
 # The current available methods 
-# ['Nelder_Mead','Linear transformation', 'Bayesian_optimisation']
+# ['Nelder_Mead', 'Linear transformation', 'Bayesian_optimisation']
 
-# Write "None" if you implement naive ensemble approach 
+# Write "None" if you implement the naive ensemble approach 
 W_OPT = None #['Nelder Mead', 'Bayesian optimisation', 'Linear transformation'] 
 
 # Hyperparameters for weight optimisation
@@ -148,7 +148,7 @@ GENE_INFO = './Data/MaizeNAM/gene_info.csv'
 # link_width:      the thickness of links
 # interaction_top: select only the top N% of strongest links in the ratio form
 # label_size:      size of font
-# scale:           scale of circos plot  
+# scale:           scale of the circos plot  
 CIRCOS_CONFIG = {'space':3,
                  'start':15,
                  'end':345,
@@ -160,10 +160,10 @@ CIRCOS_CONFIG = {'space':3,
 # Adjust the edge location of each marker for visualisation
 END_ADJUST = 0
 
-# Choose a method of how you aggregate genomic marker effect
+# Choose a method for aggregating genomic marker effects
 # Assign 0 if you do not wish to introduce a window to average the effects in each window interval
 # Otherwise, assign a window size here
-# If circos plot does not show with WINDOWS > 0, you can increase the size of the window
+# If the circos plot does not show with WINDOWS > 0, you can increase the size of the window
 WINDOW = 30
 
 # colour palette for circos plot
