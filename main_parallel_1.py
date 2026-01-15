@@ -12,17 +12,17 @@ R_PATH = None
 
 # Your target phenotypes
 # Write 'all' to select all phenotypes in your phenotype file  
-PHENOTYPE = ['days2anthesis','asi'] 
+PHENOTYPE = ['days2anthesis', 'asi'] 
 
 # Name of genomic prediction models to run
 # Available models
   # ['rrBLUP', 'GBLUP', 'BayesB', 'RKHS', 'RF', 'SVR', 'MLP', 'ensemble']
   # ['GAT_infinitesimal', 'GAT_fully_connected', 'GAT_prior_knowledge']
-MODEL = ['rrBLUP', 'BayesB', 'RF','ensemble'] 
+MODEL = ['rrBLUP', 'BayesB', 'RF', 'ensemble'] 
 
-# Data spliting ratio
-# If elements are in float values, they are used to as training set ratio when 
-# spliting the data into training and test sets
+# Data splitting ratio
+# If elements are in float values, they are used as a training set ratio when 
+# splitting the data into training and test sets
     # e.g. [0.8, 0.65, 0.5]
 
 # If elements are in tuple formats, they are used to split the data into 
@@ -39,7 +39,7 @@ RATIO = [0.8]  #[(0.5,0.25,0.25)]
 # Number of iterations with random sampling for training & test sets
 ITER_NUM = 2
 
-# Folder name that store prediction results (inside Result folder) 
+# Folder name that stores prediction results (insidethe  Result folder) 
 RESULT_NAME = 'MaizeNAM'
 
 if not os.path.exists('./Result/'+RESULT_NAME):
@@ -58,7 +58,7 @@ PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1.c
 PARALLEL = {'batch_id': 0,
             'batch_size': 2}
 
-# Hyprparameters
+# Hyperparameters
 # rrBLUP:                          
     # iteration number, burin-in
 # BayesB:                          
@@ -67,7 +67,7 @@ PARALLEL = {'batch_id': 0,
     # iteration number, buin-in, number of samples for Shapley scores, 
     # return marker effect?
 # RF:                              
-    # tree number, maximum fearures per tree, maximum samples per tree, 
+    # tree number, maximum features per tree, maximum samples per tree, 
     # number of samples for Shapley scores, return marker effect?
 # SVR:                             
     # kernel type, epsilon, regularisation, dimension for poly kernel, gamma, 
@@ -103,7 +103,7 @@ HPARAMETERS = {'rrBLUP': [10000, 2000],
 
 # Method names for weight optimisation in ensembles 
 # The current available methods 
-# ['Nelder_Mead','Linear transformation', 'Bayesian_optimisation']
+# ['Nelder_Mead', 'Linear transformation', 'Bayesian_optimisation']
 
 # Write "None" if you implement naive ensemble approach 
 W_OPT = ['Nelder Mead', 'Bayesian optimisation', 'Linear transformation'] 
