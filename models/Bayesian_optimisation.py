@@ -62,11 +62,11 @@ def Bayesian(data_train, data_valid, data_test, record, effect, weight, MODEL, H
        third_term, mean_value = second_term.copy(), second_term.iloc[:,:-1].mean(axis=1)
        
        for i in range(len(model_selected)):
-           second_term.iloc[:,i] = (second_term.iloc[:,i]*weights[i] - second_term['actual']).pow(2)
-           third_term.iloc[:,i] = (third_term.iloc[:,i]*weights[i] - mean_value).pow(2)
+           second_term.iloc[:,i] = (second_term.iloc[:,i] - second_term['actual']).pow(2)*weights[i]
+           third_term.iloc[:,i] = (third_term.iloc[:,i] - mean_value).pow(2)*weights[i]
            
-       second_term = second_term.iloc[:,:-1].mean(axis=1)
-       third_term = third_term.iloc[:,:-1].mean(axis=1)
+       second_term = second_term.iloc[:,:-1].div(weights.sum(),axis=1).mean(axis=1)
+       third_term = third_term.iloc[:,:-1].div(weights.sum(),axis=1).mean(axis=1)
        first_term = (second_term - third_term).mean()
         
        return 1/first_term
