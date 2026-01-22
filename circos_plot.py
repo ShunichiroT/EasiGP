@@ -166,15 +166,15 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, 
     
     # Extract key gmarker-by-marker interaction patterns
     if POPULATION == 'all' and interaction.shape[0]!=0:
-        interaction = interaction.loc[:,['phenotype','from','to', 'value']]
+        interaction = interaction.loc[:,['phenotype','marker1','marker2', 'value']]
     elif POPULATION != 'all' and interaction.shape[0]!=0:
-        interaction = interaction.loc[:,['population','phenotype','from','to', 'value']]
+        interaction = interaction.loc[:,['population','phenotype','marker1','marker2', 'value']]
         interaction = interaction[interaction['population']==POPULATION].reset_index(drop=False)
     else:
         return pd.DataFrame()
     
-    interaction = interaction[(interaction['from'] != 'factor') & (interaction['to'] != 'factor')]
-    interaction_total = interaction.groupby(['phenotype','from','to'], as_index=False).mean(numeric_only=True)
+    interaction = interaction[(interaction['marker1'] != 'factor') & (interaction['marker2'] != 'factor')]
+    interaction_total = interaction.groupby(['phenotype','marker1','marker2'], as_index=False).mean(numeric_only=True)
     
     interaction_selected = interaction_total[interaction_total['phenotype'] == PHENOTYPE]
     interaction_selected = interaction_selected[interaction_selected['value'] >= np.quantile(interaction_selected['value'], circos_config['interaction_top'])].reset_index(drop=True)
@@ -182,15 +182,15 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, 
     
     loc_info = pd.read_csv(marker_info)
     
-    start = pd.merge(interaction_selected['from'], loc_info, 'inner', left_on='from', right_on='name')
-    end = pd.merge(interaction_selected['to'], loc_info, 'inner', left_on='to', right_on='name')
+    start = pd.merge(interaction_selected['marker1'], loc_info, 'inner', left_on='marker1', right_on='name')
+    end = pd.merge(interaction_selected['marker2'], loc_info, 'inner', left_on='marker2', right_on='name')
     chrom_start = 'chr'+ start['chromosome'].astype(int).astype(str)
     chrom_end = 'chr'+ end['chromosome'].astype(int).astype(str)
 
     interaction_selected = pd.concat([chrom_start, start.loc[:,['start','end']],
                                chrom_end, end.loc[:,['start','end']],
                                interaction_selected['value']],axis=1)
-    interaction_selected.columns = ['chromosome_from', 'start','end','chromosome_to','start','end','value']
+    interaction_selected.columns = ['chromosome_marker1', 'start','end','chromosome_marker2','start','end','value']
 
     return interaction_selected
 
