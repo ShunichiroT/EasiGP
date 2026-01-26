@@ -55,6 +55,9 @@ PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1.c
 # Hyperparameters
 # rrBLUP:                          
     # iteration number, burin-in
+# GBLUP:                            
+    # iteration number, buin-in, number of samples for Shapley scores, 
+    # return marker effect?
 # BayesB:                          
     # iteration number, burin-in
 # RKHS:                            
@@ -67,19 +70,19 @@ PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1.c
     # kernel type, epsilon, regularisation, dimension for poly kernel, gamma, 
     # number of samples for Shapley scores, return marker effect?
 # MLP:                             
-    # neuron numbers, dropout, learning rate, decay, epoch, batch size, 
+    # neuron numbers, dropout, learning rate, decay, epoch, training batch size, 
     # number of samples for Shapley scores
 # GAT_infinitesimal_node_level:    
-    # neuron numbers, dropout, learning rate, decay, epoch, batch size, 
+    # neuron numbers, dropout, learning rate, decay, epoch, training batch size, 
     # number of heads, number of samples for Shapley scores, return marker effect?
 # GAT_infinitesimal:               
-    # neuron numbers, dropout, learning rate, decay, epoch, batch size, 
+    # neuron numbers, dropout, learning rate, decay, epoch, training batch size, 
     # number of heads, number of samples for Shapley scores, return marker effect?
 # GAT_fully_connected:             
-    # neuron numbers, dropout, learning rate, decay, epoch, batch size, 
+    # neuron numbers, dropout, learning rate, decay, epoch, training batch size, 
     # number of heads, number of samples for Shapley scores, return marker effect?
 # GAT_prior_knowledge:             
-    # neuron numbers, dropout, learning rate, decay, epoch, batch size, 
+    # neuron numbers, dropout, learning rate, decay, epoch, training batch size, 
     # number of heads, number of samples for Shapley scores, 
     # selection rate for edges from RF (e.g. 0.1 = selection the top 10% of the 
     # most important edges), return marker effect?
