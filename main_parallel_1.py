@@ -36,10 +36,10 @@ MODEL = ['rrBLUP', 'BayesB', 'RF', 'ensemble']
 
 RATIO = [0.8]  #[(0.5,0.25,0.25)]     
 
-# Number of iterations with random sampling for training & test sets
+# Number of iterations with random sampling to create training & test sets in each population-phenotype-ratio prediction combination
 ITER_NUM = 2
 
-# Folder name that stores prediction results (insidethe  Result folder) 
+# Folder name that stores prediction results (inside the Result folder) 
 RESULT_NAME = 'MaizeNAM'
 
 if not os.path.exists('./Result/'+RESULT_NAME):
@@ -50,17 +50,20 @@ GENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_genotype_population_1.csv
 PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1.csv' 
 
 # Configuration for the parallel run of prediction scenarios
-# All prediction scenarios are split into k batches
-# Batch_id: assign the id of the batch you want to run
+# Prediction scenarios (population*trait*ratio*training-test set iteration numbers) are split into k batches in parallel
+# Batch_id: assign the id of the batch you want to run in parallel
     # It is possible to automate id assignment using a job array in HPC if any
     # e.g. int(os.environ["SLURM_ARRAY_TASK_ID"])
-# Batch size: the total number of prediction scenarios in each batch
-PARALLEL = {'batch_id': 0,
+# Batch size: the total number of prediction scenarios in each parallel batch
+PARALLEL = {'batch_id': CHANGE HERE,
             'batch_size': 2}
 
 # Hyperparameters
 # rrBLUP:                          
     # iteration number, burin-in
+# GBLUP:                            
+    # iteration number, buin-in, number of samples for Shapley scores, 
+    # return marker effect?
 # BayesB:                          
     # iteration number, burin-in
 # RKHS:                            
@@ -73,19 +76,19 @@ PARALLEL = {'batch_id': 0,
     # kernel type, epsilon, regularisation, dimension for poly kernel, gamma, 
     # number of samples for Shapley scores, return marker effect?
 # MLP:                             
-    # neuron numbers, dropout, learning rate, decay, epoch, batch size, 
+    # neuron numbers, dropout, learning rate, decay, epoch, training batch size, 
     # number of samples for Shapley scores
 # GAT_infinitesimal_node_level:    
-    # neuron numbers, dropout, learning rate, decay, epoch, batch size, 
+    # neuron numbers, dropout, learning rate, decay, epoch, training batch size, 
     # number of heads, number of samples for Shapley scores, return marker effect?
 # GAT_infinitesimal:               
-    # neuron numbers, dropout, learning rate, decay, epoch, batch size, 
+    # neuron numbers, dropout, learning rate, decay, epoch, training batch size, 
     # number of heads, number of samples for Shapley scores, return marker effect?
 # GAT_fully_connected:             
-    # neuron numbers, dropout, learning rate, decay, epoch, batch size, 
+    # neuron numbers, dropout, learning rate, decay, epoch, training batch size, 
     # number of heads, number of samples for Shapley scores, return marker effect?
 # GAT_prior_knowledge:             
-    # neuron numbers, dropout, learning rate, decay, epoch, batch size, 
+    # neuron numbers, dropout, learning rate, decay, epoch, training batch size, 
     # number of heads, number of samples for Shapley scores, 
     # selection rate for edges from RF (e.g. 0.1 = selection the top 10% of the 
     # most important edges), return marker effect?
