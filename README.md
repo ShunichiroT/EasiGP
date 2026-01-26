@@ -2,14 +2,13 @@
 This code is used for "Ensemble AnalySis with Interpretable Genomic Prediction (EasiGP): Computational Tool for Interpreting Ensembles of Genomic Prediction Models". (https://doi.org/10.1002/tpg2.70138)
 
 EasiGP analyses the ensemble of multiple diverse genomic prediction models at the genome level in crop breeding programs.
-Circos plots are then constructed using the effect of each genomic marker region and the interactions of these genomic marker regions for a target trait.
-With a circos plot view, we can visually compare the inferred trait genetic architecture of each genomic prediction model to deepen the understanding of the predictive behaviour of each genomic prediction model at the genome level.
+Circos plots are then constructed using the effect of each genomic marker region and the interactions of genomic markers for a target trait.
+With a constructed circos plot, we can visually compare the inferred trait genetic architecture of genomic prediction models to deepen our understanding of their predictive behaviour at the genome level.
 The comparison of the inferred genomic marker effects with known key genome regions also enables the discovery of potential new genome regions that have not been well-investigated in previous studies.
-
 
 ## Description
 - Model: the code for seven individual genomic prediction models (rrBLUP, BayesB, RKHS, RF, SVR, MLP and GAT) and the naive ensemble-average models is stored. These genomic prediction models are implemented through the "main" function.
-   - ridge regression best linear unbiased prediction (rrBLUP), BayesB and reproducing kernel Hilbert Space (RKHS): BGLR (Pérez and de Los Campos, 2014) in R
+   - ridge regression best linear unbiased prediction (rrBLUP), genomic best linear unbiased prediction (GBLUP), BayesB and reproducing kernel Hilbert Space (RKHS): BGLR (Pérez and de Los Campos, 2014) in R
    - Random forest (RF) and support vector regression (SVR): Sklearn (Pedregosa et al., 2012) in Python
    - Multilayer perceptron (MLP): PyTorch (Paszke et al., 2019) in Python
    - Graph attention network (GAT), GAT infinitesimal, GAT fully-connected & GAT prior-knowledge: PyTorch Geometric (Fey et al., 2019) in Python 
@@ -27,7 +26,9 @@ The comparison of the inferred genomic marker effects with known key genome regi
 
 - circos_plot.py: code that generates a circos plot. This function is implemented through the "main" function.
 
-- main.py: the top function that manages the implementation of this tool. Users can modify the settings and hyperparameters through this function to optimise this tool based on their requirements.
+- main.py: the top function that manages the implementation of this tool. Users can modify the settings and hyperparameters to customise this tool based on their requirements.
+
+- main_parallel.py: the top function that manages the implementation of this tool. Users can modify the settings and hyperparameters to customise this tool based on their requirements. Multiple prediction tasks are processed in parallel using HPC or a distributed computing system
 
 ## Procedure
 1. Download EasiGP
@@ -63,7 +64,7 @@ The comparison of the inferred genomic marker effects with known key genome regi
        - Set target traits, the training-test split ratio, the number of iterations, target populations, dataset name and genomic prediction models to run as the initial setting
        - Change the hyperparameters of the chosen models if needed
        - Set paths for relevant geneomic marker information datasets, visualisation configuration and colour palette for circos plots
-    - Note: for the marker data, a circos plot may not be able to show marker effects correctly if the interval between start and end is small. Please adjust "end_adjust" parameter to increase the interval size 
+    - Note: for the marker data, a circos plot may not be able to show marker effects correctly if the interval between start and end is small. Please adjust the "end_adjust" parameter to increase the interval size 
 5. Run the "main.py" file to implement the "GP" and "circos_plot" functions
    - If you want to run genomic prediction models in a parallel way, run the "main_parallel_1.py" and "main_parallel_2.py" in a sequential order
 6. Check and analyse the generated output files in the Result folder 
@@ -75,9 +76,9 @@ Chen Q, Yang CJ, York AM, Xue W, Daskalska LL, DeValk CA, Krueger KW, Lawton SB,
 
 Dominik G. Grimm, Damian Roqueiro, Patrice A. Salomé, Stefan Kleeberger, Bastian Greshake, Wangsheng Zhu, Chang Liu, Christoph Lippert, Oliver Stegle, Bernhard Schölkopf, Detlef Weigel, Karsten M. Borgwardt. 2017. easyGWAS: A Cloud-Based Platform for Comparing the Results of Genome-Wide Association Studies. The Plant Cell. 29. 5-19.
 
-Dong Z, Danilevskaya O, Abadie T, Messina C, Coles N, Cooper M. 2012. A gene regulatory network model for floral transition of the shoot apex in maize and its dynamic modeling. PLoS ONE. 
+Dong Z, Danilevskaya O, Abadie T, Messina C, Coles N, Cooper M. 2012. A gene regulatory network model for floral transition of the shoot apex in maize and its dynamic modelling. PLoS ONE. 
 
-Fey M, Lenssen JE. 2019. Fast graph representation learning with pytorch geometric. arXiv preprint arXiv:1903.02428.
+Fey M, Lenssen JE. 2019. Fast graph representation learning with PyTorch Geometric. arXiv preprint arXiv:1903.02428.
 
 Gibbs, Patrick M., Jefferson F. Paril, and Alexandre Fournier-Level. 2025. Trait genetic architecture and population structure determine model selection for genomic prediction in natural Arabidopsis thaliana populations. Genetics 229.3: iyaf003.
 
