@@ -71,7 +71,7 @@ PARALLEL = {'batch_id': CHANGE HERE,
     # return marker effect?
 # RF:                              
     # tree number, maximum features per tree, maximum samples per tree, 
-    # number of samples for Shapley scores, return marker effect?
+    # number of samples for Shapley scores, return marker effect interactions?
 # SVR:                             
     # kernel type, epsilon, regularisation, dimension for poly kernel, gamma, 
     # number of samples for Shapley scores, return marker effect?
