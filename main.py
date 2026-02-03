@@ -155,8 +155,8 @@ GENE_INFO = './Data/MaizeNAM/gene_info.csv'
 CIRCOS_CONFIG = {'space':3,
                  'start':15,
                  'end':345,
-                 'link_width':10,
-                 'interaction_top':0.9999,
+                 'link_width':1,
+                 'interaction_top':0.01,
                  'label_size':6,
                  'scale':100}
 
