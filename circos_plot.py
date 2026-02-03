@@ -177,7 +177,7 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, 
     interaction_total = interaction.groupby(['phenotype','marker1','marker2'], as_index=False).mean(numeric_only=True)
     
     interaction_selected = interaction_total[interaction_total['phenotype'] == PHENOTYPE]
-    interaction_selected = interaction_selected[interaction_selected['value'] >= np.quantile(interaction_selected['value'], circos_config['interaction_top'])].reset_index(drop=True)
+    interaction_selected = interaction_selected[interaction_selected['value'] >= np.quantile(interaction_selected['value'], 1-circos_config['interaction_top'])].reset_index(drop=True)
     interaction_selected['value'] = interaction_selected['value'] / interaction_selected['value'].sum()
     
     loc_info = pd.read_csv(marker_info)
@@ -232,7 +232,7 @@ def plot(interactions, chrom_info, gene_info, pop_source, PHENOTYPE, MODEL, circ
                 colour = 'blue'
             else:
                 colour = 'red'
-            circos.link(region1, region2, lw=interactions.loc[ii,'value']/circos_config['link_width'], color=colour)
+            circos.link(region1, region2, lw=interactions.loc[ii,'value']*circos_config['link_width'], color=colour)
             
     # Store the circos plot
     fig = circos.plotfig()
