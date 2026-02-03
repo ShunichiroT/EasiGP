@@ -47,14 +47,14 @@ GENE_INFO = './Data/MaizeNAM/gene_info.csv'
 # start:           start angle of a ring
 # end:             end angle of a ring
 # link_width:      the thickness of links
-# interaction_top: select only the top N% of strongest links in the ratio form
+# interaction_top: select only the top N% of the strongest links in the ratio form
 # label_size:      size of font
 # scale:           scale of the circos plot  
 CIRCOS_CONFIG = {'space':3,
                  'start':15,
                  'end':345,
-                 'link_width':10,
-                 'interaction_top':0.9999,
+                 'link_width':1,
+                 'interaction_top':0.01,
                  'label_size':6,
                  'scale':10000}
 
