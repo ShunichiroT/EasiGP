@@ -46,18 +46,18 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
     effect.iloc[:,5:] = effect.iloc[:,5:].abs().astype(float)
     effect = effect.drop('ratio', axis=1)
     if POPULATION == 'all':
-        effect_grouped = effect.iloc[:,1:].groupby(['phenotype','type']).mean()
+        effect_grouped = effect.iloc[:,1:].groupby(['phenotype','model']).mean()
     else:
-        effect_grouped = effect.groupby(['population','phenotype','type']).mean()
+        effect_grouped = effect.groupby(['population','phenotype','model']).mean()
     effect_grouped = effect_grouped.reset_index(drop=False)
     REMOVE = []
 
     for iii in range(len(MODEL)):
         colour = 'red' if MODEL[iii] in ['ensemble', 'Linear transformation', 'Nelder Mead', 'Bayesian optimisation'] else 'blue'
         if POPULATION == 'all':
-            effect_selected = effect_grouped[(effect_grouped['type']==MODEL[iii]) & (effect_grouped['phenotype']==PHENOTYPE)].iloc[:,3:].T
+            effect_selected = effect_grouped[(effect_grouped['model']==MODEL[iii]) & (effect_grouped['phenotype']==PHENOTYPE)].iloc[:,3:].T
         else:
-            effect_selected = effect_grouped[(effect_grouped['type']==MODEL[iii]) & (effect_grouped['phenotype']==PHENOTYPE) & (effect_grouped['population']==POPULATION)].iloc[:,3:].T
+            effect_selected = effect_grouped[(effect_grouped['model']==MODEL[iii]) & (effect_grouped['phenotype']==PHENOTYPE) & (effect_grouped['population']==POPULATION)].iloc[:,3:].T
         if effect_selected.shape[1] != 0:
             
             if WINDOW == 0:
@@ -242,7 +242,7 @@ def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULA
 
     pop_source =  data_conversion(chrom_info, gene_info, PHENOTYPE,RESULT_NAME)
     POPULATION = ('all',) + tuple(POPULATION)
-    MODEL = pd.unique(effect['type'])
+    MODEL = pd.unique(effect['model'])
 
     for i in range(len(PHENOTYPE)):
         for j in range(len(POPULATION)):
