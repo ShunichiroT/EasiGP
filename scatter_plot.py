@@ -13,12 +13,12 @@ def scatter_plot(MODEL, PHENOTYPE, predicted_result_test, effect, QTL, SCATTER_C
     #elif 'Bayesian optimisation' in list(predicted_result_test.columns):
     #    predicted_result_test = predicted_result_test.drop('Bayesian optimisation', axis=1)
     
-    #if 'Linear transformation' in effect['type'].values:
-    #     effect = effect[effect['type']!='Linear transformation'].reset_index(drop=True)
-    #elif 'Nelder_Mead' in effect['type'].values:
-    #     effect = effect[effect['type']!='Nelder_Mead'].reset_index(drop=True)
-    #elif 'Bayesian optimisation' in effect['type'].values:
-    #     effect = effect[effect['type']!='Bayesian optimisation'].reset_index(drop=True) 
+    #if 'Linear transformation' in effect['model'].values:
+    #     effect = effect[effect['model']!='Linear transformation'].reset_index(drop=True)
+    #elif 'Nelder_Mead' in effect['model'].values:
+    #     effect = effect[effect['model']!='Nelder_Mead'].reset_index(drop=True)
+    #elif 'Bayesian optimisation' in effect['model'].values:
+    #     effect = effect[effect['model']!='Bayesian optimisation'].reset_index(drop=True) 
     
     model_selected = MODEL.copy()
     if 'ensemble' in MODEL:
@@ -45,7 +45,7 @@ def scatter_plot(MODEL, PHENOTYPE, predicted_result_test, effect, QTL, SCATTER_C
             if MODEL[jj] == 'ensemble':
                 continue
             else:
-                tmp = effect_selected[effect_selected['type']==MODEL[jj]].reset_index(drop=True)
+                tmp = effect_selected[effect_selected['model']==MODEL[jj]].reset_index(drop=True)
                 if tmp.shape[0] != 0:
                     tmp = tmp.iloc[:,5:].melt()
                     tmp.columns = ['marker',MODEL[jj]]
