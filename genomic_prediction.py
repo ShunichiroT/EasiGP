@@ -158,7 +158,7 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
             # Store prediction results
             record_sample = pd.DataFrame([{'population': sample.loc[i,'population'],
                                            'phenotype': sample.loc[i,'phenotype'],
-                                           'type': MODEL[jj],
+                                           'model': MODEL[jj],
                                            'ratio': sample.loc[i,'ratio'],
                                            'sample': sample.loc[i,'sample'],
                                            'Pearson correlation': sample_pearson,
@@ -214,7 +214,7 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
                 sample_effect.columns = train.columns.tolist()[:-1]
                 effect_sample = pd.DataFrame([{'population': sample.loc[i,'population'],
                                                'phenotype': sample.loc[i,'phenotype'],
-                                               'type': MODEL[jj],
+                                               'model': MODEL[jj],
                                                'ratio': sample.loc[i,'ratio'],
                                                'sample': sample.loc[i,'sample'],
                                                }])
@@ -226,7 +226,7 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
             if MODEL[jj]  == 'RF' and sample_interaction.shape[0] != 0:
                 sample_interaction['population'] = sample.loc[i,'population']
                 sample_interaction['phenotype'] = sample.loc[i,'phenotype']
-                sample_interaction['type'] = MODEL[jj]
+                sample_interaction['model'] = MODEL[jj]
                 sample_interaction['ratio'] = str(sample.loc[i,'ratio'])
                 sample_interaction['sample'] = sample.loc[i,'sample'] 
                 
