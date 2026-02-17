@@ -40,7 +40,7 @@ def ensemble(train, valid, test, effect, MODEL):
     
     record = result_test.loc[:,list(result_test.columns[1:6])+['ensemble']].groupby(list(result_test.columns[1:5]), as_index=False).apply(metric).reset_index(drop=True)
     record = record.rename(columns={"Pearson": "Pearson correlation"})
-    record['type'] = 'ensemble'
+    record['model'] = 'ensemble'
     
     effect = effect.reset_index(drop=True)
 
@@ -52,7 +52,7 @@ def ensemble(train, valid, test, effect, MODEL):
     effect_ensemble = pd.DataFrame()
     cnt = 0
     for kkk in range(len(model_selected)):
-        selected = effect[effect['type']==model_selected[kkk]].reset_index(drop=True)
+        selected = effect[effect['model']==model_selected[kkk]].reset_index(drop=True)
         if selected.shape[0] != 0:
             if effect_ensemble.shape[0] == 0:
                 effect_ensemble = selected
@@ -62,7 +62,7 @@ def ensemble(train, valid, test, effect, MODEL):
                 cnt += 1
     
     effect_ensemble.iloc[:,5:] = effect_ensemble.iloc[:,5:] / cnt
-    effect_ensemble['type'] = 'ensemble'
+    effect_ensemble['model'] = 'ensemble'
         
     return result_train, result_valid, result_test, record, effect_ensemble
 
