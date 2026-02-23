@@ -17,6 +17,8 @@ def GAT_fully_connected(data_train, data_valid, data_test, params):
     else:
         VALID = False
         
+    data_test_columns = pd.Series(data_test.columns)
+        
     neuron = params[0]
     dropout = params[1]
     lrate = params[2]
@@ -108,6 +110,9 @@ def GAT_fully_connected(data_train, data_valid, data_test, params):
         tmp.y = torch.from_numpy(data_pheno_test_tmp).to(torch.float)
         tmp.edge_index = torch.stack([torch.from_numpy(edges_from_test_tmp).to(torch.long),torch.from_numpy(edges_to_test_tmp).to(torch.long)], dim=0)
         data_test += [tmp]
+    
+    edge_name_from = list(data_test_columns[data_test[1].edge_index[0].tolist()])   
+    edge_name_to = list(data_test_columns[data_test[1].edge_index[1].tolist()])  
         
     ## Create GAT    
     class GAT(torch.nn.Module):
@@ -118,16 +123,22 @@ def GAT_fully_connected(data_train, data_valid, data_test, params):
             self.conv2 = GATv2Conv((-1,-1), hidden_channels, add_self_loops=False, heads=heads, concat=False, dropout=dpout)
             self.lin1 = torch.nn.Linear(hidden_channels, out_channels)
     
-        def forward(self, x,edge_index,batch):
+        def forward(self, x,edge_index,batch, return_attention):
             x, edge_index, batch = x, edge_index, batch
             x = self.conv1(x, edge_index)
             x = F.elu(x)
-            x = self.conv2(x, edge_index)
+            if return_attention:
+                x, attention = self.conv2(x, edge_index,return_attention_weights=return_attention)
+            else:
+                x = self.conv2(x, edge_index,return_attention_weights=return_attention)
             x = F.elu(x)
             x = global_mean_pool(x, batch)
             x = self.lin1(x)
     
-            return x
+            if return_attention:
+                return x, attention
+            else:
+                return x
                 
     model = GAT(hidden_channels=neuron, out_channels=1, dpout=dropout)
     
@@ -138,7 +149,7 @@ def GAT_fully_connected(data_train, data_valid, data_test, params):
         valid_loader = DataLoader(data_valid, 
                                  batch_size=bsize)
     test_loader = DataLoader(data_test, 
-                             batch_size=bsize)
+                             batch_size=1)
     
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -154,7 +165,7 @@ def GAT_fully_connected(data_train, data_valid, data_test, params):
         for batch in train_loader:
             batch = batch.to(device)
             optimizer.zero_grad()
-            out = model(batch.x,batch.edge_index,batch.batch)
+            out = model(batch.x,batch.edge_index,batch.batch,None)
             loss = F.mse_loss(torch.squeeze(out), batch.y)                            
             loss.backward()
             optimizer.step()
@@ -167,10 +178,12 @@ def GAT_fully_connected(data_train, data_valid, data_test, params):
         
     predicted_test = []
     actual_test = []
+    attention = []
     for test in test_loader:
-        result = model(test.x,test.edge_index,test.batch)
+        result, att = model(test.x,test.edge_index,test.batch,True)
         predicted_test += result.tolist()
         actual_test += test.y.tolist()
+        attention += [att[1].detach().flatten().tolist()]
                
     predicted_test = [item for sublist in predicted_test for item in sublist]     
     
@@ -185,7 +198,7 @@ def GAT_fully_connected(data_train, data_valid, data_test, params):
     predicted_train = []
     #actual_train = []
     for train in train_loader:
-        result = model(train.x,train.edge_index,train.batch)
+        result = model(train.x,train.edge_index,train.batch,None)
         predicted_train += result.tolist()
         #actual_train += train.y.tolist()
     
@@ -195,7 +208,7 @@ def GAT_fully_connected(data_train, data_valid, data_test, params):
     #actual_valid = []
     if VALID:
         for valid in valid_loader:
-            result = model(valid.x,valid.edge_index,valid.batch)
+            result = model(valid.x,valid.edge_index,valid.batch,None)
             predicted_valid += result.tolist()
             #actual_valid += train.y.tolist()
         predicted_valid = [item for sublist in predicted_valid for item in sublist] 
@@ -225,7 +238,8 @@ def GAT_fully_connected(data_train, data_valid, data_test, params):
             t = explainer(
                 batch.x,
                 batch.edge_index,
-                batch=batch.batch
+                batch=batch.batch,
+                return_attention=None
             )
             t = pd.DataFrame(t['node_mask'].squeeze().detach()).sum(axis=1)
             if explanation.shape[0] == 0:
@@ -241,5 +255,10 @@ def GAT_fully_connected(data_train, data_valid, data_test, params):
         effect.columns = list(data_QTL_test.columns)
     else:
         effect = pd.DataFrame()
+    
+    attention = pd.concat([pd.DataFrame(edge_name_from),
+                           pd.DataFrame(edge_name_to),
+                           pd.DataFrame(attention).mean().T
+                           ],axis=1)
         
-    return r, mse, effect, predicted_test, predicted_valid, predicted_train
+    return r, mse, effect, predicted_test, predicted_valid, predicted_train, attention

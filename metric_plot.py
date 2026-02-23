@@ -15,7 +15,7 @@ def metric_plot(record, MODEL, RESULT_NAME):
         for axis in g.axes.flat:
             axis.tick_params(labelleft=True) 
                     
-        g.map(sns.violinplot,'models', metrics[i], 'model', palette='colorblind', hue_order=MODEL)    
+        g.map(sns.violinplot,'models', metrics[i], 'models', palette='colorblind', hue_order=MODEL)    
         
         for axis in g.axes.flat:
             axis.set_ylabel(metrics[i])  

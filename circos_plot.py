@@ -162,83 +162,133 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
     
     return MODEL
 
-def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, RESULT_NAME):
+def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, RESULT_NAME, attention_original):
     
-    # Extract key gmarker-by-marker interaction patterns
-    if POPULATION == 'all' and interaction.shape[0]!=0:
-        interaction = interaction.loc[:,['phenotype','marker1','marker2', 'value']]
-    elif POPULATION != 'all' and interaction.shape[0]!=0:
-        interaction = interaction.loc[:,['population','phenotype','marker1','marker2', 'value']]
-        interaction = interaction[interaction['population']==POPULATION].reset_index(drop=False)
-    else:
+    interaction_selected_total = pd.DataFrame()
+    model_selected = []    
+    
+    if interaction.shape[0]==0 and attention_original.shape[0]==0:
         return pd.DataFrame()
-    
-    interaction = interaction[(interaction['marker1'] != 'factor') & (interaction['marker2'] != 'factor')]
-    interaction_total = interaction.groupby(['phenotype','marker1','marker2'], as_index=False).mean(numeric_only=True)
-    
-    interaction_selected = interaction_total[interaction_total['phenotype'] == PHENOTYPE]
-    interaction_selected = interaction_selected[interaction_selected['value'] >= np.quantile(interaction_selected['value'], 1-circos_config['interaction_top']/100)].reset_index(drop=True)
-    interaction_selected['value'] = interaction_selected['value'] / interaction_selected['value'].sum()
-    
-    loc_info = pd.read_csv(marker_info)
-    
-    start = pd.merge(interaction_selected['marker1'], loc_info, 'inner', left_on='marker1', right_on='name')
-    end = pd.merge(interaction_selected['marker2'], loc_info, 'inner', left_on='marker2', right_on='name')
-    chrom_start = 'chr'+ start['chromosome'].astype(int).astype(str)
-    chrom_end = 'chr'+ end['chromosome'].astype(int).astype(str)
-
-    interaction_selected = pd.concat([chrom_start, start.loc[:,['start','end']],
-                               chrom_end, end.loc[:,['start','end']],
-                               interaction_selected['value']],axis=1)
-    interaction_selected.columns = ['chromosome_marker1', 'start','end','chromosome_marker2','start','end','value']
-
-    return interaction_selected
-
-def plot(interactions, chrom_info, gene_info, pop_source, PHENOTYPE, MODEL, circos_config, CYTOBAND_COLORMAP, POPULATION, RESULT_NAME):
-  
-    cnt = 0
-    circos = Circos.initialize_from_bed('./Result/'+RESULT_NAME+'/chrom_'+str(POPULATION)+".bed", space=circos_config['space'], start=circos_config['start'], end=circos_config['end'])
-    
-    # Add genomic marker effects
-    for i in range(len(MODEL)):
-         circos.add_cytoband_tracks((97-(3*cnt), 100-(3*cnt)), './Result/'+RESULT_NAME+'/marker_effect_'+MODEL[i]+'_'+PHENOTYPE+'_'+str(POPULATION)+'.tsv', track_name=MODEL[i], cytoband_cmap=CYTOBAND_COLORMAP)
-         circos.text(MODEL[i], r=circos.tracks[-1].r_center-1, deg=0, size=8, color="black")
-         cnt+=1
-    
-    # Add known gene regions
-    if gene_info is not None:
-        gene_source = pd.unique(pop_source.loc[(pop_source['population']==str(POPULATION)) & (pop_source['phenotype']==str(PHENOTYPE)),'source'])
-        for i in range(len(gene_source)):    
-            circos.add_cytoband_tracks((97-(3*cnt), 100-(3*cnt)), './Result/'+RESULT_NAME+'/gene_info_'+str(PHENOTYPE)+'_'+str(gene_source[i])+'_'+str(POPULATION)+'.tsv', track_name=gene_source[i], cytoband_cmap=CYTOBAND_COLORMAP)
-            circos.text(gene_source[i], r=circos.tracks[-1].r_center-1, deg=0, size=8, color="black")
-            cnt+=1
-    
-    # Add ticks to the outermost ring
-    for sector in circos.sectors:
-        sector.text(sector.name, r=105, size=10)
-        sector.get_track(MODEL[0]).xticks_by_interval(
-            circos_config['scale'],
-            label_size=circos_config['label_size'],
-            label_orientation="vertical",
-            label_formatter=lambda v: f"{v / circos_config['scale']:.0f}",
-        )
+    else:
+        if interaction.shape[0] != 0:
+            model_selected += ['RF'] 
         
-    # Add marker-by-marker interactions
-    if interactions.shape[0] != 0:
-        for ii in range(interactions.shape[0]):
-            region1 = (interactions.iloc[ii,0], interactions.iloc[ii,1], interactions.iloc[ii,2])
-            region2 = (interactions.iloc[ii,3], interactions.iloc[ii,4], interactions.iloc[ii,5])
-            if interactions.iloc[ii,0] != interactions.iloc[ii,3]:   #within chromosome or between chromosome
-                colour = 'blue'
-            else:
-                colour = 'red'
-            circos.link(region1, region2, lw=interactions.loc[ii,'value']*circos_config['link_width'], color=colour)
+            # Extract key gmarker-by-marker interaction patterns
+            if POPULATION == 'all' and interaction.shape[0]!=0:
+                interaction = interaction.loc[:,['phenotype','from','to', 'value']]
+            elif POPULATION != 'all' and interaction.shape[0]!=0:
+                interaction = interaction.loc[:,['population','phenotype','from','to', 'value']]
+                interaction = interaction[interaction['population']==POPULATION].reset_index(drop=False)
+            #else:
+            #    return pd.DataFrame()
             
-    # Store the circos plot
-    fig = circos.plotfig()
-    fig.savefig('./Result/'+RESULT_NAME+'/circos_'+str(PHENOTYPE)+'_'+str(POPULATION)+'.png',dpi=600) 
+            interaction = interaction[(interaction['from'] != 'factor') & (interaction['to'] != 'factor')]
+            interaction = interaction.groupby(['phenotype','from','to'], as_index=False).mean(numeric_only=True)
+            
+            interaction_selected = interaction[interaction['phenotype'] == PHENOTYPE]
+            interaction_selected = interaction_selected[interaction_selected['value'] >= np.quantile(interaction_selected['value'], circos_config['interaction_top'])].reset_index(drop=True)
+            interaction_selected['value'] = interaction_selected['value'] / interaction_selected['value'].sum()
+            
+            loc_info = pd.read_csv(marker_info)
+            
+            start = pd.merge(interaction_selected['from'], loc_info, 'inner', left_on='from', right_on='name')
+            end = pd.merge(interaction_selected['to'], loc_info, 'inner', left_on='to', right_on='name')
+            chrom_start = 'chr'+ start['chromosome'].astype(int).astype(str)
+            chrom_end = 'chr'+ end['chromosome'].astype(int).astype(str)
+        
+            interaction_selected = pd.concat([chrom_start, start.loc[:,['start','end']],
+                                       chrom_end, end.loc[:,['start','end']],
+                                       interaction_selected['value']],axis=1)
+            interaction_selected.columns = ['chromosome_from', 'start','end','chromosome_to','start','end','value']
+            interaction_selected['model'] = 'RF'
+            interaction_selected_total = pd.concat([interaction_selected_total, interaction_selected])
+        if attention_original.shape[0]!=0:
+            models_GAT = attention_original['model'].unique().tolist()
+            model_selected += models_GAT
 
-def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULATION, PHENOTYPE, circos_config, end_adjust, WINDOW, CYTOBAND_COLORMAP,RESULT_NAME):
+            for i in range(len(models_GAT)):
+                # Extract key gmarker-by-marker interaction patterns
+                if POPULATION == 'all' and attention_original.shape[0]!=0:
+                    attention = attention_original[attention_original['model']==models_GAT[i]].reset_index(drop=False)
+                    attention = attention.loc[:,['phenotype','from','to', 'value']]
+                elif POPULATION != 'all' and attention_original.shape[0]!=0:
+                    attention = attention_original[attention_original['model']==models_GAT[i]].reset_index(drop=False)
+                    attention = attention.loc[:,['population','phenotype','from','to', 'value']]
+                    attention = attention_original[attention_original['population']==POPULATION].reset_index(drop=False)
+                #else:
+                #    return pd.DataFrame()
+                attention = attention[(attention['from'] != 'factor') & (attention['to'] != 'factor')]
+                attention = attention.groupby(['phenotype','from','to'], as_index=False).mean(numeric_only=True)
+                
+                attention = attention[attention['phenotype'] == PHENOTYPE]
+                attention = attention[attention['value'] >= np.quantile(attention['value'], circos_config['interaction_top'])].reset_index(drop=True)
+                attention['value'] = attention['value'] / attention['value'].sum()
+                
+                loc_info = pd.read_csv(marker_info)
+                
+                start = pd.merge(attention['from'], loc_info, 'inner', left_on='from', right_on='name')
+                end = pd.merge(attention['to'], loc_info, 'inner', left_on='to', right_on='name')
+                chrom_start = 'chr'+ start['chromosome'].astype(int).astype(str)
+                chrom_end = 'chr'+ end['chromosome'].astype(int).astype(str)
+            
+                attention = pd.concat([chrom_start, start.loc[:,['start','end']],
+                                           chrom_end, end.loc[:,['start','end']],
+                                           attention['value']],axis=1)
+                attention.columns = ['chromosome_from', 'start','end','chromosome_to','start','end','value']
+                attention['model'] = models_GAT[i]
+                interaction_selected_total = pd.concat([interaction_selected_total, attention])
+            
+    return interaction_selected_total
+
+def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MODEL, circos_config, CYTOBAND_COLORMAP, POPULATION, RESULT_NAME):
+    
+    model_selected = interactions_original['model'].unique().tolist()
+
+    for n in range(len(model_selected)):
+        cnt = 0
+        circos = Circos.initialize_from_bed('./Result/'+RESULT_NAME+'/chrom_'+str(POPULATION)+".bed", space=circos_config['space'], start=circos_config['start'], end=circos_config['end'])
+        
+        # Add genomic marker effects
+        for i in range(len(MODEL)):
+             circos.add_cytoband_tracks((97-(3*cnt), 100-(3*cnt)), './Result/'+RESULT_NAME+'/marker_effect_'+MODEL[i]+'_'+PHENOTYPE+'_'+str(POPULATION)+'.tsv', track_name=MODEL[i], cytoband_cmap=CYTOBAND_COLORMAP)
+             circos.text(MODEL[i], r=circos.tracks[-1].r_center-1, deg=0, size=8, color="black")
+             cnt+=1
+        
+        # Add known gene regions
+        if gene_info is not None:
+            gene_source = pd.unique(pop_source.loc[(pop_source['population']==str(POPULATION)) & (pop_source['phenotype']==str(PHENOTYPE)),'source'])
+            for i in range(len(gene_source)):    
+                circos.add_cytoband_tracks((97-(3*cnt), 100-(3*cnt)), './Result/'+RESULT_NAME+'/gene_info_'+str(PHENOTYPE)+'_'+str(gene_source[i])+'_'+str(POPULATION)+'.tsv', track_name=gene_source[i], cytoband_cmap=CYTOBAND_COLORMAP)
+                circos.text(gene_source[i], r=circos.tracks[-1].r_center-1, deg=0, size=8, color="black")
+                cnt+=1
+        
+        # Add ticks to the outermost ring
+        for sector in circos.sectors:
+            sector.text(sector.name, r=105, size=10)
+            sector.get_track(MODEL[0]).xticks_by_interval(
+                circos_config['scale'],
+                label_size=circos_config['label_size'],
+                label_orientation="vertical",
+                label_formatter=lambda v: f"{v / circos_config['scale']:.0f}",
+            )
+            
+        # Add marker-by-marker interactions
+        if interactions_original.shape[0] != 0:
+            interactions = interactions_original[interactions_original['model']==model_selected[n]].reset_index(drop=True)
+            for ii in range(interactions.shape[0]):
+                region1 = (interactions.iloc[ii,0], interactions.iloc[ii,1], interactions.iloc[ii,2])
+                region2 = (interactions.iloc[ii,3], interactions.iloc[ii,4], interactions.iloc[ii,5])
+                if interactions.iloc[ii,0] != interactions.iloc[ii,3]:   #within chromosome or between chromosome
+                    colour = 'blue'
+                else:
+                    colour = 'red'
+                circos.link(region1, region2, lw=interactions.loc[ii,'value']/circos_config['link_width'], color=colour)
+                
+        # Store the circos plot
+        fig = circos.plotfig()
+        fig.savefig('./Result/'+RESULT_NAME+'/circos_'+str(PHENOTYPE)+'_'+str(POPULATION)+'_interaction_'+str(model_selected[n])+'.png',dpi=600) 
+
+def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULATION, PHENOTYPE, circos_config, end_adjust, WINDOW, CYTOBAND_COLORMAP,RESULT_NAME, attention):
 
     pop_source =  data_conversion(chrom_info, gene_info, PHENOTYPE,RESULT_NAME)
     POPULATION = ('all',) + tuple(POPULATION)
@@ -247,5 +297,5 @@ def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULA
     for i in range(len(PHENOTYPE)):
         for j in range(len(POPULATION)):
             MODEL = quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE[i], MODEL, end_adjust, POPULATION[j], WINDOW,RESULT_NAME)
-            interaction_selected = interaction(interactions, marker_info, PHENOTYPE[i], circos_config, POPULATION[j],RESULT_NAME)
+            interaction_selected = interaction(interactions, marker_info, PHENOTYPE[i], circos_config, POPULATION[j],RESULT_NAME, attention)
             plot(interaction_selected, chrom_info, gene_info, pop_source, PHENOTYPE[i], MODEL, circos_config, CYTOBAND_COLORMAP, POPULATION[j],RESULT_NAME)

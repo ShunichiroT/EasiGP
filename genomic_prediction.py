@@ -57,6 +57,7 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
     effect = pd.DataFrame()       #store genomic marker effects
     interactions = pd.DataFrame() #store marker interaction effects
     weight = pd.DataFrame()
+    attention_total = pd.DataFrame()
     
     if PARALLEL is not None:
         idx = PARALLEL['batch_id']
@@ -149,11 +150,11 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
             elif MODEL[jj]  == 'GAT_fully_connected':
                 if HPARAMETERS[MODEL[jj]][-1] == 'all':
                     HPARAMETERS[MODEL[jj]][-1] = test.shape[0] 
-                sample_pearson, sample_mse, sample_effect, predicted_test, predicted_valid, predicted_train = GAT_fully_connected(train, valid, test, HPARAMETERS[MODEL[jj]])
+                sample_pearson, sample_mse, sample_effect, predicted_test, predicted_valid, predicted_train, sample_attention = GAT_fully_connected(train, valid, test, HPARAMETERS[MODEL[jj]])
             elif MODEL[jj]  == 'GAT_prior_knowledge':
                 if HPARAMETERS[MODEL[jj]][-1] == 'all':
                     HPARAMETERS[MODEL[jj]][-1] = test.shape[0] 
-                sample_pearson, sample_mse, sample_effect, predicted_test, predicted_valid, predicted_train = GAT_prior_knowledge(train, valid, test, HPARAMETERS[MODEL[jj]])
+                sample_pearson, sample_mse, sample_effect, predicted_test, predicted_valid, predicted_train, sample_attention = GAT_prior_knowledge(train, valid, test, HPARAMETERS[MODEL[jj]])
             
             # Store prediction results
             record_sample = pd.DataFrame([{'population': sample.loc[i,'population'],
@@ -230,7 +231,19 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
                 sample_interaction['ratio'] = str(sample.loc[i,'ratio'])
                 sample_interaction['sample'] = sample.loc[i,'sample'] 
                 
-                interactions = pd.concat([interactions, sample_interaction])     
+                interactions = pd.concat([interactions, sample_interaction])   
+            
+            if MODEL[jj] == 'GAT_fully_connected' or MODEL[jj] == 'GAT_prior_knowledge':
+                sample_attention['population'] = sample.loc[i,'population']
+                sample_attention['model'] = MODEL[jj]
+                sample_attention['ratio'] = str(sample.loc[i,'ratio'])
+                sample_attention['phenotype'] = sample.loc[i,'phenotype']
+                sample_attention['sample'] = sample.loc[i,'sample'] 
+                sample_attention.columns = ['from','to','value','population','model','ratio','phenotype','sample']
+                sample_attention = sample_attention.loc[:,['population','phenotype','model','ratio','sample', 'from', 'to', 'value']]
+                sample_attention = pd.concat([attention_total, sample_attention],axis=0)
+                
+                attention_total = pd.concat([attention_total, sample_attention], axis=0)
         
         # Weight optimisation 
         if W_OPT is not None and type(sample.loc[i,'ratio']) is tuple:            
@@ -280,10 +293,15 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
             interactions.to_csv('./Result/'+RESULT_NAME+'/Interaction.csv', index=False)
         else:
             interactions.to_csv('./Result/'+RESULT_NAME+'/Interaction_'+str(idx)+'.csv', index=False)
+    if 'GAT_fully_connected' in MODEL or 'GAT_prior_knowledge' in MODEL:
+        if PARALLEL is None:
+            attention_total.to_csv('./Result/'+RESULT_NAME+'/Attention.csv', index=False)
+        else:
+            attention_total.to_csv('./Result/'+RESULT_NAME+'/Attention_'+str(idx)+'.csv', index=False)
     if W_OPT is not None:
         if PARALLEL is None:
             weight.to_csv('./Result/'+RESULT_NAME+'/Weight.csv', index=False)
         else:
             weight.to_csv('./Result/'+RESULT_NAME+'/Weight_'+str(idx)+'.csv', index=False)
         
-    return record, result_train, result_test, effect, interactions, POPULATION, PHENOTYPE
+    return record, result_train, result_test, effect, interactions, POPULATION, PHENOTYPE, attention_total
