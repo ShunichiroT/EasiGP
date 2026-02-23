@@ -13,6 +13,7 @@ def assemble(RESULT_NAME):
     marker_effect = pd.DataFrame()
     interaction = pd.DataFrame()
     weight = pd.DataFrame()
+    attention = pd.DataFrame()
     
     for i in range(len(glob.glob1('./Result/'+RESULT_NAME+'/','Metric_*.csv'))):
         if os.path.isfile('./Result/'+RESULT_NAME+'/Prediction_result_train_'+str(i)+'.csv'):
@@ -42,6 +43,12 @@ def assemble(RESULT_NAME):
                                     pd.read_csv('./Result/'+RESULT_NAME+'/Weight_'+str(i)+'.csv')])
             except pd.errors.EmptyDataError:
                 weight = pd.DataFrame()
+        if os.path.isfile('./Result/'+RESULT_NAME+'/Attention_'+str(i)+'.csv'):
+            try:
+                attention = pd.concat([attention,
+                                    pd.read_csv('./Result/'+RESULT_NAME+'/Attention_'+str(i)+'.csv')])
+            except pd.errors.EmptyDataError:
+                attention = pd.DataFrame()
 
     prediction_train.to_csv('./Result/'+RESULT_NAME+'/Prediction_result_train.csv',index=False)
     prediction_valid.to_csv('./Result/'+RESULT_NAME+'/Prediction_result_valid.csv',index=False)
@@ -49,7 +56,11 @@ def assemble(RESULT_NAME):
     metric.to_csv('./Result/'+RESULT_NAME+'/Metric.csv',index=False)
     marker_effect.to_csv('./Result/'+RESULT_NAME+'/Marker_effect.csv',index=False)
     interaction.to_csv('./Result/'+RESULT_NAME+'/Interaction.csv',index=False)
-    weight.to_csv('./Result/'+RESULT_NAME+'/Weight.csv',index=False)
+    
+    if weight.shape[0] != 0: 
+        weight.to_csv('./Result/'+RESULT_NAME+'/Weight.csv',index=False)
+    if attention.shape[0] != 0:
+        attention.to_csv('./Result/'+RESULT_NAME+'/Attention.csv',index=False)
     
     MODEL = pd.unique(metric['type']).tolist() 
     if 'Linear transformation' in MODEL:
@@ -59,5 +70,5 @@ def assemble(RESULT_NAME):
     if 'Bayesian optimisation' in MODEL:
         MODEL.remove('Bayesian optimisation')
     
-    return metric, prediction_train, prediction_test, marker_effect, interaction, \
+    return metric, prediction_train, prediction_test, marker_effect, interaction, attention,\
             pd.unique(metric['population']).tolist(), pd.unique(metric['phenotype']).tolist(), MODEL  
