@@ -108,7 +108,7 @@ CYTOBAND_COLORMAP = {
 ### ======================================================================= ###
 
 # Assemble files
-metrics, predicted_result_train, predicted_result_test, effect, interactions, \
+metrics, predicted_result_train, predicted_result_test, effect, interactions, attention,\
     POPULATION, PHENOTYPE, MODEL = assemble(RESULT_NAME)
 
 # Store violin plots
