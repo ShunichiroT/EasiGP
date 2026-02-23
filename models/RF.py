@@ -21,7 +21,7 @@ def RF(train, valid, test, params):
     test_x, test_y = test.iloc[:,:-1], test.iloc[:,-1]
     
     #Develop & evaluate a model here as specified in the original code
-    rf = RandomForestRegressor(n_estimators = estimators, random_state = 0, max_samples=sample_max, max_features=features_max)
+    rf = RandomForestRegressor(n_estimators = estimators, random_state = 0, max_samples=sample_max, max_features=features_max, n_jobs=-1)
     rf.fit(train_x, train_y)
     
     predicted = rf.predict(test_x)
