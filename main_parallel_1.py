@@ -126,5 +126,5 @@ HYPERPARAMETERS_OPT = {'Linear transformation':[0.005, 150, 0.01, 2, 10, 30],
 
 # Run genomic prediction models
 metrics, predicted_result_train, predicted_result_test, effect, interactions, \
-    POPULATION, PHENOTYPE = GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, 
+    POPULATION, PHENOTYPE, attention = GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, 
                                PHENOTYPE, RATIO, ITER_NUM, HPARAMETERS, R_PATH, W_OPT, RESULT_NAME, HYPERPARAMETERS_OPT, PARALLEL)
