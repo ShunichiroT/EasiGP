@@ -127,7 +127,7 @@ def Linear_transformation(data_train, data_valid, data_test, record, effect, wei
     
     ## Store the metrics
     record = pd.concat([record, pd.DataFrame(record.iloc[-1,:]).T]).reset_index(drop=True)
-    record.loc[record.shape[0]-1,'type'] = 'Linear transformation'
+    record.loc[record.shape[0]-1,'model'] = 'Linear transformation'
     record.loc[record.shape[0]-1,'Pearson correlation'] = r
     record.loc[record.shape[0]-1,'MSE'] = mse
 
@@ -164,7 +164,7 @@ def Linear_transformation(data_train, data_valid, data_test, record, effect, wei
     d_test = torch.tensor(data_test_selected.values, dtype=torch.float32)
 
     weight_sample = pd.DataFrame(record.iloc[record.shape[0]-1,:]).T.drop(['Pearson correlation', 'MSE'],axis=1)
-    weight_sample['type'] = 'Linear transformation'
+    weight_sample['model'] = 'Linear transformation'
     
     explainer = shap.DeepExplainer(model, shap.sample(d_train, 50))    
     weight_extracted = pd.DataFrame(abs(explainer.shap_values(shap.sample(d_test, 50),check_additivity=False)).sum(axis=0)).T
@@ -177,14 +177,14 @@ def Linear_transformation(data_train, data_valid, data_test, record, effect, wei
     weight_extracted_normalised = weight_extracted.div(weight_extracted.sum(axis=1),axis=0)
     
     for i in range(len(model_selected)):
-        if effect[effect['type']==model_selected[i]].shape[0] != 0:
+        if effect[effect['model']==model_selected[i]].shape[0] != 0:
             if i == 0:
-                effect_weighted = effect[effect['type']==model_selected[i]].tail(1).iloc[:,5:].abs().reset_index(drop=True).div(effect[effect['type']==model_selected[i]].tail(1).iloc[:,5:].abs().sum(axis=1).reset_index(drop=True), axis=0).mul(weight_extracted_normalised[model_selected[i]], axis=0).reset_index(drop=True)
+                effect_weighted = effect[effect['model']==model_selected[i]].tail(1).iloc[:,5:].abs().reset_index(drop=True).div(effect[effect['model']==model_selected[i]].tail(1).iloc[:,5:].abs().sum(axis=1).reset_index(drop=True), axis=0).mul(weight_extracted_normalised[model_selected[i]], axis=0).reset_index(drop=True)
             else:
-                effect_weighted += effect[effect['type']==model_selected[i]].tail(1).iloc[:,5:].abs().reset_index(drop=True).div(effect[effect['type']==model_selected[i]].tail(1).iloc[:,5:].abs().sum(axis=1).reset_index(drop=True), axis=0).mul(weight_extracted_normalised[model_selected[i]], axis=0).reset_index(drop=True)
+                effect_weighted += effect[effect['model']==model_selected[i]].tail(1).iloc[:,5:].abs().reset_index(drop=True).div(effect[effect['model']==model_selected[i]].tail(1).iloc[:,5:].abs().sum(axis=1).reset_index(drop=True), axis=0).mul(weight_extracted_normalised[model_selected[i]], axis=0).reset_index(drop=True)
 
     effect = pd.concat([effect, pd.DataFrame(effect.iloc[effect.shape[0]-1,:]).T]).reset_index(drop=True)
-    effect.loc[effect.shape[0]-1,'type'] = 'Linear transformation'
+    effect.loc[effect.shape[0]-1,'model'] = 'Linear transformation'
 
     effect.loc[effect.shape[0]-1,list(effect_weighted.columns)] = effect_weighted.values
 

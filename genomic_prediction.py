@@ -1,5 +1,6 @@
 import pandas as pd
 import os
+from itertools import product
 from sklearn.model_selection import train_test_split
 
 from models.RF import *
@@ -15,7 +16,7 @@ from models.Linear_transformation import *
 from models.Nelder_Mead import *
 from models.Bayesian_optimisation import *
     
-def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_NUM, HPARAMETERS, R_PATH, W_OPT, RESULT_NAME, HYPERPARAMETERS_OPT, PARALLEL=None):
+def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_NUM, HPARAMETERS, R_PATH, W_OPT, RESULT_NAME, HYPERPARAMETERS_OPT, SCENARIO, PARALLEL=None):
     
     # Import R modules
     if R_PATH != None:
@@ -45,19 +46,37 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
         PHENOTYPE = list(data_phenotype_original.columns[2:])
     
     # Create the total number of combinations of prediction scenarios
-    sample = pd.DataFrame({'population':[item for item in POPULATION for i in range(SAMPLE_NUM*len(PHENOTYPE)*len(RATIO))],
-                            'phenotype':[item for item in PHENOTYPE for i in range(SAMPLE_NUM*len(RATIO))]*len(POPULATION),
-                            'ratio':[item for item in RATIO for i in range(SAMPLE_NUM)]*len(POPULATION)*len(PHENOTYPE),
-                            'sample':list(range(1,SAMPLE_NUM+1)) *len(PHENOTYPE)*len(POPULATION)*len(RATIO)})
-    
-    record = pd.DataFrame()       #store performance metrics
-    result_train = pd.DataFrame() #store predicted phenotypes for train set
-    result_valid = pd.DataFrame() #store predicted phenotypes for validation set
-    result_test = pd.DataFrame()  #store predicted phenotypes for test set
-    effect = pd.DataFrame()       #store genomic marker effects
-    interactions = pd.DataFrame() #store marker interaction effects
-    weight = pd.DataFrame()
-    attention_total = pd.DataFrame()
+    if SCENARIO == 'within':
+        sample = pd.DataFrame({'population':[item for item in POPULATION for i in range(SAMPLE_NUM*len(PHENOTYPE)*len(RATIO))],
+                                'phenotype':[item for item in PHENOTYPE for i in range(SAMPLE_NUM*len(RATIO))]*len(POPULATION),
+                                'ratio':[item for item in RATIO for i in range(SAMPLE_NUM)]*len(POPULATION)*len(PHENOTYPE),
+                                'sample':list(range(1,SAMPLE_NUM+1)) *len(PHENOTYPE)*len(POPULATION)*len(RATIO)})
+    elif SCENARIO == 'between':
+        if W_OPT is None:
+            comb = [str(x)+'->'+str(y) for x in POPULATION for y in POPULATION]
+            sample = pd.DataFrame({'population':[item for item in comb] *len(PHENOTYPE),
+                                    'phenotype':[item for item in PHENOTYPE for i in range(len(POPULATION))]*len(POPULATION),
+                                    'ratio':[-1]*len(POPULATION)*len(PHENOTYPE)*len(POPULATION),
+                                    'sample':[-1] *len(PHENOTYPE)*len(POPULATION)*len(POPULATION)})
+            tmp = sample['population'].str.split('->',expand=True)
+            sample = sample[tmp[0]!=tmp[1]].reset_index(drop=True)
+        else:
+            comb = [str(x)+'->'+str(y)+'->'+str(z) for x in POPULATION for y in POPULATION for z in POPULATION]
+            sample = pd.DataFrame({'population':[item for item in comb] *len(PHENOTYPE),
+                                    'phenotype':[item for item in PHENOTYPE for i in range(len(POPULATION))]*len(POPULATION)*len(POPULATION),
+                                    'ratio':[-1]*len(POPULATION)*len(PHENOTYPE)*len(POPULATION)*len(POPULATION),
+                                    'sample':[-1] *len(PHENOTYPE)*len(POPULATION)*len(POPULATION)*len(POPULATION)})
+            tmp = sample['population'].str.split('->',expand=True)
+            sample = sample[(tmp[0]!=tmp[1]) & (tmp[0]!=tmp[2]) & (tmp[1]!=tmp[2])].reset_index(drop=True)
+
+    record = pd.DataFrame()          #store performance metrics
+    result_train = pd.DataFrame()    #store predicted phenotypes for train set
+    result_valid = pd.DataFrame()    #store predicted phenotypes for validation set
+    result_test = pd.DataFrame()     #store predicted phenotypes for test set
+    effect = pd.DataFrame()          #store genomic marker effects
+    interactions = pd.DataFrame()    #store marker interaction effects
+    weight = pd.DataFrame()          #store weight values for weight optimisation
+    attention_total = pd.DataFrame() #store attention values from GAT models
     
     if PARALLEL is not None:
         idx = PARALLEL['batch_id']
@@ -72,27 +91,56 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
             break
         
         # Convert the data structure
-        data_genotype = data_genotype_original[data_genotype_original['population']==sample.loc[i,'population']].reset_index(drop=True)
-        data_phenotype = data_phenotype_original.loc[data_phenotype_original['population']==sample.loc[i,'population'], ['ID','population',sample.loc[i,'phenotype']]].reset_index(drop=True)
+        if SCENARIO == 'within':
+            data_genotype = data_genotype_original[data_genotype_original['population']==sample.loc[i,'population']].reset_index(drop=True)
+            data_phenotype = data_phenotype_original.loc[data_phenotype_original['population']==sample.loc[i,'population'], ['ID','population',sample.loc[i,'phenotype']]].reset_index(drop=True)
+        elif SCENARIO == 'between':
+            if W_OPT is None:
+                data_genotype = data_genotype_original[(data_genotype_original['population'].astype(str) == sample.loc[i, 'population'].split('->')[0]) | 
+                                                       (data_genotype_original['population'].astype(str) == sample.loc[i, 'population'].split('->')[1])].reset_index(drop=True)
+                data_phenotype = data_phenotype_original.loc[(data_phenotype_original['population'].astype(str) ==sample.loc[i,'population'].split('->')[0]) | 
+                                                             (data_phenotype_original['population'].astype(str) ==sample.loc[i,'population'].split('->')[1]), 
+                                                             ['ID','population',sample.loc[i,'phenotype']]].reset_index(drop=True)
+            else:
+                data_genotype = data_genotype_original[(data_genotype_original['population'].astype(str) == sample.loc[i, 'population'].split('->')[0]) | 
+                                                       (data_genotype_original['population'].astype(str) == sample.loc[i, 'population'].split('->')[1]) |
+                                                       (data_genotype_original['population'].astype(str) == sample.loc[i, 'population'].split('->')[2])].reset_index(drop=True)
+                data_phenotype = data_phenotype_original.loc[(data_phenotype_original['population'].astype(str) ==sample.loc[i,'population'].split('->')[0]) | 
+                                                             (data_phenotype_original['population'].astype(str) ==sample.loc[i,'population'].split('->')[1]) |
+                                                             (data_phenotype_original['population'].astype(str) ==sample.loc[i,'population'].split('->')[2]), 
+                                                             ['ID','population',sample.loc[i,'phenotype']]].reset_index(drop=True)
+        
         data = data_genotype.merge(data_phenotype, on=['ID','population']).dropna().reset_index(drop=True)
-        
-        if type(sample.loc[i,'ratio']) is not tuple:
-            train, test = train_test_split(data,train_size=sample.loc[i,'ratio'], random_state=sample.loc[i,'sample'])
-            train, test = train.reset_index(drop=True), test.reset_index(drop=True)
-            id_train, id_valid, id_test = train.iloc[:,0], pd.DataFrame(), test.iloc[:,0]
-            train, valid, test = train.iloc[:,2:], pd.DataFrame(), test.iloc[:,2:]
-        
-        elif type(sample.loc[i,'ratio']) is tuple:
-            train, valid = train_test_split(data,train_size=sample.loc[i,'ratio'][0], random_state=sample.loc[i,'sample'])
-            valid, test = train_test_split(valid,train_size=sample.loc[i,'ratio'][1]/(sample.loc[i,'ratio'][2]+sample.loc[i,'ratio'][1]), random_state=sample.loc[i,'sample'])
-            train, valid, test = train.reset_index(drop=True), valid.reset_index(drop=True), test.reset_index(drop=True)
-            id_train, id_valid, id_test = train.iloc[:,0], valid.iloc[:,0], test.iloc[:,0]
-            train, valid, test = train.iloc[:,2:], valid.iloc[:,2:], test.iloc[:,2:]
+
+        if SCENARIO =='within':
+            if type(sample.loc[i,'ratio']) is not tuple:
+                train, test = train_test_split(data,train_size=sample.loc[i,'ratio'], random_state=sample.loc[i,'sample'])
+                train, test = train.reset_index(drop=True), test.reset_index(drop=True)
+                id_train, id_valid, id_test = train.iloc[:,0], pd.DataFrame(), test.iloc[:,0]
+                train, valid, test = train.iloc[:,2:], pd.DataFrame(), test.iloc[:,2:]
+            elif type(sample.loc[i,'ratio']) is tuple:
+                train, valid = train_test_split(data,train_size=sample.loc[i,'ratio'][0], random_state=sample.loc[i,'sample'])
+                valid, test = train_test_split(valid,train_size=sample.loc[i,'ratio'][1]/(sample.loc[i,'ratio'][2]+sample.loc[i,'ratio'][1]), random_state=sample.loc[i,'sample'])
+                train, valid, test = train.reset_index(drop=True), valid.reset_index(drop=True), test.reset_index(drop=True)
+                id_train, id_valid, id_test = train.iloc[:,0], valid.iloc[:,0], test.iloc[:,0]
+                train, valid, test = train.iloc[:,2:], valid.iloc[:,2:], test.iloc[:,2:]
+        elif SCENARIO =='between':
+            tmp = sample.loc[i, 'population'].split('->')
+            if W_OPT is None:
+                train, test = data[data['population'].astype(str)==tmp[0]], data[data['population'].astype(str)==tmp[1]]
+                train, test = train.reset_index(drop=True), test.reset_index(drop=True)
+                id_train, id_valid, id_test = train.iloc[:,0], pd.DataFrame(), test.iloc[:,0]
+                train, valid, test = train.iloc[:,2:], pd.DataFrame(), test.iloc[:,2:] 
+            elif W_OPT is not None:
+                train, valid, test = data[data['population'].astype(str)==tmp[0]], data[data['population'].astype(str)==tmp[1]], data[data['population'].astype(str)==tmp[2]]
+                train, valid, test = train.reset_index(drop=True), valid.reset_index(drop=True), test.reset_index(drop=True)
+                id_train, id_valid, id_test = train.iloc[:,0], valid.iloc[:,0], test.iloc[:,0]
+                train, valid, test = train.iloc[:,2:], valid.iloc[:,2:], test.iloc[:,2:]
         
         result_train_sample = pd.DataFrame()
         result_valid_sample = pd.DataFrame()
         result_test_sample = pd.DataFrame()
-
+        
         # Prediction model implementation
         for jj in range(len(MODEL)):
             if MODEL[jj] == 'ensemble':
@@ -181,7 +229,7 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
                                                 pd.DataFrame({MODEL[jj]:predicted_test})
                                               ], axis=1)
            
-            if result_valid_sample.shape[0]==0 and type(sample.loc[i,'ratio']) is tuple:
+            if (result_valid_sample.shape[0]==0 and type(sample.loc[i,'ratio']) is tuple) or (result_valid_sample.shape[0]==0 and W_OPT is not None and SCENARIO == 'between'):
                 result_valid_sample = pd.DataFrame({'id': id_valid,
                                                    'population': [sample.loc[i,'population']] * len(id_valid),
                                                    'ratio': [sample.loc[i,'ratio']] * len(id_valid),
@@ -190,13 +238,13 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
                                                    'actual':valid.iloc[:,-1],
                                                    MODEL[jj]:predicted_valid
                                                   })
-            elif result_valid_sample.shape[0]!=0 and type(sample.loc[i,'ratio']) is tuple:
+            elif (result_valid_sample.shape[0]!=0 and type(sample.loc[i,'ratio']) is tuple) or (W_OPT is not None and SCENARIO == 'between'):
                 result_valid_sample = pd.concat([result_valid_sample,
                                                 pd.DataFrame({MODEL[jj]:predicted_valid})
                                               ], axis=1) 
             else:
                 result_valid_sample = pd.DataFrame()
-                
+            
             if result_train_sample.shape[0]==0:
                 result_train_sample = pd.DataFrame({'id': id_train,
                                                    'population': [sample.loc[i,'population']] * len(id_train),
@@ -244,9 +292,9 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
                 sample_attention = pd.concat([attention_total, sample_attention],axis=0)
                 
                 attention_total = pd.concat([attention_total, sample_attention], axis=0)
-        
+
         # Weight optimisation 
-        if W_OPT is not None and type(sample.loc[i,'ratio']) is tuple:            
+        if W_OPT is not None and (type(sample.loc[i,'ratio']) is tuple or SCENARIO=='between'):            
             for kk in range(len(W_OPT)):
                 if W_OPT[kk]  == 'Linear transformation':
                     record, effect, predicted_test_sample, predicted_valid_sample, predicted_train_sample, weight = Linear_transformation(result_train_sample, result_valid_sample, result_test_sample, record, effect, weight, MODEL, HYPERPARAMETERS_OPT['Linear transformation'])

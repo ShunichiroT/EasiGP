@@ -22,7 +22,7 @@ PHENOTYPE = ['days2anthesis']
 # Available models
   # ['rrBLUP', 'GBLUP', 'BayesB', 'RKHS', 'RF', 'SVR', 'MLP', 'ensemble']
   # ['GAT_infinitesimal', 'GAT_fully_connected', 'GAT_prior_knowledge']
-MODEL = ['RF','GAT_fully_connected', 'GAT_prior_knowledge','ensemble'] 
+MODEL = ['rrBLUP','BayesB','ensemble'] 
 
 # Data spliting ratio
 # If elements are in float values, they are used as training set ratio when 
@@ -48,6 +48,10 @@ RESULT_NAME = 'MaizeNAM'
 
 if not os.path.exists('./Result/'+RESULT_NAME):
     os.makedirs('./Result/'+RESULT_NAME)
+    
+# Prediction scenario (within population prediction or between population scenario)
+# Specify with either 'within' or 'between'
+SCENARIO = 'within'
 
 # File paths for your genotype & phenotype files
 GENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_genotype_population_1.csv' 
@@ -58,12 +62,15 @@ PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1.c
     # iteration number, burin-in
 # BayesB:                          
     # iteration number, burin-in
+# GBLUP:                            
+    # iteration number, buin-in, number of samples for Shapley scores, 
+    # return marker effect?
 # RKHS:                            
     # iteration number, buin-in, number of samples for Shapley scores, 
     # return marker effect?
 # RF:                              
     # tree number, maximum fearures per tree, maximum samples per tree, 
-    # number of samples for Shapley scores, return marker effect?
+    # number of samples for interaction Shapley scores, return marker effect for interactions?
 # SVR:                             
     # kernel type, epsilon, regularisation, dimension for poly kernel, gamma, 
     # number of samples for Shapley scores, return marker effect?
@@ -101,7 +108,7 @@ HPARAMETERS = {'rrBLUP': [12000, 2000],
 # ['Nelder_Mead','Linear transformation', 'Bayesian_optimisation']
 
 # Write "None" if you implement naive ensemble approach 
-W_OPT = None #['Nelder Mead', 'Bayesian optimisation', 'Linear transformation'] 
+W_OPT = ['Nelder Mead']#['Nelder Mead', 'Bayesian optimisation', 'Linear transformation'] 
 
 # Hyperparameters for weight optimisation
 # Linear transformation:
@@ -147,14 +154,14 @@ GENE_INFO = './Data/MaizeNAM/gene_info.csv'
 # start:           start angle of a ring
 # end:             end angle of a ring
 # link_width:      the thickness of links
-# interaction_top: select only the top N% of strongest links in the ratio form
+# interaction_top: select only the top N% of strongest links
 # label_size:      size of font
 # scale:           scale of circos plot  
 CIRCOS_CONFIG = {'space':3,
                  'start':15,
                  'end':345,
                  'link_width':10,
-                 'interaction_top':0.9999,
+                 'interaction_top':0.001,
                  'label_size':6,
                  'scale':100}
 
@@ -207,20 +214,20 @@ CYTOBAND_COLORMAP = {
 
 ### ======================================================================= ###
 
-import time
-
 # Run genomic prediction models
 metrics, predicted_result_train, predicted_result_test, effect, interactions, \
     POPULATION, PHENOTYPE, attention = GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, 
-                               PHENOTYPE, RATIO, ITER_NUM, HPARAMETERS, R_PATH, W_OPT, RESULT_NAME, HYPERPARAMETERS_OPT)
+                               PHENOTYPE, RATIO, ITER_NUM, HPARAMETERS, R_PATH, W_OPT, RESULT_NAME, HYPERPARAMETERS_OPT, SCENARIO)
 
+# Retrieve attention values from GAT models if included
 if 'GAT_fully_connected' in MODEL or 'GAT_prior_knowledge' in MODEL:
     attention_distribution(attention, RESULT_NAME, 10)
+    
 # Store violin plots
 if W_OPT is not None:
-    metric_plot(metrics.copy(), MODEL+W_OPT, RESULT_NAME)
+    metric_plot(metrics.copy(), MODEL+W_OPT, RESULT_NAME, SCENARIO)
 else:
-    metric_plot(metrics.copy(), MODEL, RESULT_NAME)
+    metric_plot(metrics.copy(), MODEL, RESULT_NAME, SCENARIO)
 
 # Generate scatter plot matrices if needed
 if SCATTER_CREATE:
@@ -228,4 +235,4 @@ if SCATTER_CREATE:
 
 # Generate circos plots
 circos_plot(effect, interactions, MARKER_INFO, CHROMOSOME_INFO, GENE_INFO, 
-            POPULATION, PHENOTYPE, CIRCOS_CONFIG, END_ADJUST, WINDOW, CYTOBAND_COLORMAP, RESULT_NAME, attention) 
+            POPULATION, PHENOTYPE, CIRCOS_CONFIG, END_ADJUST, WINDOW, CYTOBAND_COLORMAP, RESULT_NAME, attention, SCENARIO) 

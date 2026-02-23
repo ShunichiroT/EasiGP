@@ -45,19 +45,24 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
     # Convert genomic marker effects into ten level quantiles
     effect.iloc[:,5:] = effect.iloc[:,5:].abs().astype(float)
     effect = effect.drop('ratio', axis=1)
+    
     if POPULATION == 'all':
         effect_grouped = effect.iloc[:,1:].groupby(['phenotype','model']).mean()
+        effect_grouped = effect_grouped.reset_index(drop=False)
     else:
         effect_grouped = effect.groupby(['population','phenotype','model']).mean()
-    effect_grouped = effect_grouped.reset_index(drop=False)
+        effect_grouped = effect_grouped.reset_index(drop=False)
+        effect_grouped['population'] = effect_grouped['population'].astype(str)
+    
     REMOVE = []
-
+    
     for iii in range(len(MODEL)):
         colour = 'red' if MODEL[iii] in ['ensemble', 'Linear transformation', 'Nelder Mead', 'Bayesian optimisation'] else 'blue'
         if POPULATION == 'all':
             effect_selected = effect_grouped[(effect_grouped['model']==MODEL[iii]) & (effect_grouped['phenotype']==PHENOTYPE)].iloc[:,3:].T
         else:
-            effect_selected = effect_grouped[(effect_grouped['model']==MODEL[iii]) & (effect_grouped['phenotype']==PHENOTYPE) & (effect_grouped['population']==POPULATION)].iloc[:,3:].T
+            effect_selected = effect_grouped[(effect_grouped['model']==MODEL[iii]) & (effect_grouped['phenotype']==PHENOTYPE) & (effect_grouped['population']==str(POPULATION))].iloc[:,3:].T
+           
         if effect_selected.shape[1] != 0:
             
             if WINDOW == 0:
@@ -178,7 +183,7 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, 
                 interaction = interaction.loc[:,['phenotype','from','to', 'value']]
             elif POPULATION != 'all' and interaction.shape[0]!=0:
                 interaction = interaction.loc[:,['population','phenotype','from','to', 'value']]
-                interaction = interaction[interaction['population']==POPULATION].reset_index(drop=False)
+                interaction = interaction[interaction['population']==str(POPULATION)].reset_index(drop=False)
             #else:
             #    return pd.DataFrame()
             
@@ -186,7 +191,7 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, 
             interaction = interaction.groupby(['phenotype','from','to'], as_index=False).mean(numeric_only=True)
             
             interaction_selected = interaction[interaction['phenotype'] == PHENOTYPE]
-            interaction_selected = interaction_selected[interaction_selected['value'] >= np.quantile(interaction_selected['value'], circos_config['interaction_top'])].reset_index(drop=True)
+            interaction_selected = interaction_selected[interaction_selected['value'] >= np.quantile(interaction_selected['value'], 1-circos_config['interaction_top']/100)].reset_index(drop=True)
             interaction_selected['value'] = interaction_selected['value'] / interaction_selected['value'].sum()
             
             loc_info = pd.read_csv(marker_info)
@@ -214,7 +219,7 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, 
                 elif POPULATION != 'all' and attention_original.shape[0]!=0:
                     attention = attention_original[attention_original['model']==models_GAT[i]].reset_index(drop=False)
                     attention = attention.loc[:,['population','phenotype','from','to', 'value']]
-                    attention = attention_original[attention_original['population']==POPULATION].reset_index(drop=False)
+                    attention = attention_original[attention_original['population']==str(POPULATION)].reset_index(drop=False)
                 #else:
                 #    return pd.DataFrame()
                 attention = attention[(attention['from'] != 'factor') & (attention['to'] != 'factor')]
@@ -242,7 +247,10 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, 
 
 def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MODEL, circos_config, CYTOBAND_COLORMAP, POPULATION, RESULT_NAME):
     
-    model_selected = interactions_original['model'].unique().tolist()
+    if interactions_original.shape[0] != 0:
+        model_selected = interactions_original['model'].unique().tolist()
+    else:
+        model_selected = ['not_returned']
 
     for n in range(len(model_selected)):
         cnt = 0
@@ -256,12 +264,12 @@ def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MO
         
         # Add known gene regions
         if gene_info is not None:
-            gene_source = pd.unique(pop_source.loc[(pop_source['population']==str(POPULATION)) & (pop_source['phenotype']==str(PHENOTYPE)),'source'])
+            gene_source = pd.unique(pop_source.loc[(pop_source['population'].astype(str)==str(POPULATION)) & (pop_source['phenotype']==str(PHENOTYPE)),'source'])
             for i in range(len(gene_source)):    
                 circos.add_cytoband_tracks((97-(3*cnt), 100-(3*cnt)), './Result/'+RESULT_NAME+'/gene_info_'+str(PHENOTYPE)+'_'+str(gene_source[i])+'_'+str(POPULATION)+'.tsv', track_name=gene_source[i], cytoband_cmap=CYTOBAND_COLORMAP)
                 circos.text(gene_source[i], r=circos.tracks[-1].r_center-1, deg=0, size=8, color="black")
                 cnt+=1
-        
+                
         # Add ticks to the outermost ring
         for sector in circos.sectors:
             sector.text(sector.name, r=105, size=10)
@@ -288,12 +296,24 @@ def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MO
         fig = circos.plotfig()
         fig.savefig('./Result/'+RESULT_NAME+'/circos_'+str(PHENOTYPE)+'_'+str(POPULATION)+'_interaction_'+str(model_selected[n])+'.png',dpi=600) 
 
-def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULATION, PHENOTYPE, circos_config, end_adjust, WINDOW, CYTOBAND_COLORMAP,RESULT_NAME, attention):
+def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULATION, PHENOTYPE, circos_config, end_adjust, WINDOW, CYTOBAND_COLORMAP,RESULT_NAME, attention, SCENARIO):
 
     pop_source =  data_conversion(chrom_info, gene_info, PHENOTYPE,RESULT_NAME)
-    POPULATION = ('all',) + tuple(POPULATION)
+    
+    if SCENARIO == 'between' and interactions.shape[0] != 0:
+        interactions['population'] = interactions['population'].str.split('->', expand=True).iloc[:,-1]
+    if SCENARIO == 'between' and interactions.shape[0] != 0:
+        attention['population'] = attention['population'].str.split('->', expand=True).iloc[:,-1]
+    if SCENARIO == 'between' and effect.shape[0] != 0:
+        effect['population'] = effect['population'].str.split('->', expand=True).iloc[:,-1]
+    #print(POPULATION)
+    #if SCENARIO =='within':
+    POPULATION = ('all',) + tuple(POPULATION.tolist())
+    #elif SCENARIO == 'between':
+    #    POPULATION = ('all',) + tuple([item.tolist().split('->')[-1] for item in POPULATION])
+        
     MODEL = pd.unique(effect['model'])
-
+    
     for i in range(len(PHENOTYPE)):
         for j in range(len(POPULATION)):
             MODEL = quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE[i], MODEL, end_adjust, POPULATION[j], WINDOW,RESULT_NAME)

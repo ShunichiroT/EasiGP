@@ -1,10 +1,8 @@
-import os
-
 from assemble import *
 from metric_plot import *
 from scatter_plot import *
 from circos_plot import *
-from attention_histogram import *
+  
 
 # Change below
 ### ======================================================================= ###
@@ -23,14 +21,15 @@ QTL = None
 SCATTER_CONFIG = {'font_size':2,
                   'fig_size':30}
 
-# Folder name that stores prediction results (insidethe  Result folder) 
+# Folder name that store prediction results (inside Result folder) 
 RESULT_NAME = 'MaizeNAM'
-
-if not os.path.exists('./Result/'+RESULT_NAME):
-    os.makedirs('./Result/'+RESULT_NAME)
 
 # ---------------------------------------------------------------------------- #
 # 3. Circos plot configuration
+
+# Prediction scenario (within population prediction or between population scenario)
+# Specify with either 'within' or 'between'
+SCENARIO = 'within'
 
 # File path for the information of chromosomes
 CHROMOSOME_INFO = './Data/MaizeNAM/chrom.csv'
@@ -38,33 +37,33 @@ CHROMOSOME_INFO = './Data/MaizeNAM/chrom.csv'
 # File path for the information of all markers
 MARKER_INFO = './Data/MaizeNAM/marker_info.csv'
 
-# File path for key gene region information for comparison
+# File path for key gene region information for comaprison
 # Write 'None' if no key gene region information needs to be included
 GENE_INFO = './Data/MaizeNAM/gene_info.csv'
 
-# Configuration for circos plots
+# Configuration for ciscos plots
 # space:           space size between rings
 # start:           start angle of a ring
 # end:             end angle of a ring
 # link_width:      the thickness of links
-# interaction_top: select only the top N% of the strongest links in the ratio form
+# interaction_top: select only the top N% of strongest links
 # label_size:      size of font
-# scale:           scale of the circos plot  
+# scale:           scale of circos plot  
 CIRCOS_CONFIG = {'space':3,
                  'start':15,
                  'end':345,
-                 'link_width':1,
-                 'interaction_top':0.01,
+                 'link_width':10,
+                 'interaction_top':0.001,
                  'label_size':6,
-                 'scale':10000}
+                 'scale':100}
 
 # adjust the edge location of each marker for visualisation
 END_ADJUST = 0
 
-# Choose a method for aggregating genomic marker effects
+# Choose a method of how you aggregate genomic marker effect
 # Assign 0 if you do not wish to introduce a window to average the effects in each window interval
 # Otherwise, assign a window size here
-# If the circos plot does not show with WINDOWS > 0, you can increase the size of the window
+# If circos plot does not show with WINDOWS > 0, you can increase the size of the window
 WINDOW = 30
 
 # colour palette for circos plot
@@ -108,14 +107,14 @@ CYTOBAND_COLORMAP = {
 ### ======================================================================= ###
 
 # Assemble files
-metrics, predicted_result_train, predicted_result_test, effect, interactions, attention,\
+metrics, predicted_result_train, predicted_result_test, effect, interactions, \
     POPULATION, PHENOTYPE, MODEL = assemble(RESULT_NAME)
+
+# Store violin plots
+metric_plot(metrics.copy(), MODEL, RESULT_NAME)
 
 if 'GAT_fully_connected' in MODEL or 'GAT_prior_knowledge' in metrics['model'].unique().tolist():
     attention_distribution(attention, RESULT_NAME, 10)
-  
-# Store violin plots
-metric_plot(metrics.copy(), MODEL, RESULT_NAME)
 
 # Generate scatter plot matrices if needed
 if SCATTER_CREATE:
@@ -123,4 +122,4 @@ if SCATTER_CREATE:
 
 # Generate circos plots
 circos_plot(effect, interactions, MARKER_INFO, CHROMOSOME_INFO, GENE_INFO, 
-            POPULATION, PHENOTYPE, CIRCOS_CONFIG, END_ADJUST, WINDOW, CYTOBAND_COLORMAP, RESULT_NAME, attention) 
+            POPULATION, PHENOTYPE, CIRCOS_CONFIG, END_ADJUST, WINDOW, CYTOBAND_COLORMAP, RESULT_NAME, SCENARIO) 

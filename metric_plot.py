@@ -1,11 +1,15 @@
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-def metric_plot(record, MODEL, RESULT_NAME):
+def metric_plot(record, MODEL, RESULT_NAME, SCENARIO):
     
     metrics = ['Pearson correlation', 'MSE']
-    record['models'] = 'models'
-    sns.set_theme(style="ticks",font_scale = 1, rc={"figure.dpi":300, 'savefig.dpi':300})
+    record['x'] = 'Model'
+    
+    if SCENARIO == 'between':
+        record['population'] = record['population'].str.split('->', expand=True).iloc[:,-1]
+    
+    sns.set_theme(style="ticks",font_scale = 1, rc={"figure.dpi":600, 'savefig.dpi':600})
     
     for i in range(len(metrics)):
         ax_share = False #if metrics[i] == 'MSE' else True
@@ -15,12 +19,12 @@ def metric_plot(record, MODEL, RESULT_NAME):
         for axis in g.axes.flat:
             axis.tick_params(labelleft=True) 
                     
-        g.map(sns.violinplot,'models', metrics[i], 'models', palette='colorblind', hue_order=MODEL)    
+        g.map(sns.violinplot,'x', metrics[i], 'model', palette='colorblind', hue_order=MODEL)    
         
         for axis in g.axes.flat:
             axis.set_ylabel(metrics[i])  
             axis.set_xlabel("")  
         
         plt.tight_layout()
-        g.add_legend()
+        g.add_legend(loc='lower right')
         g.savefig('./Result/'+RESULT_NAME+'/'+metrics[i]+'.png') 
