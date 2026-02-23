@@ -4,7 +4,7 @@ from assemble import *
 from metric_plot import *
 from scatter_plot import *
 from circos_plot import *
-  
+from attention_histogram import *
 
 # Change below
 ### ======================================================================= ###
@@ -111,6 +111,9 @@ CYTOBAND_COLORMAP = {
 metrics, predicted_result_train, predicted_result_test, effect, interactions, attention,\
     POPULATION, PHENOTYPE, MODEL = assemble(RESULT_NAME)
 
+if 'GAT_fully_connected' in MODEL or 'GAT_prior_knowledge' in metrics['model'].unique().tolist():
+    attention_distribution(attention, RESULT_NAME, 10)
+  
 # Store violin plots
 metric_plot(metrics.copy(), MODEL, RESULT_NAME)
 
