@@ -31,7 +31,7 @@ def scatter_plot(MODEL, PHENOTYPE, predicted_result_test, effect, QTL, SCATTER_C
     
     # Read QTL data if needed
     if QTL != None:
-        QTL_info = pd.read_csv(QTL+'.csv')
+        QTL_info = pd.read_csv(QTL)
     
     # Generate a scatter plot per phenotype
     for k in range(len(PHENOTYPE)):
