@@ -306,11 +306,8 @@ def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULA
         attention['population'] = attention['population'].str.split('->', expand=True).iloc[:,-1]
     if SCENARIO == 'between' and effect.shape[0] != 0:
         effect['population'] = effect['population'].str.split('->', expand=True).iloc[:,-1]
-    #print(POPULATION)
-    #if SCENARIO =='within':
-    POPULATION = ('all',) + tuple(POPULATION.tolist())
-    #elif SCENARIO == 'between':
-    #    POPULATION = ('all',) + tuple([item.tolist().split('->')[-1] for item in POPULATION])
+    
+    POPULATION = ('all',) + tuple(POPULATION)
         
     MODEL = pd.unique(effect['model'])
     
