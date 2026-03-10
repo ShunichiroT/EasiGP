@@ -290,7 +290,7 @@ def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MO
                     colour = 'blue'
                 else:
                     colour = 'red'
-                circos.link(region1, region2, lw=interactions.loc[ii,'value']/circos_config['link_width'], color=colour)
+                circos.link(region1, region2, lw=interactions.loc[ii,'value']*circos_config['link_width'], color=colour)
                 
         # Store the circos plot
         fig = circos.plotfig()
