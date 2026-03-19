@@ -24,9 +24,9 @@ PHENOTYPE = ['days2anthesis']
   # ['GAT_infinitesimal', 'GAT_fully_connected', 'GAT_prior_knowledge']
 MODEL = ['rrBLUP','BayesB','ensemble'] 
 
-# Data spliting ratio
-# If elements are in float values, they are used as training set ratio when 
-# spliting the data into training and test sets
+# Data splitting ratio
+# If elements are in float values, they are used as the training set ratio when 
+# splitting the data into training and test sets
     # e.g. [0.8, 0.65, 0.5]
 
 # If elements are in tuple formats, they are used to split the data into 
@@ -38,12 +38,12 @@ MODEL = ['rrBLUP','BayesB','ensemble']
 # The element of each tuple shows the ratio of the training, 
 # validation and test set, respectively
 
-RATIO = [0.8]#[(0.5,0.25,0.25)]  #[(0.5,0.25,0.25)]     #[0.8]     
+RATIO = [0.8]   
 
 # Number of iterations with random sampling for training & test sets
 ITER_NUM = 1
 
-# Folder name that store prediction results (inside Result folder) 
+# Folder name that stores prediction results (inside Result folder) 
 RESULT_NAME = 'MaizeNAM'
 
 if not os.path.exists('./Result/'+RESULT_NAME):
@@ -69,7 +69,7 @@ PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1.c
     # iteration number, buin-in, number of samples for Shapley scores, 
     # return marker effect?
 # RF:                              
-    # tree number, maximum fearures per tree, maximum samples per tree, 
+    # tree number, maximum features per tree, maximum samples per tree, 
     # number of samples for interaction Shapley scores, return marker effect for interactions?
 # SVR:                             
     # kernel type, epsilon, regularisation, dimension for poly kernel, gamma, 
@@ -156,7 +156,7 @@ GENE_INFO = './Data/MaizeNAM/gene_info.csv'
 # link_width:      the thickness of links
 # interaction_top: select only the top N% of strongest links
 # label_size:      size of font
-# scale:           scale of circos plot  
+# scale:           scale of the circos plot  
 CIRCOS_CONFIG = {'space':3,
                  'start':15,
                  'end':345,
@@ -168,10 +168,10 @@ CIRCOS_CONFIG = {'space':3,
 # Adjust the edge location of each marker for visualisation
 END_ADJUST = 0
 
-# Choose a method of how you aggregate genomic marker effect
+# Choose a method for aggregating genomic marker effect
 # Assign 0 if you do not wish to introduce a window to average the effects in each window interval
 # Otherwise, assign a window size here
-# If circos plot does not show with WINDOWS > 0, you can increase the size of the window
+# If the circos plot does not show with WINDOWS > 0, you can increase the size of the window
 WINDOW = 300
 
 # colour palette for circos plot
