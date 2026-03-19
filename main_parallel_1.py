@@ -17,9 +17,9 @@ PHENOTYPE = ['days2anthesis','asi']
 # Name of genomic prediction models to run
 MODEL = ['rrBLUP', 'BayesB', 'RF','ensemble'] 
 
-# Data spliting ratio
-# If elements are in float values, they are used to as training set ratio when 
-# spliting the data into training and test sets
+# Data splitting ratio
+# If elements are in float values, they are used as a training set ratio when 
+# splitting the data into training and test sets
     # e.g. [0.8, 0.65, 0.5]
 
 # If elements are in tuple formats, they are used to split the data into 
@@ -31,12 +31,12 @@ MODEL = ['rrBLUP', 'BayesB', 'RF','ensemble']
 # The element of each tuple shows the ratio of the training, 
 # validation and test set, respectively
 
-RATIO = [0.8]  #[(0.5,0.25,0.25)]     
+RATIO = [0.8]    
 
 # Number of iterations with random sampling for training & test sets
 ITER_NUM = 1
 
-# Folder name that store prediction results (inside Result folder) 
+# Folder name that stores prediction results (inside Result folder) 
 RESULT_NAME = 'MaizeNAM'
 
 if not os.path.exists('./Result/'+RESULT_NAME):
@@ -52,14 +52,14 @@ PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1.c
 
 # Configuration for the parallel run of prediction scenarios
 # All prediction scenarios are split into k batches
-# Batch_id: assign the id of the batch you want to run
-    # It is possible to automate id assignment using a job array in HPC if any
+# Batch_id: assign the ID of the batch you want to run
+    # It is possible to automate ID assignment using a job array in HPC if any
     # e.g. int(os.environ["SLURM_ARRAY_TASK_ID"])
 # Batch size: the total number of prediction scenarios in each batch
 PARALLEL = {'batch_id': 0,
             'batch_size': 2}
 
-# Hyprparameters
+# Hyperparameters
 # rrBLUP:                          
     # iteration number, burin-in
 # BayesB:                          
@@ -71,7 +71,7 @@ PARALLEL = {'batch_id': 0,
     # iteration number, buin-in, number of samples for Shapley scores, 
     # return marker effect?
 # RF:                              
-    # tree number, maximum fearures per tree, maximum samples per tree, 
+    # tree number, maximum features per tree, maximum samples per tree, 
     # number of samples for interaction Shapley scores, return marker effect interactions?
 # SVR:                             
     # kernel type, epsilon, regularisation, dimension for poly kernel, gamma, 
@@ -107,10 +107,10 @@ HPARAMETERS = {'rrBLUP': [10000, 2000],
 
 # Method names for weight optimisation in ensembles 
 # The current available methods 
-# ['Nelder Mead','Linear transformation', 'Bayesian_optimisation']
+# ['Nelder Mead', 'Linear transformation', 'Bayesian optimisation']
 
 # Write "None" if you implement naive ensemble approach 
-W_OPT = None #['Nelder Mead', 'Bayesian optimisation', 'Linear transformation'] 
+W_OPT = None
 
 # Hyperparameters for weight optimisation
 # Linear transformation:
