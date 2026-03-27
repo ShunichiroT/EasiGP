@@ -183,15 +183,13 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, 
                 interaction = interaction.loc[:,['phenotype','from','to', 'value']]
             elif POPULATION != 'all' and interaction.shape[0]!=0:
                 interaction = interaction.loc[:,['population','phenotype','from','to', 'value']]
-                interaction = interaction[interaction['population']==str(POPULATION)].reset_index(drop=False)
-            #else:
-            #    return pd.DataFrame()
+                interaction = interaction[interaction['population'].astype(str)==str(POPULATION)].reset_index(drop=False)
             
             interaction = interaction[(interaction['from'] != 'factor') & (interaction['to'] != 'factor')]
             interaction = interaction.groupby(['phenotype','from','to'], as_index=False).mean(numeric_only=True)
             
             interaction_selected = interaction[interaction['phenotype'] == PHENOTYPE]
-            interaction_selected = interaction_selected[interaction_selected['value'] >= np.quantile(interaction_selected['value'], 1-circos_config['interaction_top']/100)].reset_index(drop=True)
+            interaction_selected = interaction_selected[interaction_selected['value'] >= np.quantile(interaction_selected['value'], (1-circos_config['interaction_top']))].reset_index(drop=True)
             interaction_selected['value'] = interaction_selected['value'] / interaction_selected['value'].sum()
             
             loc_info = pd.read_csv(marker_info)
@@ -294,7 +292,10 @@ def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MO
                 
         # Store the circos plot
         fig = circos.plotfig()
-        fig.savefig('./Result/'+RESULT_NAME+'/circos_'+str(PHENOTYPE)+'_'+str(POPULATION)+'_interaction_'+str(model_selected[n])+'.png',dpi=600) 
+        if model_selected[n] == 'not_returned':
+            fig.savefig('./Result/'+RESULT_NAME+'/circos_'+str(PHENOTYPE)+'_'+str(POPULATION)+'.png',dpi=600) 
+        else:
+            fig.savefig('./Result/'+RESULT_NAME+'/circos_'+str(PHENOTYPE)+'_'+str(POPULATION)+'_interaction_'+str(model_selected[n])+'.png',dpi=600) 
 
 def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULATION, PHENOTYPE, circos_config, end_adjust, WINDOW, CYTOBAND_COLORMAP,RESULT_NAME, attention, SCENARIO):
 
