@@ -209,7 +209,17 @@ CYTOBAND_COLORMAP = {
        "red7": "#b57c02",
        "red8": "#8a5e01",
        "red9": "#874001",
-       "red10": "#610901"
+       "red10": "#610901",
+       "transduction":"#02b01c",
+       "transduction_clock":"#0afcd0",
+       "clock": "#0389ad",
+       "photoperiod":"#947b01",
+       "autonomous":"#ffbc03",
+       "integrator":"#91029c",
+       "integrator_clock":"#f990fc",
+       "GA":"#a990fc",
+       "aging":"#90a7fc",
+       "centromere": "#333333"
    }
 
 ### ======================================================================= ###
