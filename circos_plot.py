@@ -189,7 +189,7 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, 
             interaction = interaction.groupby(['phenotype','from','to'], as_index=False).mean(numeric_only=True)
             
             interaction_selected = interaction[interaction['phenotype'] == PHENOTYPE]
-            interaction_selected = interaction_selected[interaction_selected['value'] >= np.quantile(interaction_selected['value'], (1-circos_config['interaction_top']))].reset_index(drop=True)
+            interaction_selected = interaction_selected[interaction_selected['value'] >= np.quantile(interaction_selected['value'], (1-(circos_config['interaction_top']/100)))].reset_index(drop=True)
             interaction_selected['value'] = interaction_selected['value'] / interaction_selected['value'].sum()
             
             loc_info = pd.read_csv(marker_info)
