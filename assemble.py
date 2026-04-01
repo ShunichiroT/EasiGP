@@ -62,7 +62,7 @@ def assemble(RESULT_NAME):
     if attention.shape[0] != 0:
         attention.to_csv('./Result/'+RESULT_NAME+'/Attention.csv',index=False)
     
-    MODEL = pd.unique(metric['type']).tolist() 
+    MODEL = pd.unique(metric['model']).tolist() 
     if 'Linear transformation' in MODEL:
         MODEL.remove('Linear transformation')
     if 'Nelder Mead' in MODEL:
