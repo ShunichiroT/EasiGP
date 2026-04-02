@@ -44,7 +44,7 @@ def RF(train, valid, test, params):
         
         interaction_sample.index = interaction_sample.columns = test_x.columns
         interaction_sample = interaction_sample.stack(dropna=True).reset_index(drop=False)
-        interaction_sample.columns = ['from','to','value']
+        interaction_sample.columns = ['marker1','marker2','value']
     else:
         interaction_sample = pd.DataFrame()
     
