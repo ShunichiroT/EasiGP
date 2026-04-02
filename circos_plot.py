@@ -202,7 +202,7 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, 
             interaction_selected = pd.concat([chrom_start, start.loc[:,['start','end']],
                                        chrom_end, end.loc[:,['start','end']],
                                        interaction_selected['value']],axis=1)
-            interaction_selected.columns = ['chromosome_from', 'start','end','chromosome_to','start','end','value']
+            interaction_selected.columns = ['chromosome_marker1', 'start','end','chromosome_marker2','start','end','value']
             interaction_selected['model'] = 'RF'
             interaction_selected_total = pd.concat([interaction_selected_total, interaction_selected])
         if attention_original.shape[0]!=0:
@@ -218,8 +218,6 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, 
                     attention = attention_original[attention_original['model']==models_GAT[i]].reset_index(drop=False)
                     attention = attention.loc[:,['population','phenotype','marker1','marker2', 'value']]
                     attention = attention_original[attention_original['population']==str(POPULATION)].reset_index(drop=False)
-                #else:
-                #    return pd.DataFrame()
                 attention = attention[(attention['marker1'] != 'factor') & (attention['marker2'] != 'factor')]
                 attention = attention.groupby(['phenotype','marker1','marker2'], as_index=False).mean(numeric_only=True)
                 
@@ -237,7 +235,7 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, 
                 attention = pd.concat([chrom_start, start.loc[:,['start','end']],
                                            chrom_end, end.loc[:,['start','end']],
                                            attention['value']],axis=1)
-                attention.columns = ['chromosome_from', 'start','end','chromosome_to','start','end','value']
+                attention.columns = ['chromosome_marker1', 'start','end','chromosome_marker2','start','end','value']
                 attention['model'] = models_GAT[i]
                 interaction_selected_total = pd.concat([interaction_selected_total, attention])
             
