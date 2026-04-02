@@ -76,7 +76,7 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
     effect = pd.DataFrame()          #store genomic marker effects
     interactions = pd.DataFrame()    #store marker interaction effects
     weight = pd.DataFrame()          #store weight values for weight optimisation
-    attention_total = pd.DataFrame() #store attention values from GAT models
+    attention_total = pd.DataFrame() #store attention values  GAT models
     
     if PARALLEL is not None:
         idx = PARALLEL['batch_id']
@@ -287,8 +287,8 @@ def GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, PHENOTYPE, RATIO, SAMPLE_
                 sample_attention['ratio'] = str(sample.loc[i,'ratio'])
                 sample_attention['phenotype'] = sample.loc[i,'phenotype']
                 sample_attention['sample'] = sample.loc[i,'sample'] 
-                sample_attention.columns = ['from','to','value','population','model','ratio','phenotype','sample']
-                sample_attention = sample_attention.loc[:,['population','phenotype','model','ratio','sample', 'from', 'to', 'value']]
+                sample_attention.columns = ['marker1','marker2','value','population','model','ratio','phenotype','sample']
+                sample_attention = sample_attention.loc[:,['population','phenotype','model','ratio','sample', 'marker1', 'marker2', 'value']]
                 sample_attention = pd.concat([attention_total, sample_attention],axis=0)
                 
                 attention_total = pd.concat([attention_total, sample_attention], axis=0)
