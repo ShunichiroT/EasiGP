@@ -30,7 +30,7 @@ def data_conversion(chrom_info, gene_info, PHENOTYPE, RESULT_NAME):
         
     return pop_source
 
-def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_adjust, POPULATION, WINDOW, RESULT_NAME):
+def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_adjust, POPULATION, WINDOW, RESULT_NAME, ASCENDING):
     
     chromosome = pd.read_csv('./Result/'+RESULT_NAME+'/chrom_'+str(POPULATION)+'.bed', delimiter='\t')
     
@@ -68,28 +68,31 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
             if WINDOW == 0:
                 effect_selected_copy = effect_selected.copy()
                 
-                effect_selected_copy.iloc[:,0] = colour+'1'
+                effect_selected_copy.iloc[:,0] = colour+'0'
                 tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.1)].dropna().index)
-                effect_selected_copy.loc[tmp,:] = colour+'2'
+                effect_selected_copy.loc[tmp,:] = colour+'1'
                 tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.2)].dropna().index)
-                effect_selected_copy.loc[tmp,:] = colour+'3'
+                effect_selected_copy.loc[tmp,:] = colour+'2'
                 tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.3)].dropna().index)
-                effect_selected_copy.loc[tmp,:] = colour+'4'
+                effect_selected_copy.loc[tmp,:] = colour+'3'
                 tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.4)].dropna().index)
-                effect_selected_copy.loc[tmp,:] = colour+'5'
+                effect_selected_copy.loc[tmp,:] = colour+'4'
                 tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.5)].dropna().index)
-                effect_selected_copy.loc[tmp,:] = colour+'6'
+                effect_selected_copy.loc[tmp,:] = colour+'5'
                 tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.6)].dropna().index)
-                effect_selected_copy.loc[tmp,:] = colour+'7'
+                effect_selected_copy.loc[tmp,:] = colour+'6'
                 tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.7)].dropna().index)
-                effect_selected_copy.loc[tmp,:] = colour+'8'
+                effect_selected_copy.loc[tmp,:] = colour+'7'
                 tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.8)].dropna().index)
-                effect_selected_copy.loc[tmp,:] = colour+'9'
+                effect_selected_copy.loc[tmp,:] = colour+'8'
                 tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.9)].dropna().index)
-                effect_selected_copy.loc[tmp,:] = colour+'10'
+                effect_selected_copy.loc[tmp,:] = colour+'9'
                 
                 effect_selected_copy.columns = ['colour']
+                if ASCENDING is not None:
+                    effect_selected_copy = effect_selected_copy.sort_values(by=['colour'], ascending=ASCENDING)
                 effect_selected_copy = effect_selected_copy.reset_index(drop=False)
+                
                 marker = pd.read_csv(marker_info)
                 merged = pd.merge(effect_selected_copy, marker, left_on=['index'], right_on=['name'])
                 merged = merged.loc[:,['chromosome','start','end','index','colour']]
@@ -132,25 +135,25 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
 
 
                 effect_selected_copy = effect_selected.copy()
-                effect_selected_copy.iloc[:,2] = colour+'1'
+                effect_selected_copy.iloc[:,2] = colour+'0'
                 tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.1)].dropna().index)
-                effect_selected_copy.iloc[tmp,2] = colour+'2'
+                effect_selected_copy.iloc[tmp,2] = colour+'1'
                 tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.2)].dropna().index)
-                effect_selected_copy.iloc[tmp,2] = colour+'3'
+                effect_selected_copy.iloc[tmp,2] = colour+'2'
                 tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.3)].dropna().index)
-                effect_selected_copy.iloc[tmp,2] = colour+'4'
+                effect_selected_copy.iloc[tmp,2] = colour+'3'
                 tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.4)].dropna().index)
-                effect_selected_copy.iloc[tmp,2] = colour+'5'
+                effect_selected_copy.iloc[tmp,2] = colour+'4'
                 tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.5)].dropna().index)
-                effect_selected_copy.iloc[tmp,2] = colour+'6'
+                effect_selected_copy.iloc[tmp,2] = colour+'5'
                 tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.6)].dropna().index)
-                effect_selected_copy.iloc[tmp,2] = colour+'7'
+                effect_selected_copy.iloc[tmp,2] = colour+'6'
                 tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.7)].dropna().index)
-                effect_selected_copy.iloc[tmp,2] = colour+'8'
+                effect_selected_copy.iloc[tmp,2] = colour+'7'
                 tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.8)].dropna().index)
-                effect_selected_copy.iloc[tmp,2] = colour+'9'
+                effect_selected_copy.iloc[tmp,2] = colour+'8'
                 tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.9)].dropna().index)
-                effect_selected_copy.iloc[tmp,2] = colour+'10'
+                effect_selected_copy.iloc[tmp,2] = colour+'9'
                 
                 merged = effect_selected_copy.loc[:,['chromosome', 'start', 'end', 'index', 'effect']]
                 merged = merged.rename(columns={'effect':'colour'})
@@ -295,7 +298,7 @@ def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MO
         else:
             fig.savefig('./Result/'+RESULT_NAME+'/circos_'+str(PHENOTYPE)+'_'+str(POPULATION)+'_interaction_'+str(model_selected[n])+'.png',dpi=600) 
 
-def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULATION, PHENOTYPE, circos_config, end_adjust, WINDOW, CYTOBAND_COLORMAP,RESULT_NAME, attention, SCENARIO):
+def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULATION, PHENOTYPE, circos_config, end_adjust, WINDOW, CYTOBAND_COLORMAP, RESULT_NAME, attention, SCENARIO, ASCENDING):
 
     pop_source =  data_conversion(chrom_info, gene_info, PHENOTYPE,RESULT_NAME)
     
@@ -312,6 +315,6 @@ def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULA
     
     for i in range(len(PHENOTYPE)):
         for j in range(len(POPULATION)):
-            MODEL = quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE[i], MODEL, end_adjust, POPULATION[j], WINDOW,RESULT_NAME)
+            MODEL = quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE[i], MODEL, end_adjust, POPULATION[j], WINDOW, RESULT_NAME, ASCENDING)
             interaction_selected = interaction(interactions, marker_info, PHENOTYPE[i], circos_config, POPULATION[j],RESULT_NAME, attention)
             plot(interaction_selected, chrom_info, gene_info, pop_source, PHENOTYPE[i], MODEL, circos_config, CYTOBAND_COLORMAP, POPULATION[j],RESULT_NAME)

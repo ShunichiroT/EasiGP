@@ -174,6 +174,14 @@ END_ADJUST = 0
 # If the circos plot does not show with WINDOWS > 0, you can increase the size of the window
 WINDOW = 300
 
+# This determines the order of genomic marker effect mapping when WINDOW = 0
+# PyCirclize maps marker effects in order from the start to the end of the generated marker effect tsv files
+# Hence, if two marker regions overlap, the first marker effect is overwritten by the second marker effect
+# If ASCENDING = True, stronger marker effects will be emphasised
+# If ASCENDING = False, weaker marker effects will be emphasised
+# If ASCENDING = None, the original genomic marker effect order in the generated tsv files is used 
+ASCENDING = None
+
 # colour palette for circos plot
 CYTOBAND_COLORMAP = {   
        "gpos100": "#000000", # 0,0,0
@@ -190,26 +198,26 @@ CYTOBAND_COLORMAP = {
        "green": "#47c462",
        "brown": "#e0a22f",
        "purple": "#a62bcc",
-       "blue1": "#def2ff",
-       "blue2": "#c2e5fc",
-       "blue3": "#addeff",
-       "blue4": "#99d6ff",
-       "blue5": "#83ccfc",
-       "blue6": "#68c1fc",
-       "blue7": "#45b5ff",
-       "blue8": "#14a0fc",
-       "blue9": "#027ac9",
-       "blue10": "#014f82",
-       "red1": "#fce1a7",
-       "red2": "#ffd780",
-       "red3": "#ffc954",
-       "red4": "#fcba2b",
-       "red5": "#ffaf03",
-       "red6": "#d99502",
-       "red7": "#b57c02",
-       "red8": "#8a5e01",
-       "red9": "#874001",
-       "red10": "#610901",
+       "blue0": "#def2ff",
+       "blue1": "#c2e5fc",
+       "blue2": "#addeff",
+       "blue3": "#99d6ff",
+       "blue4": "#83ccfc",
+       "blue5": "#68c1fc",
+       "blue6": "#45b5ff",
+       "blue7": "#14a0fc",
+       "blue8": "#027ac9",
+       "blue9": "#014f82",
+       "red0": "#fce1a7",
+       "red1": "#ffd780",
+       "red2": "#ffc954",
+       "red3": "#fcba2b",
+       "red4": "#ffaf03",
+       "red5": "#d99502",
+       "red6": "#b57c02",
+       "red7": "#8a5e01",
+       "red8": "#874001",
+       "red9": "#610901",
        "transduction":"#02b01c",
        "transduction_clock":"#0afcd0",
        "clock": "#0389ad",
@@ -245,4 +253,4 @@ if SCATTER_CREATE:
 
 # Generate circos plots
 circos_plot(effect, interactions, MARKER_INFO, CHROMOSOME_INFO, GENE_INFO, 
-            POPULATION, PHENOTYPE, CIRCOS_CONFIG, END_ADJUST, WINDOW, CYTOBAND_COLORMAP, RESULT_NAME, attention, SCENARIO) 
+            POPULATION, PHENOTYPE, CIRCOS_CONFIG, END_ADJUST, WINDOW, CYTOBAND_COLORMAP, RESULT_NAME, attention, SCENARIO, ASCENDING) 
