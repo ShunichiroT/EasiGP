@@ -171,7 +171,7 @@ dependencies:
   - qhull=2020.2=h4bd325d_2
   - r-askpass=1.2.0=r43h76d94ec_0
   - r-backports=1.4.1=r43h76d94ec_0
-  - r-base=4.4.0=h1ae530e_0
+  - r-base=4.3.1=h1ae530e_0
   - r-base64enc=0.1_3=r43h76d94ec_4
   - r-bglr=1.1.4=r43h2b5f3a1_0
   - r-bit=4.0.5=r43h76d94ec_0
