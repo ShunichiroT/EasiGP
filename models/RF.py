@@ -13,6 +13,7 @@ def RF(train, valid, test, params):
     sample_max = params[2]
     shapley_num = params[3]
     get_interaction = params[4]
+    threshold = params[5]
     
     #Split the data sets into x and y here as specified in the original code
     train_x, train_y = train.iloc[:,:-1], train.iloc[:,-1]    
@@ -31,11 +32,12 @@ def RF(train, valid, test, params):
         predicted_valid = []
     predicted_train = rf.predict(train_x)
 
-    ## Calculate the metrics
+    #Calculate the metrics
     actual_test = test_y.values.tolist()
     mse = mean_squared_error(actual_test, predicted)
     r = pearsonr(actual_test, predicted)[0]
     
+    #Extract interactions 
     if get_interaction == True:
         explainer = shap.TreeExplainer(rf)
         interaction_sample = pd.DataFrame(abs(explainer.shap_interaction_values(shap.sample(test_x, shapley_num))).sum(axis=0))
@@ -45,6 +47,9 @@ def RF(train, valid, test, params):
         interaction_sample.index = interaction_sample.columns = test_x.columns
         interaction_sample = interaction_sample.stack(dropna=True).reset_index(drop=False)
         interaction_sample.columns = ['marker1','marker2','value']
+        
+        if threshold != 'all':
+            interaction_sample = interaction_sample[interaction_sample['value'] > interaction_sample['value'].quantile((1-(threshold/100)))]
     else:
         interaction_sample = pd.DataFrame()
     

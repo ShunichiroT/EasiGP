@@ -2,14 +2,15 @@ from assemble import *
 from metric_plot import *
 from scatter_plot import *
 from circos_plot import *
-  
+from attention_histogram import *
+
 
 # Change below
 ### ======================================================================= ###
 
 # 2.Scatter plot matrix configuration
 
-# True if scatter plot is needed. False otherwise
+# True if you want to generate scatter plot. False otherwise
 SCATTER_CREATE = True 
 
 # Write a file path if you want to add QTL information. None otherwise
@@ -24,12 +25,22 @@ SCATTER_CONFIG = {'font_size':2,
 # Folder name that stores prediction results (inside Result folder) 
 RESULT_NAME = 'MaizeNAM'
 
-# ---------------------------------------------------------------------------- #
-# 3. Circos plot configuration
+if not os.path.exists('./Result/'+RESULT_NAME):
+    os.makedirs('./Result/'+RESULT_NAME)
 
 # Prediction scenario (within population prediction or between population scenario)
 # Specify with either 'within' or 'between'
 SCENARIO = 'within'
+
+# Method names for weight optimisation in ensembles 
+# The current available methods 
+# ['Nelder Mead', 'Linear transformation', 'Bayesian optimisation']
+# Make sure to write the names in the form of a list []
+# Write "None" if you implement naive ensemble approach 
+W_OPT = None
+
+# ---------------------------------------------------------------------------- #
+# 3. Circos plot configuration
 
 # File path for the information of chromosomes
 CHROMOSOME_INFO = './Data/MaizeNAM/chrom.csv'
@@ -57,14 +68,14 @@ CIRCOS_CONFIG = {'space':3,
                  'label_size':6,
                  'scale':100}
 
-# adjust the edge location of each marker for visualisation
+# Adjust the edge location of each marker for visualisation
 END_ADJUST = 0
 
-# Choose a method for aggregating genomic marker effects
+# Choose a method for aggregating genomic marker effect
 # Assign 0 if you do not wish to introduce a window to average the effects in each window interval
 # Otherwise, assign a window size here
-# If the circos plot does not show with WINDOWS > 0, you can increase the size of the window
-WINDOW = 30
+# If the circos plot does not show with WINDOWS > 0, the size of the window needs to be larger
+WINDOW = 300
 
 # This determines the order of genomic marker effect mapping when WINDOW = 0
 # PyCirclize maps marker effects in order from the start to the end of the generated marker effect tsv files
@@ -125,14 +136,18 @@ CYTOBAND_COLORMAP = {
 ### ======================================================================= ###
 
 # Assemble files
-metrics, predicted_result_train, predicted_result_test, effect, interactions, \
+metrics, predicted_result_train, predicted_result_test, effect, interactions, attention, \
     POPULATION, PHENOTYPE, MODEL = assemble(RESULT_NAME)
 
-# Store violin plots
-metric_plot(metrics.copy(), MODEL, RESULT_NAME)
-
-if 'GAT_fully_connected' in MODEL or 'GAT_prior_knowledge' in metrics['model'].unique().tolist():
+# Retrieve attention values from GAT models if included
+if 'GAT_fully_connected' in MODEL or 'GAT_prior_knowledge' in MODEL:
     attention_distribution(attention, RESULT_NAME, 10)
+    
+# Store violin plots
+if W_OPT is not None:
+    metric_plot(metrics.copy(), MODEL+W_OPT, RESULT_NAME, SCENARIO)
+else:
+    metric_plot(metrics.copy(), MODEL, RESULT_NAME, SCENARIO)
 
 # Generate scatter plot matrices if needed
 if SCATTER_CREATE:
@@ -140,4 +155,4 @@ if SCATTER_CREATE:
 
 # Generate circos plots
 circos_plot(effect, interactions, MARKER_INFO, CHROMOSOME_INFO, GENE_INFO, 
-            POPULATION, PHENOTYPE, CIRCOS_CONFIG, END_ADJUST, WINDOW, CYTOBAND_COLORMAP, RESULT_NAME, SCENARIO, ASCENDING) 
+            POPULATION, PHENOTYPE, CIRCOS_CONFIG, END_ADJUST, WINDOW, CYTOBAND_COLORMAP, RESULT_NAME, attention, SCENARIO, ASCENDING) 

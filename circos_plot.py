@@ -220,12 +220,12 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, 
                 elif POPULATION != 'all' and attention_original.shape[0]!=0:
                     attention = attention_original[attention_original['model']==models_GAT[i]].reset_index(drop=False)
                     attention = attention.loc[:,['population','phenotype','marker1','marker2', 'value']]
-                    attention = attention_original[attention_original['population']==str(POPULATION)].reset_index(drop=False)
+                    attention = attention_original[attention_original['population'].astype(str)==str(POPULATION)].reset_index(drop=False)
                 attention = attention[(attention['marker1'] != 'factor') & (attention['marker2'] != 'factor')]
                 attention = attention.groupby(['phenotype','marker1','marker2'], as_index=False).mean(numeric_only=True)
                 
                 attention = attention[attention['phenotype'] == PHENOTYPE]
-                attention = attention[attention['value'] >= np.quantile(attention['value'], circos_config['interaction_top'])].reset_index(drop=True)
+                attention = attention[attention['value'] >= np.quantile(attention['value'], (1-(circos_config['interaction_top']/100)))].reset_index(drop=True)
                 attention['value'] = attention['value'] / attention['value'].sum()
                 
                 loc_info = pd.read_csv(marker_info)

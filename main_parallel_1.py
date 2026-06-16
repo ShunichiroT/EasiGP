@@ -8,33 +8,35 @@ from genomic_prediction import *
 
 # Assign path for R if causing an error
 # e.g.'C:\Program Files\R\R-4.4.0'
+# Oterviwse write 'None'
 R_PATH = 'C:\Program Files\R\R-4.4.0'
 
 # Your target phenotypes
 # Write 'all' to select all phenotypes in your phenotype file  
-PHENOTYPE = ['days2anthesis','asi'] 
+PHENOTYPE = ['days2anthesis'] 
 
 # Name of genomic prediction models to run
-MODEL = ['rrBLUP', 'BayesB', 'RF','ensemble'] 
+# Available models
+  # ['rrBLUP', 'GBLUP', 'BayesB', 'RKHS', 'RF', 'SVR', 'MLP', 'ensemble']
+  # ['GAT_infinitesimal', 'GAT_fully_connected', 'GAT_prior_knowledge']
+MODEL = ['rrBLUP', 'BayesB', 'RF', 'ensemble'] 
 
 # Data splitting ratio
 # If elements are in float values, they are used as a training set ratio when 
 # splitting the data into training and test sets
     # e.g. [0.8, 0.65, 0.5]
 
-# If elements are in tuple formats, they are used to split the data into 
+# If elements are in a tuple format, the data is split the data into 
 # training, validation and test sets
-
-# The data needs to be split into training, validation and test sets for 
+# Data needs to be split into training, validation and test sets for 
 # weight optimisation
     # e.g. [(0.5,0.25,0.25),(0.8,0.1,0.1)] 
 # The element of each tuple shows the ratio of the training, 
 # validation and test set, respectively
+RATIO = [0.8]
 
-RATIO = [0.8]    
-
-# Number of iterations with random sampling for training & test sets
-ITER_NUM = 1
+# Number of iterations with random sampling when splitting data
+ITER_NUM = 3
 
 # Folder name that stores prediction results (inside Result folder) 
 RESULT_NAME = 'MaizeNAM'
@@ -57,7 +59,7 @@ PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1.c
     # e.g. int(os.environ["SLURM_ARRAY_TASK_ID"])
 # Batch size: the total number of prediction scenarios in each batch
 PARALLEL = {'batch_id': 0,
-            'batch_size': 2}
+            'batch_size': 3}
 
 # Hyperparameters
 # rrBLUP:                          
@@ -72,7 +74,8 @@ PARALLEL = {'batch_id': 0,
     # return marker effect?
 # RF:                              
     # tree number, maximum features per tree, maximum samples per tree, 
-    # number of samples for interaction Shapley scores, return marker effect interactions?
+    # number of samples for interaction Shapley scores, return marker effect for interactions?,
+    # threshold for extracting the top N% of interactions. Write "all" for extracting all interactions
 # SVR:                             
     # kernel type, epsilon, regularisation, dimension for poly kernel, gamma, 
     # number of samples for Shapley scores, return marker effect?
@@ -93,11 +96,11 @@ PARALLEL = {'batch_id': 0,
     # number of heads, number of samples for Shapley scores, 
     # selection rate for edges from RF (e.g. 0.1 = selection the top 10% of the 
     # most important edges), return marker effect?
-HPARAMETERS = {'rrBLUP': [10000, 2000],   
-               'GBLUP': [12000, 2000, 3, False], 
+HPARAMETERS = {'rrBLUP': [12000, 2000],     
+               'GBLUP': [12000, 2000, 3, False],   
                'BayesB': [12000, 2000],    
                'RKHS': [12000, 2000, 30, False],   
-               'RF': [1000, 1.0, None, 30, False],           
+               'RF': [1000, 1.0, None, 30, True, 'all'],           
                'SVR':['rbf', 0.5, 1.0, 3, 'scale', 30, False],      
                'MLP':[30, 0, 0.0001, 5e-4, 200, 8, 10],
                'GAT_infinitesimal_node_level':[20, 0.9, 0.005, 5e-4, 1, 8, 1, 3, False],
@@ -108,7 +111,7 @@ HPARAMETERS = {'rrBLUP': [10000, 2000],
 # Method names for weight optimisation in ensembles 
 # The current available methods 
 # ['Nelder Mead', 'Linear transformation', 'Bayesian optimisation']
-
+# Make sure to write the names in the form of a list []
 # Write "None" if you implement naive ensemble approach 
 W_OPT = None
 
@@ -127,5 +130,5 @@ HYPERPARAMETERS_OPT = {'Linear transformation':[0.005, 150, 0.01, 2, 10, 30],
 
 # Run genomic prediction models
 metrics, predicted_result_train, predicted_result_test, effect, interactions, \
-    POPULATION, PHENOTYPE = GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, 
-                               PHENOTYPE, RATIO, ITER_NUM, HPARAMETERS, R_PATH, W_OPT, RESULT_NAME, HYPERPARAMETERS_OPT, PARALLEL)
+    POPULATION, PHENOTYPE, attention = GP(GENOTYPE_FILE_NAME, PHENOTYPE_FILE_NAME, MODEL, 
+                               PHENOTYPE, RATIO, ITER_NUM, HPARAMETERS, R_PATH, W_OPT, RESULT_NAME, HYPERPARAMETERS_OPT, SCENARIO, PARALLEL)

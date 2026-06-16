@@ -12,6 +12,7 @@ from attention_histogram import *
 
 # Assign path for R if causing an error
 # e.g.'C:\Program Files\R\R-4.4.0'
+# Oterviwse write 'None'
 R_PATH = 'C:\Program Files\R\R-4.4.0'
 
 # Your target phenotypes
@@ -22,25 +23,23 @@ PHENOTYPE = ['days2anthesis']
 # Available models
   # ['rrBLUP', 'GBLUP', 'BayesB', 'RKHS', 'RF', 'SVR', 'MLP', 'ensemble']
   # ['GAT_infinitesimal', 'GAT_fully_connected', 'GAT_prior_knowledge']
-MODEL = ['rrBLUP','BayesB','ensemble'] 
+MODEL = ['rrBLUP','BayesB','RF','ensemble'] 
 
 # Data splitting ratio
 # If elements are in float values, they are used as the training set ratio when 
 # splitting the data into training and test sets
     # e.g. [0.8, 0.65, 0.5]
 
-# If elements are in tuple formats, they are used to split the data into 
+# If elements are in a tuple format, the data is split the data into 
 # training, validation and test sets
-
-# The data needs to be split into training, validation and test sets for 
+# Data needs to be split into training, validation and test sets for 
 # weight optimisation
     # e.g. [(0.5,0.25,0.25),(0.8,0.1,0.1)] 
 # The element of each tuple shows the ratio of the training, 
 # validation and test set, respectively
-
 RATIO = [0.8]   
 
-# Number of iterations with random sampling for training & test sets
+# Number of iterations with random sampling for when splitting data
 ITER_NUM = 1
 
 # Folder name that stores prediction results (inside Result folder) 
@@ -70,7 +69,8 @@ PHENOTYPE_FILE_NAME = './Data/MaizeNAM/MaizeNAM_dataset_phenotype_population_1.c
     # return marker effect?
 # RF:                              
     # tree number, maximum features per tree, maximum samples per tree, 
-    # number of samples for interaction Shapley scores, return marker effect for interactions?
+    # number of samples for interaction Shapley scores, return marker effect for interactions?,
+    # threshold for extracting the top N% of interactions. Write "all" for extracting all interactions
 # SVR:                             
     # kernel type, epsilon, regularisation, dimension for poly kernel, gamma, 
     # number of samples for Shapley scores, return marker effect?
@@ -95,7 +95,7 @@ HPARAMETERS = {'rrBLUP': [12000, 2000],
                'GBLUP': [12000, 2000, 3, False],   
                'BayesB': [12000, 2000],    
                'RKHS': [12000, 2000, 30, False],   
-               'RF': [1000, 1.0, None, 30, True],           
+               'RF': [1000, 1.0, None, 30, True, 'all'],           
                'SVR':['rbf', 0.5, 1.0, 3, 'scale', 30, False],      
                'MLP':[30, 0, 0.0001, 5e-4, 200, 8, 10],
                'GAT_infinitesimal_node_level':[20, 0.9, 0.005, 5e-4, 1, 8, 1, 3, False],
@@ -106,7 +106,7 @@ HPARAMETERS = {'rrBLUP': [12000, 2000],
 # Method names for weight optimisation in ensembles 
 # The current available methods 
 # ['Nelder Mead', 'Linear transformation', 'Bayesian optimisation']
-
+# Make sure to write the names in the form of a list []
 # Write "None" if you implement naive ensemble approach 
 W_OPT = None
 
@@ -124,7 +124,7 @@ HYPERPARAMETERS_OPT = {'Linear transformation':[0.005, 150, 0.01, 2, 10, 30],
 # ---------------------------------------------------------------------------- #
 # 2.Scatter plot matrix configuration
 
-# True if scatter plot is needed. False otherwise
+# True if you want to generate scatter plot. False otherwise
 SCATTER_CREATE = True 
 
 # Write a file path if you want to add QTL information. None otherwise
@@ -171,7 +171,7 @@ END_ADJUST = 0
 # Choose a method for aggregating genomic marker effect
 # Assign 0 if you do not wish to introduce a window to average the effects in each window interval
 # Otherwise, assign a window size here
-# If the circos plot does not show with WINDOWS > 0, you can increase the size of the window
+# If the circos plot does not show with WINDOWS > 0, the size of the window needs to be larger
 WINDOW = 300
 
 # This determines the order of genomic marker effect mapping when WINDOW = 0
