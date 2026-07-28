@@ -53,27 +53,14 @@ def GAT_infinitesimal_node_level(data_train, data_valid, data_test, params):
         data['qtl_'+str(i+1),'self','qtl_'+str(i+1)].edge_index = torch.stack([torch.from_numpy(edges).to(torch.long),torch.from_numpy(edges).to(torch.long)], dim=0)
     
     ## Add masks to distinguish between train, validation and test data
-    ids = list(range(data_pheno.shape[0]))
-    train_id = list(range(0,data_train.shape[0]))
-    valid_id = list(range(data_train.shape[0],(data_train.shape[0]+data_valid.shape[0])))
-    test_id = list(range((data_train.shape[0]+data_valid.shape[0]),(data_train.shape[0]+data_valid.shape[0]+data_test.shape[0])))
-    
-    mask_train = np.array([])
-    mask_valid = np.array([])
-    mask_test = np.array([])
-    for i in range(len(ids)):
-        if i in train_id:
-            mask_train = np.append(mask_train, True)
-            mask_valid = np.append(mask_valid, False)
-            mask_test = np.append(mask_test,False)   
-        elif i in valid_id:
-            mask_train = np.append(mask_train, False)
-            mask_valid = np.append(mask_valid, True)
-            mask_test = np.append(mask_test,False)   
-        else:
-            mask_train = np.append(mask_train, False)
-            mask_valid = np.append(mask_valid, False)
-            mask_test = np.append(mask_test,True)
+    ## data was built as concat([data_train, data_valid, data_test]), so the three
+    ## groups are always contiguous blocks - build the masks directly instead of
+    ## looping over every sample with an O(n) 'in list' check each time.
+    n_train, n_valid, n_test = data_train.shape[0], data_valid.shape[0], data_test.shape[0]
+
+    mask_train = np.array([True] * n_train + [False] * n_valid + [False] * n_test)
+    mask_valid = np.array([False] * n_train + [True] * n_valid + [False] * n_test)
+    mask_test = np.array([False] * n_train + [False] * n_valid + [True] * n_test)
     
     data['pheno'].train_mask = torch.from_numpy(mask_train).to(torch.bool)
     data['pheno'].valid_mask = torch.from_numpy(mask_valid).to(torch.bool)
@@ -147,18 +134,22 @@ def GAT_infinitesimal_node_level(data_train, data_valid, data_test, params):
         out = model(data.x_dict, data.edge_index_dict)
     
     ## Convert the data into mini-batches
+    ## Sample enough neighbors per hop to always cover every marker/sample node, rather
+    ## than a fixed count tuned for a specific dataset size (which would silently drop
+    ## markers on larger datasets).
+    max_neighbors = max(data_QTL.shape[1], data_pheno.shape[0])
     train_loader = HGTLoader(data, 
-                            num_samples={key:[1064] * 4 for key in data.node_types},
+                            num_samples={key:[max_neighbors] * 4 for key in data.node_types},
                             shuffle=True,
                             batch_size=bsize,
                             input_nodes=('pheno', data['pheno'].train_mask))
     if VALID:
         valid_loader = HGTLoader(data, 
-                                 num_samples={key:[1064] * 4 for key in data.node_types},
+                                 num_samples={key:[max_neighbors] * 4 for key in data.node_types},
                                  batch_size=bsize,shuffle=False,
                                  input_nodes=('pheno', data['pheno'].valid_mask))
     test_loader = HGTLoader(data, 
-                             num_samples={key:[1064] * 4 for key in data.node_types},
+                             num_samples={key:[max_neighbors] * 4 for key in data.node_types},
                              batch_size=bsize,shuffle=False,
                              input_nodes=('pheno', data['pheno'].test_mask))
     ## Train a model

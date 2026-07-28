@@ -61,8 +61,9 @@ def ensemble(train, valid, test, effect, MODEL):
                 effect_ensemble.iloc[:,5:] += selected.iloc[:,5:] 
                 cnt += 1
     
-    effect_ensemble.iloc[:,5:] = effect_ensemble.iloc[:,5:] / cnt
-    effect_ensemble['model'] = 'ensemble'
-        
+    if cnt > 0:
+        effect_ensemble.iloc[:,5:] = effect_ensemble.iloc[:,5:] / cnt
+        effect_ensemble['model'] = 'ensemble'
+
     return result_train, result_valid, result_test, record, effect_ensemble
 

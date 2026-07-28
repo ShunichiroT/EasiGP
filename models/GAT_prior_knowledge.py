@@ -31,9 +31,10 @@ def GAT_prior_knowledge(data_train, data_valid, data_test, params):
     epoch = params[4]
     bsize = params[5]
     heads = params[6]
-    samples = params[7]
-    top_rate = params[8]
-    marker_effect = params[9]
+    top_rate = params[7]
+    marker_effect = params[8]
+    samples = params[9]
+
     
     ## Train RF & extract interactions
 
@@ -53,7 +54,7 @@ def GAT_prior_knowledge(data_train, data_valid, data_test, params):
     pair = pd.DataFrame(product(list(f_imp_inter_train.columns), list(f_imp_inter_train.columns)))
     pair = pd.concat([pair,f_imp_inter_train.melt().iloc[:,1]],axis=1)
     pair = pair[pair['value'] > 0].reset_index(drop=True)
-    pair = pair[(pair['value'] >= np.quantile(pair['value'].to_numpy().flatten(), 1-top_rate))]
+    pair = pair[(pair['value'] >= np.quantile(pair['value'].to_numpy().flatten(), 1-(top_rate/100)))]
     
     ## Preprocess the data so that it can be converted into a graph format    
     if VALID:
@@ -78,10 +79,17 @@ def GAT_prior_knowledge(data_train, data_valid, data_test, params):
     edges_from = np.array(pair.iloc[:,0].values)
     edges_to = np.array(pair.iloc[:,1].values)
     
+    ## Group once by sample id instead of re-scanning the full melted dataframe with a
+    ## boolean mask on every loop iteration (O(n) instead of O(n^2) over samples).
+    train_groups = dict(tuple(data_QTL_melt_train.groupby('variable')))
+    if VALID:
+        valid_groups = dict(tuple(data_QTL_melt_valid.groupby('variable')))
+    test_groups = dict(tuple(data_QTL_melt_test.groupby('variable')))
+
     data_train = []
     for kk in range(data_pheno_train.shape[0]):
         tmp = Data()
-        data_QTL_melt_train_tmp = data_QTL_melt_train.loc[data_QTL_melt_train['variable']==kk].iloc[:,1:]
+        data_QTL_melt_train_tmp = train_groups[kk].iloc[:,1:]
         data_pheno_train_tmp = np.expand_dims(np.array(data_pheno_train[kk]),axis=0)
         edges_from_train_tmp, edges_to_train_tmp = edges_from, edges_to
         tmp.x = torch.from_numpy(data_QTL_melt_train_tmp.to_numpy(dtype=float)).to(torch.float)
@@ -94,7 +102,7 @@ def GAT_prior_knowledge(data_train, data_valid, data_test, params):
         data_valid = []
         for kk in range(data_pheno_valid.shape[0]):
             tmp = Data()
-            data_QTL_melt_valid_tmp = data_QTL_melt_valid.loc[data_QTL_melt_valid['variable']==kk].iloc[:,1:]
+            data_QTL_melt_valid_tmp = valid_groups[kk].iloc[:,1:]
             data_pheno_valid_tmp = np.expand_dims(np.array(data_pheno_valid[kk]),axis=0)
             edges_from_valid_tmp = edges_from
             edges_to_valid_tmp = edges_to
@@ -107,7 +115,7 @@ def GAT_prior_knowledge(data_train, data_valid, data_test, params):
     data_test = []
     for kk in range(data_pheno_test.shape[0]):
         tmp = Data()
-        data_QTL_melt_test_tmp = data_QTL_melt_test.loc[data_QTL_melt_test['variable']==kk].iloc[:,1:]
+        data_QTL_melt_test_tmp = test_groups[kk].iloc[:,1:]
         data_pheno_test_tmp = np.expand_dims(np.array(data_pheno_test[kk]),axis=0)
         edges_from_test_tmp = edges_from
         edges_to_test_tmp = edges_to

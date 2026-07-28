@@ -6,6 +6,9 @@ def data_conversion(chrom_info, gene_info, PHENOTYPE, RESULT_NAME):
     chromosome = pd.read_csv(chrom_info)
     chromosome_population = pd.unique(chromosome['population'])
     
+    chromosome['start'] =[int(round(chromosome.loc[k, 'start'])) for k in range(chromosome.shape[0])]
+    chromosome['end'] =[int(round(chromosome.loc[k, 'end'])) for k in range(chromosome.shape[0])]
+    
     for i in range(len(chromosome_population)):
         chromosome_selected = chromosome[chromosome['population']==chromosome_population[i]]
         chromosome_selected = chromosome_selected.drop(['population'],axis=1)
@@ -33,6 +36,7 @@ def data_conversion(chrom_info, gene_info, PHENOTYPE, RESULT_NAME):
 def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_adjust, POPULATION, WINDOW, RESULT_NAME, ASCENDING):
     
     chromosome = pd.read_csv('./Result/'+RESULT_NAME+'/chrom_'+str(POPULATION)+'.bed', delimiter='\t')
+    chromosome['chromosome'] = chromosome['chromosome'].astype(str)
     
     if WINDOW != 0:
         division = []
@@ -99,7 +103,7 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
                 merged['start'] = (merged['start'] - end_adjust).round().astype(int)
                 merged.loc[merged['start'] < 0, 'start'] = 0
                 merged['end'] = (merged['end'] + end_adjust).round().astype(int)
-                merged['chromosome'] = 'chr' + merged['chromosome'].astype(int).astype(str)
+                merged['chromosome'] = merged['chromosome'].astype(str)
                 
                 chromosome_total = pd.unique(merged['chromosome'])
                 
@@ -114,7 +118,7 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
                 effect_selected = pd.merge(effect_selected, marker, left_on=['index'], right_on=['name'])
                 effect_selected = effect_selected.loc[:,['chromosome','start','end','index','effect']]
 
-                effect_selected['chromosome'] = 'chr' + effect_selected['chromosome'].astype(int).astype(str)
+                effect_selected['chromosome'] = effect_selected['chromosome'].astype(str)
                 
                 effect_selected['range'] = (effect_selected['start'] + effect_selected['end'])/2
                 
@@ -122,7 +126,7 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
                 
                 for k in range(len(chromosome_total)):
                     effect_selected.loc[(effect_selected['chromosome']==chromosome_total[k]) & 
-                               (effect_selected['range'] > chromosome.loc[chromosome['chromosome']==chromosome_total[k],'end'].values[0]),'range'] = int(chromosome.loc[chromosome['chromosome']==chromosome_total[k], 'end'].values)
+                               (effect_selected['range'] > chromosome.loc[chromosome['chromosome']==chromosome_total[k],'end'].values[0]),'range'] = int(chromosome.loc[chromosome['chromosome']==chromosome_total[k], 'end'].values[0])
 
                 effect_selected = effect_selected.groupby(['chromosome',pd.cut((effect_selected['range']), bins=division)]).sum().drop(['start','end', 'range'],axis=1).reset_index(drop=False)
                 effect_selected = effect_selected.rename(columns={'range':'interval'})
@@ -199,14 +203,21 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, 
             
             start = pd.merge(interaction_selected['marker1'], loc_info, 'inner', left_on='marker1', right_on='name')
             end = pd.merge(interaction_selected['marker2'], loc_info, 'inner', left_on='marker2', right_on='name')
-            chrom_start = 'chr'+ start['chromosome'].astype(int).astype(str)
-            chrom_end = 'chr'+ end['chromosome'].astype(int).astype(str)
+            
+            start['start'] =[int(round(start.loc[k, 'start'])) for k in range(start.shape[0])]
+            start['end'] =[int(round(start.loc[k, 'end'])) for k in range(start.shape[0])]
+            end['start'] =[int(round(end.loc[k, 'start'])) for k in range(end.shape[0])]
+            end['end'] =[int(round(end.loc[k, 'end'])) for k in range(end.shape[0])]
+            
+            chrom_start = start['chromosome'].astype(str)
+            chrom_end = end['chromosome'].astype(str)
         
             interaction_selected = pd.concat([chrom_start, start.loc[:,['start','end']],
                                        chrom_end, end.loc[:,['start','end']],
                                        interaction_selected['value']],axis=1)
             interaction_selected.columns = ['chromosome_marker1', 'start','end','chromosome_marker2','start','end','value']
             interaction_selected['model'] = 'RF'
+
             interaction_selected_total = pd.concat([interaction_selected_total, interaction_selected])
         if attention_original.shape[0]!=0:
             models_GAT = attention_original['model'].unique().tolist()
@@ -220,7 +231,7 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, 
                 elif POPULATION != 'all' and attention_original.shape[0]!=0:
                     attention = attention_original[attention_original['model']==models_GAT[i]].reset_index(drop=False)
                     attention = attention.loc[:,['population','phenotype','marker1','marker2', 'value']]
-                    attention = attention_original[attention_original['population'].astype(str)==str(POPULATION)].reset_index(drop=False)
+                    attention = attention[attention['population'].astype(str)==str(POPULATION)].reset_index(drop=False)
                 attention = attention[(attention['marker1'] != 'factor') & (attention['marker2'] != 'factor')]
                 attention = attention.groupby(['phenotype','marker1','marker2'], as_index=False).mean(numeric_only=True)
                 
@@ -232,8 +243,14 @@ def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, 
                 
                 start = pd.merge(attention['marker1'], loc_info, 'inner', left_on='marker1', right_on='name')
                 end = pd.merge(attention['marker2'], loc_info, 'inner', left_on='marker2', right_on='name')
-                chrom_start = 'chr'+ start['chromosome'].astype(int).astype(str)
-                chrom_end = 'chr'+ end['chromosome'].astype(int).astype(str)
+                
+                start['start'] =[int(round(start.loc[k, 'start'])) for k in range(start.shape[0])]
+                start['end'] =[int(round(start.loc[k, 'end'])) for k in range(start.shape[0])]
+                end['start'] =[int(round(end.loc[k, 'start'])) for k in range(end.shape[0])]
+                end['end'] =[int(round(end.loc[k, 'end'])) for k in range(end.shape[0])]
+                
+                chrom_start = start['chromosome'].astype(str)
+                chrom_end = end['chromosome'].astype(str)
             
                 attention = pd.concat([chrom_start, start.loc[:,['start','end']],
                                            chrom_end, end.loc[:,['start','end']],

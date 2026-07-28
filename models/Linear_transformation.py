@@ -106,8 +106,10 @@ def Linear_transformation(data_train, data_valid, data_test, record, effect, wei
                 
             print(f'Epoch {epoch:>3} | Train Loss: {loss_train_sum/batch_size:.5f} | Valid Loss: {loss_valid_sum/batch_size_valid:.5f}')
         
-    ## Load the trained weights of the best model
-    model.load_state_dict(best_model_weights)
+    ## Load the trained weights of the best model (fall back to the last trained model's
+    ## weights if no validation improvement was ever recorded, e.g. all-NaN losses)
+    if best_model_weights is not None:
+        model.load_state_dict(best_model_weights)
     
     ## Evaluate model
     model.eval()

@@ -56,6 +56,15 @@ def Bayesian(data_train, data_valid, data_test, record, effect, weight, MODEL, H
         model_selected.remove('ensemble')
 
     ## Define the objective function to maximise based on the Diversity Prediction Theorem
+    ## Track the best weight vector ourselves as the optimiser evaluates it, rather than
+    ## reading it back afterwards from optimizer.max/optimizer.res: for this custom
+    ## multi-dimensional 'weights' parameter, those don't reliably reconstruct the full
+    ## length-len(model_selected) vector (it can come back as a single collapsed value
+    ## regardless of how many models are being weighted). The objective function itself
+    ## always receives the correct, full-length array on every call, so capturing it here
+    ## is the reliable source of truth.
+    best = {'target': -np.inf, 'weights': None}
+
     def optimisation(weights):
        
        second_term = data_valid.loc[:,model_selected+['actual']]
@@ -68,8 +77,13 @@ def Bayesian(data_train, data_valid, data_test, record, effect, weight, MODEL, H
        second_term = second_term.iloc[:,:-1].div(weights.sum(),axis=1).mean(axis=1)
        third_term = third_term.iloc[:,:-1].div(weights.sum(),axis=1).mean(axis=1)
        first_term = (second_term - third_term).mean()
+       
+       target = 1/first_term
+       if target > best['target']:
+           best['target'] = target
+           best['weights'] = np.asarray(weights, dtype=float).copy()
         
-       return 1/first_term
+       return target
 
     ## Define the parameters for the Bayesian optimisation
     #bounds_transformer = SequentialDomainReductionTransformer(minimum_window=0.2)
@@ -98,11 +112,9 @@ def Bayesian(data_train, data_valid, data_test, record, effect, weight, MODEL, H
         #acquisition_function=acquisition_function
     )
     
-    best_target, best_first_weight = optimizer.max['target'], optimizer.max['params']['weights']
-    res = optimizer.res
-    for i in range(len(res)):
-        if res[i]['target'] == best_target and res[i]['params']['weights'][0] == best_first_weight:
-            w = res[i]['params']['weights']
+    # w is the weight vector captured inside optimisation() above at the point it
+    # achieved the best target - guaranteed to be the correct, full-length array.
+    w = best['weights']
     
     ## Weight extraction
     weight_extracted = pd.DataFrame(w).T

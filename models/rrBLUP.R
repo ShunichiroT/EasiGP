@@ -7,8 +7,20 @@ library(dplyr)
 rrBLUP <- function(train, valid, test, params, RESULT_NAME){
   
   params <- unlist(params)
-  nIter <- params[1]
-  burnIn <-  params[2]
+  nIter <- as.numeric(params[1])
+  burnIn <- as.numeric(params[2])
+  # Control how strongly BRR shrinks marker effects towards zero. df0 is the
+  # prior degrees of freedom and R2 is the expected proportion of phenotypic
+  # variance explained by the markers; together they set the prior variance
+  # BGLR uses for the marker effects.
+  df0 <- as.numeric(params[3])
+  R2 <- as.numeric(params[4])
+
+  # A process-unique id for BGLR's saveAt path - prevents concurrent tasks in
+  # a parallel/HPC run (e.g. run_step1_batch.py array jobs) from colliding on
+  # the same intermediate-file prefix, which otherwise only depended on
+  # RESULT_NAME and was shared across every concurrent process.
+  run_id <- paste0(Sys.getpid(), '_', sample.int(.Machine$integer.max, 1))
   
   data <- rbind(train, valid, test)
   data_qtl <- data.frame(lapply(data[,1:(ncol(data)-1)], as.numeric))
@@ -22,8 +34,8 @@ rrBLUP <- function(train, valid, test, params, RESULT_NAME){
   y_test <- y
   y_test[(nrow(data)-(nrow(valid)+nrow(test))+1):nrow(data)] <- NA
   
-  fm <- BGLR(y=y_test,ETA=list(mrk=list(X=X,model='BRR')),
-             nIter=nIter,burnIn=burnIn,verbose=FALSE,saveAt=paste('./Result/',RESULT_NAME,'/brr_', sep = ""))
+  fm <- BGLR(y=y_test,ETA=list(mrk=list(X=X,model='BRR',df0=df0,R2=R2)),
+             nIter=nIter,burnIn=burnIn,verbose=FALSE,saveAt=paste('./Result/',RESULT_NAME,'/brr_',run_id,'_', sep = ""))
   
   y_predicted <- fm$yHat[(nrow(data)-nrow(test)+1):nrow(data)]
   y_actual <- y[(nrow(data)-nrow(test)+1):nrow(data)]
@@ -44,6 +56,10 @@ rrBLUP <- function(train, valid, test, params, RESULT_NAME){
   
   effect <- data.frame(t(fm[["ETA"]][["mrk"]][["b"]]))
 
-  return(list(pearson, MSE, effect, y_predicted, y_predicted_valid, y_predicted_train))
-  
+  return(list(r_pearson=pearson, 
+              r_MSE=MSE, 
+              r_effect=effect, 
+              r_y_predicted=y_predicted, 
+              r_y_predicted_valid=y_predicted_valid, 
+              r_y_predicted_train=y_predicted_train))           
 }

@@ -29,12 +29,21 @@ class CSVDataset(Dataset):
 
 class MLP(Module):
     # define model elements
-    def __init__(self, n_inputs, neurons, dout):
+    def __init__(self, n_inputs, neurons, dout, neurons2=None):
         super(MLP, self).__init__()
 
         self.hidden1 = Linear(n_inputs, neurons)
-        self.dropout = Dropout(dout) 
-        self.hidden2 = Linear(neurons,1)
+        self.dropout = Dropout(dout)
+        # Optional second hidden layer - off by default (neurons2=None/0),
+        # which reproduces the original single-hidden-layer architecture
+        # exactly. Set neurons2 to a positive number of units to add a
+        # second Linear+Dropout+ReLU block before the output layer.
+        if neurons2:
+            self.hidden_extra = Linear(neurons, int(neurons2))
+            self.hidden2 = Linear(int(neurons2), 1)
+        else:
+            self.hidden_extra = None
+            self.hidden2 = Linear(neurons, 1)
  
     # forward propaMLPe input
     def forward(self, X):
@@ -42,6 +51,10 @@ class MLP(Module):
         X = self.hidden1(X)
         X = self.dropout(X)
         X = F.relu(X)
+        if self.hidden_extra is not None:
+            X = self.hidden_extra(X)
+            X = self.dropout(X)
+            X = F.relu(X)
         X = self.hidden2(X)
 
         return X
@@ -55,7 +68,11 @@ def ML_Perceptron(train, valid, test, params):
     decay = params[3]
     ep = int(params[4])
     bsize = int(params[5])
-    shapley_num = params[6]
+    # Size of an additional second hidden layer. None/0 keeps the original
+    # single-hidden-layer architecture unchanged; a positive number adds a
+    # second Linear+Dropout+ReLU block.
+    neurons2 = params[6]
+    shapley_num = params[7]
     
     train_data = CSVDataset(train)
     if valid.shape[0] != 0:
@@ -67,7 +84,7 @@ def ML_Perceptron(train, valid, test, params):
         valid_loader = DataLoader(valid_data, batch_size=bsize, shuffle=False)
     test_loader = DataLoader(test_data, batch_size=bsize, shuffle=False)
     
-    model = MLP(train.shape[1]-1, neurons, dout)
+    model = MLP(train.shape[1]-1, neurons, dout, neurons2)
    
     optimizer = torch.optim.Adam(model.parameters(), lr=lrate, weight_decay=decay) #0.0005
    

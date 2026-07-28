@@ -26,8 +26,8 @@ def GAT_fully_connected(data_train, data_valid, data_test, params):
     epoch = params[4]
     bsize = params[5]
     heads = params[6]
-    samples = params[7]
-    marker_effect = params[8]
+    marker_effect = params[7]
+    samples = params[8]
     
     ## Preprocess the data so that it can be converted into a graph format    
     if VALID:
@@ -74,10 +74,17 @@ def GAT_fully_connected(data_train, data_valid, data_test, params):
     data_QTL_melt_test = pd.concat([data_QTL_melt_test,pd.concat([dummy]*int(data_QTL_melt_test.shape[0]/dummy.shape[0])).reset_index(drop=True)],axis=1)
  
     ## Create graphs
+    ## Group once by sample id instead of re-scanning the full melted dataframe with a
+    ## boolean mask on every loop iteration (O(n) instead of O(n^2) over samples).
+    train_groups = dict(tuple(data_QTL_melt_train.groupby('variable')))
+    if VALID:
+        valid_groups = dict(tuple(data_QTL_melt_valid.groupby('variable')))
+    test_groups = dict(tuple(data_QTL_melt_test.groupby('variable')))
+
     data_train = []
     for kk in range(data_pheno_train.shape[0]):
         tmp = Data()
-        data_QTL_melt_train_tmp = data_QTL_melt_train.loc[data_QTL_melt_train['variable']==kk].iloc[:,1:]#.reset_index(drop=True)
+        data_QTL_melt_train_tmp = train_groups[kk].iloc[:,1:]
         data_pheno_train_tmp = np.expand_dims(np.array(data_pheno_train[kk]),axis=0)
         edges_from_train_tmp = edges_from_train[:data_QTL_train.shape[1]*data_QTL_train.shape[1]]
         edges_to_train_tmp = edges_to_train[:data_QTL_train.shape[1]*data_QTL_train.shape[1]]
@@ -90,7 +97,7 @@ def GAT_fully_connected(data_train, data_valid, data_test, params):
         data_valid = []
         for kk in range(data_pheno_valid.shape[0]):
             tmp = Data()
-            data_QTL_melt_valid_tmp = data_QTL_melt_valid.loc[data_QTL_melt_valid['variable']==kk].iloc[:,1:]
+            data_QTL_melt_valid_tmp = valid_groups[kk].iloc[:,1:]
             data_pheno_valid_tmp = np.expand_dims(np.array(data_pheno_valid[kk]),axis=0)
             edges_from_valid_tmp = edges_from_valid[:data_QTL_valid.shape[1]*data_QTL_valid.shape[1]]
             edges_to_valid_tmp = edges_to_valid[:data_QTL_valid.shape[1]*data_QTL_valid.shape[1]]
@@ -102,7 +109,7 @@ def GAT_fully_connected(data_train, data_valid, data_test, params):
     data_test = []
     for kk in range(data_pheno_test.shape[0]):
         tmp = Data()
-        data_QTL_melt_test_tmp = data_QTL_melt_test.loc[data_QTL_melt_test['variable']==kk].iloc[:,1:]#.reset_index(drop=True)
+        data_QTL_melt_test_tmp = test_groups[kk].iloc[:,1:]
         data_pheno_test_tmp = np.expand_dims(np.array(data_pheno_test[kk]),axis=0)
         edges_from_test_tmp = edges_from_test[:data_QTL_test.shape[1]*data_QTL_test.shape[1]]
         edges_to_test_tmp = edges_to_test[:data_QTL_test.shape[1]*data_QTL_test.shape[1]]

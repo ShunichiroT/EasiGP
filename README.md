@@ -30,44 +30,56 @@ The comparison of the inferred genomic marker effects with known key genome regi
 
 - main_parallel.py: the top function that manages the implementation of this tool. Users can modify the settings and hyperparameters to customise this tool based on their requirements. Multiple prediction tasks are processed in parallel using HPC or a distributed computing system
 
-## Procedure
-1. Download EasiGP
-   - https://github.com/ShunichiroT/EasiGP/archive/refs/heads/main.zip
-2. Develop an environment using the "environment.yml" file
-   - It is recommended to use Anaconda for the environment development:
-          ```
-          conda env create -f environment.yml
-          ```
-        - It is recommended that the R version is 4.4.0 or higher, especially for Windows (install R from here if needed: https://cran.r-project.org/)
-        - Check "Creating an environment from an environment.yml file" for the procedure in detail (https://docs.conda.io/projects/conda/en/latest/user-guide/tasks/manage-environments.html)
-        - Change the path of the prefix based on your folder location of Anaconda  
-3. Prepare the relevant data in the specified format
-   - Genotype data (csv)
-        - Columns: ID, population and genomic markers
-        - Rows: Records
-   - Phenotype data (csv)
-        - Columns: ID, population and phenotypes
-        - Rows: records
-   - Chromosome data (csv)
-        - Columns: chromosome, start, end and population
-        - Rows: chromosomes
-   - Key gene region (csv)
-        - Columns: chromosome, start, end, name, colour, source, phenotype and population
-        - Rows: genes
-   - Marker data (csv)
-        - Columns: chromosome, name, start, end
-        - Rows: markers
-   - Check the Data folder for more details on formatting and examples
-4. Adjust settings and hyperparameters in the "main" function
-   - Check the comments corresponding to each hyperparameter, explaining the meaning of each
-   - Change the value of each hyperparameter based on your prediction tasks and preference for the visualisation of circos plots
-       - Set target traits, the training-test split ratio, the number of iterations, target populations, dataset name and genomic prediction models to run as the initial setting
-       - Change the hyperparameters of the chosen models if needed
-       - Set paths for relevant geneomic marker information datasets, visualisation configuration and colour palette for circos plots
-    - Note: for the marker data, a circos plot may not be able to show marker effects correctly if the interval between start and end is small. Please adjust the "end_adjust" parameter to increase the interval size 
-5. Run the "main.py" file to implement the "GP" and "circos_plot" functions
-   - If you want to run genomic prediction models in a parallel way, run the "main_parallel_1.py" and "main_parallel_2.py" in a sequential order
-6. Check and analyse the generated output files in the Result folder 
+
+## EasiGP setup procedure
+
+### For laptop
+
+1. Clone the EasiGP folder from GitHub (https://github.com/ShunichiroT/EasiGP) and store it locally.
+2. Convert the format of your genotype/phenotype data into the format EasiGP requires (details: https://github.com/ShunichiroT/EasiGP/tree/main/Data).
+3. Start Anaconda and create an Anaconda environment using the provided yml file:
+   - Windows (use Anaconda Prompt): `conda env create -f environment_windows.yml`
+   - Mac / Linux (use Terminal): `conda activate` and `conda env create -f environment_linux.yml`
+5. Activate the environment you just created: `conda activate EasiGP`
+6. Change directory to the main EasiGP folder: `cd <YOUR PATH TO EasiGP>/EasiGP`
+7. Run: `streamlit run main_app.py --server.port 8501`
+   a. If port 8501 is already in use, change it to another free port.
+8. Your default browser should open automatically to the GUI.
+   - If it doesn't open automatically, copy the local URL printed in the terminal (e.g. `http://localhost:8501`) into your browser.
+9. Complete the configuration in the GUI and run the pipeline.
+10. Before using LD pruning: this feature requires `plink2` to be installed and available on your PATH (or point the GUI at its executable path directly).
+
+### For HPC
+
+1. Clone the EasiGP folder from GitHub (https://github.com/ShunichiroT/EasiGP), log in to your HPC, and store it there.
+2. Convert the format of your genotype/phenotype data into the format EasiGP requires (details: https://github.com/ShunichiroT/EasiGP/tree/main/Data).
+3. Activate Anaconda (e.g. `module load anaconda3`).
+4. Create an Anaconda environment using the provided yml file: `conda env create -f environment_linux.yml`
+5. Activate the environment you just created: `conda activate EasiGP`
+6. Change directory to the main EasiGP folder: `cd <YOUR PATH TO EasiGP>/EasiGP`
+7. Submit a job for interactive mode, e.g. for Slurm:
+   ```
+   salloc --nodes=<NODE_NUMBER; e.g. 1> --ntasks-per-node=<TASK_NUMBER; e.g. 1> \
+     --cpus-per-task=<CPU_NUMBER; e.g. 1> --mem=<MEMORY; e.g. 10G> \
+     --job-name=<YOUR JOB NAME> --time=<ALLOCATED TIME; e.g. 01:00:00> \
+     --partition=<YOUR PARTITION; e.g. general> --account=<YOUR GROUP> \
+     srun --export=PATH,TERM,HOME,LANG --pty /bin/bash -l
+   ```
+8. Once the interactive job starts running, run: `streamlit run main_app.py --server.port 8501 --server.headless true`
+   a. If port 8501 is already in use, change it to another free port.
+   b. Note the compute node name shown by the scheduler (e.g. in your shell prompt, or via `squeue --me`) - you'll need it in the next step.
+9. From your **local machine**, open a new terminal and set up an SSH tunnel to that compute node:
+   ```
+   ssh -N -L 8501:<COMPUTE_NODE_NAME>:8501 <YOUR_ACCOUNT>@<YOUR_HPC_LOGIN_ADDRESS>
+   ```
+   For example, on UQ's Bunya cluster: `ssh -N -L 8501:bun128:8501 USERNAME@bunya.rcc.uq.edu.au`
+10. Open the local URL in your browser (e.g. `http://localhost:8501`).
+11. Complete the configuration in the GUI, then use the "Generate and save job files" option to create the submission script and its config JSON file.
+12. Log in to the HPC using another terminal (separate from the tunnel in step 9, which must stay open only as long as you're using the GUI).
+13. Change directory to the main EasiGP folder: `cd <YOUR PATH TO EasiGP>/EasiGP`
+14. Submit the job file created in step 11 (e.g. `sbatch <script name>.sh` for Slurm).
+15. Before using LD pruning: this feature requires `plink2` to be installed and available on your PATH (or point the GUI at its executable path directly).
+    - Yo can also activate your module on HPC if available (e.g. `module load plink`)
 
 ## References
 Buckler ES, Holland JB, Bradbury PJ, Acharya CB, Brown PJ, Browne C, Ersoz E, Flint-Garcia S, Garcia A, 464 Glaubitz JC et al. 2009. The genetic architecture of maize flowering time. Science. 325:714–718.
