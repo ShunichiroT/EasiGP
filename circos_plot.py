@@ -16,8 +16,13 @@ def data_conversion(chrom_info, gene_info, PHENOTYPE, RESULT_NAME):
     
     if gene_info is not None:
         gene = pd.read_csv(gene_info)
+
+        gene['start'] =[int(round(gene.loc[k, 'start'])) for k in range(gene.shape[0])]
+        gene['end'] =[int(round(gene.loc[k, 'end'])) for k in range(gene.shape[0])]
+
         gene_population = pd.unique(gene['population'])
         gene_source = pd.unique(gene['source'])
+
         for i in range(len(PHENOTYPE)):
             for j in range(len(gene_population)):
                 for k in range(len(gene_source)):
