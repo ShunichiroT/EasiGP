@@ -166,9 +166,9 @@ def resolve_batch_id_from_env():
     )
 
 
-def restore_ratio(ratio, scenario):
+def restore_ratio(ratio, w_opt):
     """JSON turns (train, valid, test) tuples into plain lists; restore
     tuples when the 'between' scenario needs them. No-op otherwise."""
-    if scenario == 'between':
+    if w_opt is not None:
         return [tuple(item) if isinstance(item, list) else item for item in ratio]
     return ratio

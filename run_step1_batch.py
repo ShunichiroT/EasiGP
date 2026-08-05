@@ -93,7 +93,7 @@ def main():
     # Imported after R/rpy2 setup so R_HOME/PATH are already correct.
     from genomic_prediction import GP
 
-    ratio = restore_ratio(cfg['RATIO'], cfg['SCENARIO'])
+    ratio = restore_ratio(cfg['RATIO'], cfg['W_OPT'])
 
     print(f"[run_step1_batch] RESULT_NAME={cfg['RESULT_NAME']} "
           f"batch_id={batch_id} batch_size={batch_size} models={cfg['MODEL']}")
