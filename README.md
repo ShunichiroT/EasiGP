@@ -63,7 +63,7 @@ The comparison of the inferred genomic marker effects with known key genome regi
    ```
 4. Once the interactive job starts running, activate Anaconda (e.g. `module load anaconda3`).
 5. Create an Anaconda environment using the provided yml file: `conda env create -f environment_linux.yml`.
-6. Activate the environment you just created if it is not: `conda activate EasiGP
+6. Activate the environment you just created if it is not: `conda activate EasiGP`
 7. Change directory to the main EasiGP folder: `cd <YOUR PATH TO EasiGP>/EasiGP`
 8. Run: `streamlit run main_app.py --server.port 8501 --server.headless true`
    a. If port 8501 is already in use, change it to another free port.
