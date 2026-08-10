@@ -53,11 +53,7 @@ The comparison of the inferred genomic marker effects with known key genome regi
 
 1. Clone the EasiGP folder from GitHub (https://github.com/ShunichiroT/EasiGP), log in to your HPC, and store it there.
 2. Convert the format of your genotype/phenotype data into the format EasiGP requires (details: https://github.com/ShunichiroT/EasiGP/tree/main/Data).
-3. Activate Anaconda (e.g. `module load anaconda3`).
-4. Create an Anaconda environment using the provided yml file: `conda env create -f environment_linux.yml`
-5. Activate the environment you just created: `conda activate EasiGP`
-6. Change directory to the main EasiGP folder: `cd <YOUR PATH TO EasiGP>/EasiGP`
-7. Submit a job for interactive mode, e.g. for Slurm:
+3. Submit a job for interactive mode, e.g. for Slurm:
    ```
    salloc --nodes=<NODE_NUMBER; e.g. 1> --ntasks-per-node=<TASK_NUMBER; e.g. 1> \
      --cpus-per-task=<CPU_NUMBER; e.g. 1> --mem=<MEMORY; e.g. 10G> \
@@ -65,7 +61,11 @@ The comparison of the inferred genomic marker effects with known key genome regi
      --partition=<YOUR PARTITION; e.g. general> --account=<YOUR GROUP> \
      srun --export=PATH,TERM,HOME,LANG --pty /bin/bash -l
    ```
-8. Once the interactive job starts running, run: `streamlit run main_app.py --server.port 8501 --server.headless true`
+4. Once the interactive job starts running, activate Anaconda (e.g. `module load anaconda3`).
+5. Create an Anaconda environment using the provided yml file: `conda env create -f environment_linux.yml`.
+6. Activate the environment you just created if it is not: `conda activate EasiGP
+7. Change directory to the main EasiGP folder: `cd <YOUR PATH TO EasiGP>/EasiGP`
+8. Run: `streamlit run main_app.py --server.port 8501 --server.headless true`
    a. If port 8501 is already in use, change it to another free port.
    b. Note the compute node name shown by the scheduler (e.g. in your shell prompt, or via `squeue --me`) - you'll need it in the next step.
 9. From your **local machine**, open a new terminal and set up an SSH tunnel to that compute node:
