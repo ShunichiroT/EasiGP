@@ -73,7 +73,10 @@ A few concepts worth knowing before you start, if you haven't used these before:
 
 #### Getting the image file
 
-You'll need a copy of `EasiGP.tar` (Full version) or `EasiGP_light.tar` (Light version). These files are typically several gigabytes, too large to email, so they're usually shared via a direct file transfer instead - a USB drive, a shared network drive, a cloud storage link, or (on HPC) a `scp`/`rsync` upload to your own account. Ask whoever prepared the image for you how to get a copy, or see "Building the image files yourself" below if you're preparing one for others.
+EasiGP's ready-made images are published on [Docker Hub](https://hub.docker.com/repository/docker/shunichirot/easigp/general) rather than distributed as downloadable files directly from GitHub - the images are several gigabytes each (over 2GB), too large for GitHub to host directly. That Docker Hub page shows the exact tags available for the Full and Light versions, and the exact `docker pull` command to use for each - you'll need this for the steps below, wherever you see `<TAG>` (Full version) or `<LIGHT TAG>` (Light version).
+
+- On a **local PC**, using Docker (below), you pull the image directly from that page - no separate download or `.tar` file needed at all.
+- On **HPC**, using Apptainer (below), you can often build directly from Docker Hub too, the same way - a `.tar` file is only needed as a fallback, for an HPC whose login/build environment doesn't have internet access, or if you'd simply rather transfer the image over yourself. See that section for exactly how to create one, if you need it.
 
 #### Getting a Claude Code access token (Full version only)
 
@@ -88,55 +91,67 @@ This token works with either an API-billed Anthropic account or a Claude subscri
 #### For a local PC/laptop, using Docker
 
 1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) if you don't already have it, and make sure it's running.
-2. Open a terminal (**Command Prompt** or **PowerShell** on Windows; **Terminal** on Mac/Linux) and navigate to the folder containing your `.tar` file, e.g. `cd Downloads`.
-3. Load the image:
-   - Full version: `docker load -i EasiGP.tar`
-   - Light version: `docker load -i EasiGP_light.tar`
+2. Open a terminal (**Command Prompt** or **PowerShell** on Windows; **Terminal** on Mac/Linux).
+3. Pull the image directly from Docker Hub - see "Getting the image file" above for the exact tag to use in place of `<TAG>`/`<LIGHT TAG>` below:
+   - Full version: `docker pull shunichirot/easigp:<TAG>`
+   - Light version: `docker pull shunichirot/easigp:<LIGHT TAG>`
 
-   This can take a few minutes the first time.
+   This downloads several gigabytes, so it can take a while the first time - you only need to repeat it when a new version is released.
 4. Run it:
    - Full version:
      ```
-     docker run -p 8501:8501 -it -e CLAUDE_CODE_OAUTH_TOKEN=<YOUR TOKEN> easigp streamlit run main_app.py --server.address=0.0.0.0 --server.port=8501
+     docker run -p 8501:8501 -it -e CLAUDE_CODE_OAUTH_TOKEN=<YOUR TOKEN> shunichirot/easigp:<TAG> streamlit run main_app.py --server.address=0.0.0.0 --server.port=8501
      ```
    - Light version:
      ```
-     docker run -p 8501:8501 -it easigp streamlit run main_app.py --server.address=0.0.0.0 --server.port=8501
+     docker run -p 8501:8501 -it shunichirot/easigp:<LIGHT TAG> streamlit run main_app.py --server.address=0.0.0.0 --server.port=8501
      ```
    (If port 8501 is already in use on your machine, change *both* `8501`s before the colon-separated pair, e.g. `-p 8502:8501`, and use that new port number in the next step instead.)
 5. Once you see EasiGP's own startup messages in the terminal, open your browser and go to `http://localhost:8501` (or whichever port you chose in step 4).
 6. When you're done, press `Ctrl+C` in the terminal to stop the container.
 
-Any files EasiGP creates (results, generated networks, etc.) live inside the container and are lost when it stops, unless you mount a folder from your own computer into it - add `-v "<PATH ON YOUR COMPUTER>":/workspace/data` to the `docker run` command above (before `easigp`) to keep a folder in sync, e.g. `-v "$(pwd)/data":/workspace/data` on Mac/Linux or `-v "${PWD}\data":/workspace/data` in PowerShell.
+Any files EasiGP creates (results, generated networks, etc.) live inside the container and are lost when it stops, unless you mount a folder from your own computer into it - add `-v "<PATH ON YOUR COMPUTER>":/workspace/data` to the `docker run` command above (before `shunichirot/easigp:<TAG>`) to keep a folder in sync, e.g. `-v "$(pwd)/data":/workspace/data` on Mac/Linux or `-v "${PWD}\data":/workspace/data` in PowerShell.
 
 #### For HPC, using Apptainer
 
-Apptainer builds a **sandbox** - an extracted, folder-based copy of the image - from your tar file, then runs EasiGP from that sandbox. Do this once per tar file; you can reuse the same sandbox for every future session.
+Apptainer builds a **sandbox** - an extracted, folder-based copy of the image - then runs EasiGP from that sandbox. Do this once; you can reuse the same sandbox for every future session.
 
 1. Log in to your HPC and make sure Apptainer is available (try `apptainer --version`; if that fails, check your HPC's documentation for how to load it, e.g. `module load apptainer`).
-2. Upload your `.tar` file to your HPC account if it isn't already there (e.g. via `scp`/`rsync`, or your HPC's own file-transfer tool).
-3. Build the sandbox:
-   - Full version:
+2. Build the sandbox - see "Getting the image file" above for the exact tag to use in place of `<TAG>`/`<LIGHT TAG>` below. There are two ways to do this, depending on whether your HPC's login node has outbound internet access (many do; some, especially compute nodes, don't):
+
+   **a. Directly from Docker Hub (simplest - try this first):**
+   ```
+   mkdir -p /scratch/user/$USER/EasiGP
+   apptainer build --sandbox /scratch/user/$USER/EasiGP docker://shunichirot/easigp:<TAG>
+   ```
+   (Light version: replace both `EasiGP` in the paths with `EasiGP_light`, and `<TAG>` with `<LIGHT TAG>`.) If this works, skip straight to step 3 below.
+
+   **b. Via a `.tar` file (if step a fails, or your login node has no internet access):**
+   - On a *different* computer that has both internet access and Docker installed - your own laptop is usually easiest - download and re-package the image as a single file:
+     ```
+     docker pull shunichirot/easigp:<TAG>
+     docker save -o EasiGP.tar shunichirot/easigp:<TAG>
+     ```
+     (Light version: use `<LIGHT TAG>` and name the file `EasiGP_light.tar` instead.) This file will be several gigabytes - the same size as the image itself.
+   - Transfer that `.tar` file to your HPC account (e.g. via `scp`/`rsync`, or your HPC's own file-transfer tool) - it doesn't need to go anywhere special, just somewhere in your own storage.
+   - Build the sandbox from it:
      ```
      mkdir -p /scratch/user/$USER/EasiGP
-     apptainer build --sandbox /scratch/user/$USER/EasiGP docker-archive:///scratch/user/$USER/EasiGP.tar
+     apptainer build --sandbox /scratch/user/$USER/EasiGP docker-archive:///path/to/EasiGP.tar
      ```
-   - Light version:
-     ```
-     mkdir -p /scratch/user/$USER/EasiGP_light
-     apptainer build --sandbox /scratch/user/$USER/EasiGP_light docker-archive:///scratch/user/$USER/EasiGP_light.tar
-     ```
-   (Adjust `/scratch/user/$USER/...` if your HPC uses a different path for your own storage - `$USER` fills in your own username automatically, so you shouldn't need to type it yourself. Point the last part of each command at wherever you actually uploaded the `.tar` file in step 2, if that's different.)
+     (Light version: replace `EasiGP` in the paths with `EasiGP_light`, and point the last part at `EasiGP_light.tar` instead.) Replace `/path/to/EasiGP.tar` with wherever you actually uploaded it.
 
-   This can take a while the first time - it's unpacking the whole image.
-4. Start an interactive job on a compute node first (running Apptainer directly on the login node is usually against HPC policy) - check your own HPC's documentation for the right command, since this varies between clusters. For example, for Slurm:
+   (Adjust `/scratch/user/$USER/...` if your HPC uses a different path for your own storage - `$USER` fills in your own username automatically, so you shouldn't need to type it yourself.)
+
+   Either way, this can take a while the first time - it's unpacking the whole image.
+3. Start an interactive job on a compute node first (running Apptainer directly on the login node is usually against HPC policy) - check your own HPC's documentation for the right command, since this varies between clusters. For example, for Slurm:
    ```
    salloc --nodes=1 --ntasks-per-node=1 --cpus-per-task=1 --mem=10G \
      --job-name=EasiGP --time=01:00:00 \
      --partition=<YOUR PARTITION> --account=<YOUR GROUP> \
      srun --export=PATH,TERM,HOME,LANG --pty /bin/bash -l
    ```
-5. Once your interactive job is running, run the container:
+4. Once your interactive job is running, run the container:
    - Full version - generate a Claude Code access token first (see "Getting a Claude Code access token" above), then:
      ```
      export APPTAINERENV_CLAUDE_CODE_OAUTH_TOKEN="<YOUR TOKEN>"
@@ -151,26 +166,26 @@ Apptainer builds a **sandbox** - an extracted, folder-based copy of the image - 
      streamlit run main_app.py --server.address=0.0.0.0 --server.port=8501
      ```
    Note the compute node name shown by the scheduler (e.g. in your shell prompt, or via `squeue --me`) - you'll need it next.
-6. From your **local machine** (not the HPC), open a new terminal and set up an SSH tunnel to that compute node:
+5. From your **local machine** (not the HPC), open a new terminal and set up an SSH tunnel to that compute node:
    ```
    ssh -N -L 8501:<COMPUTE_NODE_NAME>:8501 <YOUR_ACCOUNT>@<YOUR_HPC_LOGIN_ADDRESS>
    ```
    For example, on UQ's Bunya cluster: `ssh -N -L 8501:bun128:8501 USERNAME@bunya.rcc.uq.edu.au`. Leave this terminal open for as long as you're using EasiGP.
-7. Open `http://localhost:8501` in your browser.
-8. When you're done, close the browser tab, stop the SSH tunnel (`Ctrl+C` in that terminal), and end your interactive job (`exit`, or however your scheduler expects you to release it).
+6. Open `http://localhost:8501` in your browser.
+7. When you're done, close the browser tab, stop the SSH tunnel (`Ctrl+C` in that terminal), and end your interactive job (`exit`, or however your scheduler expects you to release it).
 
 ##### Bunya (UQ) or Gadi (NCI) users: an easier option using a virtual desktop
 
-If you're on UQ's Bunya or NCI's Gadi, there's a simpler alternative to steps 4-8 above: both offer a **virtual desktop** - a full graphical Linux desktop, running on a compute node, that opens directly in your own browser. Since your browser and the compute node running EasiGP end up in the same place, this skips the separate interactive-job and SSH-tunnel steps entirely - you just open a terminal *inside* the virtual desktop for step 3 and 5 above, then open a second browser tab (e.g. Firefox) *inside that same desktop* for step 7, instead of tunnelling back to your own machine.
+If you're on UQ's Bunya or NCI's Gadi, there's a simpler alternative to steps 3-7 above: both offer a **virtual desktop** - a full graphical Linux desktop, running on a compute node, that opens directly in your own browser. Since your browser and the compute node running EasiGP end up in the same place, this skips the separate interactive-job and SSH-tunnel steps entirely - you just open a terminal *inside* the virtual desktop for step 2 and 4 above, then open a second browser tab (e.g. Firefox) *inside that same desktop* for step 6, instead of tunnelling back to your own machine.
 
-- **Bunya**: go to [onBunya](https://bunya-ondemand.rcc.uq.edu.au/pun/sys/dashboard) and launch a desktop session from **Interactive Apps** (see UQ RCC's [OnDemand Guide](https://github.com/UQ-RCC/hpc-docs/blob/main/guides/OnDemand-Guide.md) for the full walkthrough). This already *is* your interactive job, so step 4 above isn't needed - open a terminal from within the desktop and continue from step 3.
+- **Bunya**: go to [onBunya](https://bunya-ondemand.rcc.uq.edu.au/pun/sys/dashboard) and launch a desktop session from **Interactive Apps** (see UQ RCC's [OnDemand Guide](https://github.com/UQ-RCC/hpc-docs/blob/main/guides/OnDemand-Guide.md) for the full walkthrough). This already *is* your interactive job, so step 3 above isn't needed - open a terminal from within the desktop and continue from step 2.
   - If you've separately set up EasiGP's conda environment on Bunya (Option B below) and added conda's own initialisation to your `.bashrc`, onBunya's own desktop sessions won't start until that's removed (`conda init --reverse`) - see UQ RCC's guide for details. This doesn't apply to the Apptainer route described here on its own.
-- **Gadi**: go to the [Australian Research Environment (ARE)](https://are.nci.org.au/) and launch a **VDI** (Virtual Desktop Infrastructure) session (see this [Gadi/ARE platform guide](https://acdguide.github.io/BigData/platforms/platforms-nci-gadi.html) for more background). Open a terminal from within the desktop and continue from step 3.
-  - Gadi's compute nodes (including VDI sessions) typically don't have general internet access - this doesn't affect the Light version at all, but may prevent the Full version's Claude Code/FLASH-P (Mitsanis et al., 2026) features from reaching Anthropic's API from inside a VDI session. Check with NCI if you specifically need internet access from a VDI session for this.
+- **Gadi**: go to the [Australian Research Environment (ARE)](https://are.nci.org.au/) and launch a **VDI** (Virtual Desktop Infrastructure) session (see this [Gadi/ARE platform guide](https://acdguide.github.io/BigData/platforms/platforms-nci-gadi.html) for more background). Open a terminal from within the desktop and continue from step 2.
+  - Gadi's compute nodes (including VDI sessions) typically don't have general internet access - this doesn't affect the Light version at all, but may prevent the Full version's Claude Code/FLASH-P (Mitsanis et al., 2026) features from reaching Anthropic's API from inside a VDI session, and may also mean option 2a above (building directly from Docker Hub) doesn't work from a VDI session either, even though it might from the login node - option 2b (via a `.tar` file) always works regardless. Check with NCI if you specifically need internet access from a VDI/compute-node session for this.
 
 #### Building the image files yourself
 
-If you're the one preparing `EasiGP.tar`/`EasiGP_light.tar` for others (e.g. you have the EasiGP Dockerfile and want to build fresh images), see the Dockerfile's own comments for the exact `docker build` commands, including the `--build-arg INSTALL_FLASHP=false` option used to produce the Light version. Once built, `docker save -o EasiGP.tar easigp` produces the tar file used in the steps above.
+If you're the one preparing/publishing these images (e.g. you have the EasiGP Dockerfile and want to build and push fresh ones to Docker Hub), see the Dockerfile's own comments for the exact `docker build` commands, including the `--build-arg INSTALL_FLASHP=false` option used to produce the Light version.
 
 ---
 
