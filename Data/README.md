@@ -1,6 +1,6 @@
 ## Description
 
-This folder contains two folders containing example base files to implement both genomic prediction and circos plot generation functions.
+This folder contains three folders containing example base files to implement both genomic prediction and circos plot generation functions.
 
 * TeoNAM folder contains adjusted example data from the TeoNAM dataset (Chen et al.,2019), accompanied by key genomic marker information for flowering (Dong et al., 2012; Wisser et al., 2019)
 * Arabidopsis folder contains adjusted example data from the 1001 Genomes Consortium (2016), Grimm et al. (2017) and Gibbs et al. (2025), accompanied by key genomic marker information for flowering and branching (Arabidopsis Information Resource (TAIR); https://www.arabidopsis.org/)
