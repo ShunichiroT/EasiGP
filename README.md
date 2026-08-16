@@ -73,7 +73,7 @@ A few concepts worth knowing before you start, if you haven't used these before:
 
 #### Getting the image file
 
-EasiGP's ready-made images are published on [Docker Hub](https://hub.docker.com/repository/docker/shunichirot/easigp/general) rather than distributed as downloadable files directly from GitHub - the images are several gigabytes each (over 2GB), too large for GitHub to host directly. That Docker Hub page shows the exact tags available for the Full and Light versions, and the exact `docker pull` command to use for each - you'll need this for the steps below, wherever you see `<TAG>` (Full version) or `<LIGHT TAG>` (Light version).
+EasiGP's ready-made images are published on [Docker Hub](https://hub.docker.com/r/shunichirot/easigp/tags) rather than distributed as downloadable files directly from GitHub - the images are several gigabytes each (over 2GB), too large for GitHub to host directly. That Docker Hub page shows the exact tags available for the Full and Light versions, and the exact `docker pull` command to use for each - you'll need this for the steps below, wherever you see `v1` (Full version) or `v1_light` (Light version).
 
 - On a **local PC**, using Docker (below), you pull the image directly from that page - no separate download or `.tar` file needed at all.
 - On **HPC**, using Apptainer (below), you can often build directly from Docker Hub too, the same way - a `.tar` file is only needed as a fallback, for an HPC whose login/build environment doesn't have internet access, or if you'd simply rather transfer the image over yourself. See that section for exactly how to create one, if you need it.
@@ -84,7 +84,7 @@ The Full version's Claude Code integration needs to authenticate with Anthropic,
 
 1. Install Claude Code there if you haven't already (see [Anthropic's Claude Code documentation](https://docs.claude.com) for installation instructions).
 2. Run `claude setup-token` and follow the prompts to log in.
-3. Copy the token it prints out - you'll paste this in below, wherever you see `<YOUR TOKEN>`. Keep it private; treat it like a password.
+3. Copy the token it prints out - you'll paste this in below, wherever you see `YOUR TOKEN`. Keep it private; treat it like a password.
 
 This token works with either an API-billed Anthropic account or a Claude subscription (Pro/Max/Team/Enterprise).
 
@@ -92,47 +92,47 @@ This token works with either an API-billed Anthropic account or a Claude subscri
 
 1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) if you don't already have it, and make sure it's running.
 2. Open a terminal (**Command Prompt** or **PowerShell** on Windows; **Terminal** on Mac/Linux).
-3. Pull the image directly from Docker Hub - see "Getting the image file" above for the exact tag to use in place of `<TAG>`/`<LIGHT TAG>` below:
-   - Full version: `docker pull shunichirot/easigp:<TAG>`
-   - Light version: `docker pull shunichirot/easigp:<LIGHT TAG>`
+3. Pull the image directly from Docker Hub - see "Getting the image file" above for the exact tag to use in place of `v1`/`v1_light` below:
+   - Full version: `docker pull shunichirot/easigp:v1`
+   - Light version: `docker pull shunichirot/easigp:v1_light`
 
    This downloads several gigabytes, so it can take a while the first time - you only need to repeat it when a new version is released.
 4. Run it:
    - Full version:
      ```
-     docker run -p 8501:8501 -it -e CLAUDE_CODE_OAUTH_TOKEN=<YOUR TOKEN> shunichirot/easigp:<TAG> streamlit run main_app.py --server.address=0.0.0.0 --server.port=8501
+     docker run -p 8501:8501 -it -e CLAUDE_CODE_OAUTH_TOKEN=YOUR TOKEN shunichirot/easigp:v1 streamlit run main_app.py --server.address=0.0.0.0 --server.port=8501
      ```
    - Light version:
      ```
-     docker run -p 8501:8501 -it shunichirot/easigp:<LIGHT TAG> streamlit run main_app.py --server.address=0.0.0.0 --server.port=8501
+     docker run -p 8501:8501 -it shunichirot/easigp:v1_light streamlit run main_app.py --server.address=0.0.0.0 --server.port=8501
      ```
    (If port 8501 is already in use on your machine, change *both* `8501`s before the colon-separated pair, e.g. `-p 8502:8501`, and use that new port number in the next step instead.)
 5. Once you see EasiGP's own startup messages in the terminal, open your browser and go to `http://localhost:8501` (or whichever port you chose in step 4).
 6. When you're done, press `Ctrl+C` in the terminal to stop the container.
 
-Any files EasiGP creates (results, generated networks, etc.) live inside the container and are lost when it stops, unless you mount a folder from your own computer into it - add `-v "<PATH ON YOUR COMPUTER>":/workspace/data` to the `docker run` command above (before `shunichirot/easigp:<TAG>`) to keep a folder in sync, e.g. `-v "$(pwd)/data":/workspace/data` on Mac/Linux or `-v "${PWD}\data":/workspace/data` in PowerShell.
+Any files EasiGP creates (results, generated networks, etc.) live inside the container and are lost when it stops, unless you mount a folder from your own computer into it - add `-v "PATH ON YOUR COMPUTER":/workspace/data` to the `docker run` command above (before `shunichirot/easigp:v1`) to keep a folder in sync, e.g. `-v "$(pwd)/data":/workspace/data` on Mac/Linux or `-v "${PWD}\data":/workspace/data` in PowerShell.
 
 #### For HPC, using Apptainer
 
 Apptainer builds a **sandbox** - an extracted, folder-based copy of the image - then runs EasiGP from that sandbox. Do this once; you can reuse the same sandbox for every future session.
 
 1. Log in to your HPC and make sure Apptainer is available (try `apptainer --version`; if that fails, check your HPC's documentation for how to load it, e.g. `module load apptainer`).
-2. Build the sandbox - see "Getting the image file" above for the exact tag to use in place of `<TAG>`/`<LIGHT TAG>` below. There are two ways to do this, depending on whether your HPC's login node has outbound internet access (many do; some, especially compute nodes, don't):
+2. Build the sandbox - see "Getting the image file" above for the exact tag to use in place of `v1`/`v1_light` below. There are two ways to do this, depending on whether your HPC's login node has outbound internet access (many do; some, especially compute nodes, don't):
 
    **a. Directly from Docker Hub (simplest - try this first):**
    ```
    mkdir -p /scratch/user/$USER/EasiGP
-   apptainer build --sandbox /scratch/user/$USER/EasiGP docker://shunichirot/easigp:<TAG>
+   apptainer build --sandbox /scratch/user/$USER/EasiGP docker://shunichirot/easigp:v1
    ```
-   (Light version: replace both `EasiGP` in the paths with `EasiGP_light`, and `<TAG>` with `<LIGHT TAG>`.) If this works, skip straight to step 3 below.
+   (Light version: replace both `EasiGP` in the paths with `EasiGP_light`, and `v1` with `v1_light`.) If this works, skip straight to step 3 below.
 
    **b. Via a `.tar` file (if step a fails, or your login node has no internet access):**
    - On a *different* computer that has both internet access and Docker installed - your own laptop is usually easiest - download and re-package the image as a single file:
      ```
-     docker pull shunichirot/easigp:<TAG>
-     docker save -o EasiGP.tar shunichirot/easigp:<TAG>
+     docker pull shunichirot/easigp:v1
+     docker save -o EasiGP.tar shunichirot/easigp:v1
      ```
-     (Light version: use `<LIGHT TAG>` and name the file `EasiGP_light.tar` instead.) This file will be several gigabytes - the same size as the image itself.
+     (Light version: use `v1_light` and name the file `EasiGP_light.tar` instead.) This file will be several gigabytes - the same size as the image itself.
    - Transfer that `.tar` file to your HPC account (e.g. via `scp`/`rsync`, or your HPC's own file-transfer tool) - it doesn't need to go anywhere special, just somewhere in your own storage.
    - Build the sandbox from it:
      ```
@@ -148,13 +148,13 @@ Apptainer builds a **sandbox** - an extracted, folder-based copy of the image - 
    ```
    salloc --nodes=1 --ntasks-per-node=1 --cpus-per-task=1 --mem=10G \
      --job-name=EasiGP --time=01:00:00 \
-     --partition=<YOUR PARTITION> --account=<YOUR GROUP> \
+     --partition=YOUR PARTITION --account=YOUR GROUP \
      srun --export=PATH,TERM,HOME,LANG --pty /bin/bash -l
    ```
 4. Once your interactive job is running, run the container:
    - Full version - generate a Claude Code access token first (see "Getting a Claude Code access token" above), then:
      ```
-     export APPTAINERENV_CLAUDE_CODE_OAUTH_TOKEN="<YOUR TOKEN>"
+     export APPTAINERENV_CLAUDE_CODE_OAUTH_TOKEN="YOUR TOKEN"
      apptainer run /scratch/user/$USER/EasiGP
      cd /scratch/user/$USER/EasiGP/workspace/EasiGP/
      streamlit run main_app.py --server.address=0.0.0.0 --server.port=8501
@@ -168,7 +168,7 @@ Apptainer builds a **sandbox** - an extracted, folder-based copy of the image - 
    Note the compute node name shown by the scheduler (e.g. in your shell prompt, or via `squeue --me`) - you'll need it next.
 5. From your **local machine** (not the HPC), open a new terminal and set up an SSH tunnel to that compute node:
    ```
-   ssh -N -L 8501:<COMPUTE_NODE_NAME>:8501 <YOUR_ACCOUNT>@<YOUR_HPC_LOGIN_ADDRESS>
+   ssh -N -L 8501:COMPUTE_NODE_NAME:8501 YOUR_ACCOUNT@YOUR_HPC_LOGIN_ADDRESS
    ```
    For example, on UQ's Bunya cluster: `ssh -N -L 8501:bun128:8501 USERNAME@bunya.rcc.uq.edu.au`. Leave this terminal open for as long as you're using EasiGP.
 6. Open `http://localhost:8501` in your browser.
@@ -199,7 +199,7 @@ If you're the one preparing/publishing these images (e.g. you have the EasiGP Do
    - Windows (use Anaconda Prompt): `conda env create -f environment_windows.yml`
    - Mac / Linux (use Terminal): `conda activate` and `conda env create -f environment_linux.yml`
 5. Activate the environment you just created: `conda activate EasiGP`
-6. Change directory to the main EasiGP folder: `cd <YOUR PATH TO EasiGP>/EasiGP`
+6. Change directory to the main EasiGP folder: `cd YOUR PATH TO EasiGP/EasiGP`
 7. Run: `streamlit run main_app.py --server.port 8501`
    a. If port 8501 is already in use, change it to another free port.
 8. Your default browser should open automatically to the GUI.
@@ -213,29 +213,29 @@ If you're the one preparing/publishing these images (e.g. you have the EasiGP Do
 2. Convert the format of your genotype/phenotype data into the format EasiGP requires (details: https://github.com/ShunichiroT/EasiGP/tree/main/Data).
 3. Submit a job for interactive mode, e.g. for Slurm:
    ```
-   salloc --nodes=<NODE_NUMBER; e.g. 1> --ntasks-per-node=<TASK_NUMBER; e.g. 1> \
-     --cpus-per-task=<CPU_NUMBER; e.g. 1> --mem=<MEMORY; e.g. 10G> \
-     --job-name=<YOUR JOB NAME> --time=<ALLOCATED TIME; e.g. 01:00:00> \
-     --partition=<YOUR PARTITION; e.g. general> --account=<YOUR GROUP> \
+   salloc --nodes=NODE_NUMBER; e.g. 1 --ntasks-per-node=TASK_NUMBER; e.g. 1 \
+     --cpus-per-task=CPU_NUMBER; e.g. 1 --mem=MEMORY; e.g. 10G \
+     --job-name=YOUR JOB NAME --time=ALLOCATED TIME; e.g. 01:00:00 \
+     --partition=YOUR PARTITION; e.g. general --account=YOUR GROUP \
      srun --export=PATH,TERM,HOME,LANG --pty /bin/bash -l
    ```
 4. Once the interactive job starts running, activate Anaconda (e.g. `module load anaconda3`).
 5. Create an Anaconda environment using the provided yml file: `conda env create -f environment_linux.yml`.
 6. Activate the environment you just created if it is not: `conda activate EasiGP`
-7. Change directory to the main EasiGP folder: `cd <YOUR PATH TO EasiGP>/EasiGP`
+7. Change directory to the main EasiGP folder: `cd YOUR PATH TO EasiGP/EasiGP`
 8. Run: `streamlit run main_app.py --server.port 8501 --server.headless true`
    a. If port 8501 is already in use, change it to another free port.
    b. Note the compute node name shown by the scheduler (e.g. in your shell prompt, or via `squeue --me`) - you'll need it in the next step.
 9. From your **local machine**, open a new terminal and set up an SSH tunnel to that compute node:
    ```
-   ssh -N -L 8501:<COMPUTE_NODE_NAME>:8501 <YOUR_ACCOUNT>@<YOUR_HPC_LOGIN_ADDRESS>
+   ssh -N -L 8501:COMPUTE_NODE_NAME:8501 YOUR_ACCOUNT@YOUR_HPC_LOGIN_ADDRESS
    ```
    For example, on UQ's Bunya cluster: `ssh -N -L 8501:bun128:8501 USERNAME@bunya.rcc.uq.edu.au`
 10. Open the local URL in your browser (e.g. `http://localhost:8501`).
 11. Complete the configuration in the GUI, then use the "Generate and save job files" option to create the submission script and its config JSON file.
 12. Log in to the HPC using another terminal (separate from the tunnel in step 9, which must stay open only as long as you're using the GUI).
-13. Change directory to the main EasiGP folder: `cd <YOUR PATH TO EasiGP>/EasiGP`
-14. Submit the job file created in step 11 (e.g. `sbatch <script name>.sh` for Slurm).
+13. Change directory to the main EasiGP folder: `cd YOUR PATH TO EasiGP/EasiGP`
+14. Submit the job file created in step 11 (e.g. `sbatch script name.sh` for Slurm).
 15. Before using LD pruning: this feature requires `plink2` to be installed and available on your PATH (or point the GUI at its executable path directly).
     - Yo can also activate your module on HPC if available (e.g. `module load plink`)
 
