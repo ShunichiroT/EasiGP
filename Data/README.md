@@ -41,7 +41,7 @@ This folder contains two folders containing example base files to implement both
   * chromosome: chromosome number (number)
   * start: the beginning location of the chromosome (the value should be 0 for the standard use)
   * end: the end location of the chromosome
-  * population: target population (write "all" for across all populations). This is needed only when each population has different chromosome lengths.
+  * population: target population (write "all" for across all populations). This is needed only when each population has different chromosome lengths
 
 * Rows:
 
@@ -57,10 +57,10 @@ This folder contains two folders containing example base files to implement both
   * start: the beginning location of the marker
   * end: the end location of the marker
   * name: name of each gene
-  * colour: allocated colour of each gene
+  * colour: allocated colour name in the colour palette (Circos plot tab on the GUI) of each gene
   * source: information source of each gene. Used as the name of each ring section for a circos plot
   * phenotype: target phenotype of each gene
-  * population: target population of each gene (write "all" for across all populations). This is needed only when each population has different chromosome lengths.
+  * population: target population of each gene (write "all" for across all populations). This is needed only when each population has different chromosome lengths
 
 * Rows: markers
 
