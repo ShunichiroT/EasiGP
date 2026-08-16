@@ -54,9 +54,19 @@ GBLUP <- function(train, valid, test, params, RESULT_NAME){
   # colliding with another's.
   run_id <- paste0(Sys.getpid(), '_', sample.int(.Machine$integer.max, 1))
   call_counter <- 0
+  # BGLR's saveAt writes several of its own diagnostic/trace files (MCMC
+  # variance-component traces, etc.) as a side effect of every call - these
+  # aren't read back by anything else in the pipeline, but shouldn't be left
+  # loose directly in Result/<RESULT_NAME>/ alongside the pipeline's own
+  # output files. showWarnings=FALSE because this directory gets (re)created
+  # once per task (potentially many times, including concurrently across
+  # parallel/HPC processes) - it already existing on a later call is
+  # expected, not a problem to warn about.
+  bglr_output_dir <- paste0('./Result/', RESULT_NAME, '/BGLR_output')
+  dir.create(bglr_output_dir, showWarnings = FALSE, recursive = TRUE)
   next_save_prefix <- function(tag) {
     call_counter <<- call_counter + 1
-    paste0('./Result/', RESULT_NAME, '/', tag, '_', run_id, '_', call_counter, '_')
+    paste0(bglr_output_dir, '/', tag, '_', run_id, '_', call_counter, '_')
   }
   
   data <- rbind(train, valid, test)

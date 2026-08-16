@@ -8,6 +8,19 @@ from torch.utils.data import Dataset, DataLoader
 from torch.nn import Linear, Module
 from sklearn.metrics import mean_squared_error
 
+
+def _safe_row_normalize(df):
+    """Row-wise L1-normalize (each row divided by its own sum of - here
+    already non-negative - values, e.g. abs(marker effect) or SHAP-based
+    importance) - safely: a row whose sum is exactly 0 (a model that
+    assigned literally zero effect/importance to everything) is left as
+    all-zero, rather than becoming all-NaN via an unguarded 0/0 division,
+    which would otherwise silently corrupt this weighted ensemble's
+    entire combined marker-effect output - NaN + anything is NaN."""
+    row_sums = df.sum(axis=1)
+    return df.div(row_sums, axis=0).fillna(0)
+
+
 ## Define the class converting the data into a specific format
 class CSVDataset(Dataset):
     # load the dataset
@@ -176,14 +189,14 @@ def Linear_transformation(data_train, data_valid, data_test, record, effect, wei
     weight = pd.concat([weight, weight_sample])
     
     ## Calculate weighted effects    
-    weight_extracted_normalised = weight_extracted.div(weight_extracted.sum(axis=1),axis=0)
+    weight_extracted_normalised = _safe_row_normalize(weight_extracted)
     
     for i in range(len(model_selected)):
         if effect[effect['model']==model_selected[i]].shape[0] != 0:
             if i == 0:
-                effect_weighted = effect[effect['model']==model_selected[i]].tail(1).iloc[:,5:].abs().reset_index(drop=True).div(effect[effect['model']==model_selected[i]].tail(1).iloc[:,5:].abs().sum(axis=1).reset_index(drop=True), axis=0).mul(weight_extracted_normalised[model_selected[i]], axis=0).reset_index(drop=True)
+                effect_weighted = _safe_row_normalize(effect[effect['model']==model_selected[i]].tail(1).iloc[:,5:].abs().reset_index(drop=True)).mul(weight_extracted_normalised[model_selected[i]], axis=0).reset_index(drop=True)
             else:
-                effect_weighted += effect[effect['model']==model_selected[i]].tail(1).iloc[:,5:].abs().reset_index(drop=True).div(effect[effect['model']==model_selected[i]].tail(1).iloc[:,5:].abs().sum(axis=1).reset_index(drop=True), axis=0).mul(weight_extracted_normalised[model_selected[i]], axis=0).reset_index(drop=True)
+                effect_weighted += _safe_row_normalize(effect[effect['model']==model_selected[i]].tail(1).iloc[:,5:].abs().reset_index(drop=True)).mul(weight_extracted_normalised[model_selected[i]], axis=0).reset_index(drop=True)
 
     effect = pd.concat([effect, pd.DataFrame(effect.iloc[effect.shape[0]-1,:]).T]).reset_index(drop=True)
     effect.loc[effect.shape[0]-1,'model'] = 'Linear transformation'

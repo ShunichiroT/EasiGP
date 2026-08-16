@@ -44,7 +44,7 @@ import time
 
 from pipeline_utils import (
     configure_r_environment, init_rpy2_conversion,
-    resolve_batch_id_from_env, restore_ratio, TimestampedWriter,
+    resolve_batch_id_from_env, restore_ratio, TimestampedWriter, make_run_log_path,
 )
 
 
@@ -68,14 +68,9 @@ def parse_args():
 
 
 def main():
-    # Wrap stdout so every line this process prints gets a timestamp prefix
-    # automatically - the scheduler captures this process's stdout to the
-    # array task's log file, so this is what makes that file timestamped.
-    sys.stdout = TimestampedWriter(sys.stdout)
-
     args = parse_args()
 
-    with open(args.config, 'r') as f:
+    with open(args.config, 'r', encoding='utf-8-sig') as f:
         cfg = json.load(f)
 
     batch_id = args.batch_id
@@ -87,13 +82,26 @@ def main():
     batch_size = cfg['PARALLEL']['batch_size']
     parallel = {'batch_id': batch_id, 'batch_size': batch_size}
 
+    # Wrap stdout so every line this process prints gets a timestamp prefix
+    # automatically, AND save it to Result/<RESULT_NAME>/logs/ - the same
+    # place the GUI's own local-run option already saves a log (see
+    # pipeline_utils.make_run_log_path) - in addition to whatever the job
+    # scheduler itself captures to the array task's own job-output file.
+    # The batch ID is included in the label (not just the log's own
+    # timestamp) so two array tasks that happen to start within the same
+    # second never collide on the same log filename.
+    log_file_path = make_run_log_path(cfg['RESULT_NAME'], f'step1_batch{batch_id}')
+    log_file = open(log_file_path, 'w', encoding='utf-8')
+    sys.stdout = TimestampedWriter(sys.stdout, log_file)
+    print(f'[run_step1_batch] Logging to {log_file_path}')
+
     configure_r_environment(cfg.get('R_PATH'))
     init_rpy2_conversion()
 
     # Imported after R/rpy2 setup so R_HOME/PATH are already correct.
     from genomic_prediction import GP
 
-    ratio = restore_ratio(cfg['RATIO'], cfg['W_OPT'])
+    ratio = restore_ratio(cfg['RATIO'], cfg['SCENARIO'])
 
     print(f"[run_step1_batch] RESULT_NAME={cfg['RESULT_NAME']} "
           f"batch_id={batch_id} batch_size={batch_size} models={cfg['MODEL']}")
@@ -103,7 +111,11 @@ def main():
         cfg['GENOTYPE_FILE_NAME'], cfg['PHENOTYPE_FILE_NAME'], cfg['MODEL'],
         cfg['PHENOTYPE'], ratio, cfg['ITER_NUM'], cfg['HPARAMETERS'],
         cfg['R_PATH'], cfg['W_OPT'], cfg['RESULT_NAME'], cfg['HYPERPARAMETERS_OPT'],
-        cfg['SCENARIO'], parallel, LD_prune=cfg.get('LD_PRUNE')
+        cfg['SCENARIO'], parallel, LD_prune=cfg.get('LD_PRUNE'), RF_filter=cfg.get('RF_FILTER'),
+        GENOTYPE_FORMAT=cfg.get('GENOTYPE_FORMAT', 'csv'), GENOTYPE_PLINK_PATH=cfg.get('GENOTYPE_PLINK_PATH', 'plink2'),
+        OTHER_MODELS_MARKER_SOURCE=cfg.get('OTHER_MODELS_MARKER_SOURCE', 'full_or_filtered'),
+        HP_TUNE=cfg.get('HP_TUNE'), HP_TUNE_ENSEMBLE_MODE=cfg.get('HP_TUNE_ENSEMBLE_MODE', 'per_method'),
+        MIN_DATA_POINTS=cfg.get('MIN_DATA_POINTS', 100),
     )
 
     print(f'[run_step1_batch] Batch {batch_id} finished (took {time.time() - _t0:.1f}s). '

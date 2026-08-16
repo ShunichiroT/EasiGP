@@ -15,6 +15,20 @@ from sklearn.metrics import mean_squared_error
 import scipy.stats
 
 
+def _safe_row_normalize(df):
+    """Row-wise L1-normalize (each row divided by its own sum of - here
+    already non-negative - values, e.g. abs(marker effect)) - safely: a
+    row whose sum is exactly 0 (a model that assigned literally zero
+    effect to every marker) is left as all-zero, rather than becoming
+    all-NaN via an unguarded 0/0 division. A single such row would
+    otherwise silently corrupt this WHOLE ensemble's combined marker
+    effects once summed with every other (valid) model's row below -
+    NaN + anything is NaN, so one degenerate model poisons the average
+    for every marker, not just its own."""
+    row_sums = df.sum(axis=1)
+    return df.div(row_sums, axis=0).fillna(0)
+
+
 # Function to calculate the metrics
 def metric(data):
     mse = mean_squared_error(data.loc[:,'actual'],data.loc[:,'ensemble'])
@@ -46,7 +60,7 @@ def ensemble(train, valid, test, effect, MODEL):
 
     # Extract genomic marker effects
     effect = pd.concat([effect.iloc[:,:5],
-                        effect.iloc[:,5:].abs().reset_index(drop=True).div(effect.iloc[:,5:].abs().sum(axis=1).reset_index(drop=True),axis=0)
+                        _safe_row_normalize(effect.iloc[:,5:].abs().reset_index(drop=True))
                        ], axis=1)
     
     effect_ensemble = pd.DataFrame()

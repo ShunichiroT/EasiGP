@@ -89,6 +89,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from pipeline_utils import unify_columns_by_position
+
 logger = logging.getLogger(__name__)
 
 
@@ -98,6 +100,52 @@ class PlinkError(RuntimeError):
 
 class LDPruneInputError(ValueError):
     """Raised when genotype_df / snp_info fail validation."""
+
+
+# --------------------------------------------------------------------------
+# Optional MAF (minor allele frequency) filtering - a separate, simpler
+# pre-filter that can run alongside LD pruning. Pure NumPy/pandas (no
+# PLINK dependency), computed directly from dosage genotypes, so it works
+# identically regardless of window_unit ('kb'/'cm'/'variants'). Applied
+# inside ld_prune_snps() BEFORE the plink2-dependent pruning step itself
+# runs, but if that later step then fails (e.g. plink2 isn't installed -
+# see PlinkError), the whole call still raises rather than returning a
+# MAF-filtered-but-not-LD-pruned partial result - see LD_pruning()'s own
+# comment on why a plink2 failure must stop the run, not silently return
+# something other than what was actually requested.
+# --------------------------------------------------------------------------
+
+def compute_maf(genotype_df: pd.DataFrame) -> pd.Series:
+    """Minor allele frequency per marker (column), computed directly from
+    0/1/2(.x) dosage genotypes: allele frequency = mean(dosage) / 2,
+    folded to the minor allele (so the result is always <= 0.5) via
+    min(p, 1-p). Missing calls (NaN) are ignored when computing the mean
+    (pandas' default skipna behaviour) - a marker with EVERY sample
+    missing has no defined frequency and gets NaN here, not 0."""
+    p = genotype_df.mean(axis=0, skipna=True) / 2.0
+    return p.where(p <= 0.5, 1.0 - p)
+
+
+def maf_filter(genotype_df: pd.DataFrame, maf_threshold: float) -> list:
+    """Marker (column) names in genotype_df that SURVIVE MAF filtering -
+    i.e. minor allele frequency >= maf_threshold. `maf_threshold` <= 0
+    disables filtering entirely (every column is kept, without even
+    computing MAF) - the same "0/None means off" convention as
+    r2_threshold's own use elsewhere in this module.
+
+    Markers with an undefined MAF (every sample missing for that column -
+    see compute_maf) are KEPT, not dropped: "we don't know its frequency"
+    is a data-completeness problem, not evidence the marker is rare, and
+    conflating the two would silently discard markers for the wrong
+    reason. Missing-data handling elsewhere in the pipeline (dosage
+    imputation, model-level NaN handling) is where that should be
+    addressed instead.
+    """
+    if maf_threshold is None or maf_threshold <= 0:
+        return list(genotype_df.columns)
+    maf = compute_maf(genotype_df)
+    keep = maf.isna() | (maf >= maf_threshold)
+    return list(genotype_df.columns[keep.to_numpy()])
 
 
 # --------------------------------------------------------------------------
@@ -536,6 +584,7 @@ def ld_prune_snps(
     unmapped_strategy: str = "variant_count",
     unmapped_window: int = 50,
     unmapped_step: int = 5,
+    maf_threshold: float = 0.0,
 ) -> pd.DataFrame:
     """
     LD-prune a 0/1/2(.x) genotype matrix and return it restricted to the
@@ -610,6 +659,18 @@ def ld_prune_snps(
                         without a map.
     unmapped_window, unmapped_step : window/step (variant counts) used for
                   the unmapped partition when unmapped_strategy="variant_count".
+    maf_threshold : minor allele frequency (MAF) filtering, applied ONCE
+                  up front - before LD pruning itself - using the TRAIN
+                  genotype (genotype_df) to decide which markers survive,
+                  exactly like LD pruning's own r2 decisions are made from
+                  train and then applied to valid/test too. 0 (default)
+                  disables this entirely - no behaviour change from before
+                  this parameter existed. A marker with an undefined MAF
+                  (every train sample missing for it) is always kept -
+                  see maf_filter()'s own docstring for why. This is a pure
+                  NumPy/pandas computation with no PLINK dependency, so it
+                  applies identically regardless of window_unit and even
+                  when plink2 itself isn't available.
 
     Returns
     -------
@@ -620,6 +681,22 @@ def ld_prune_snps(
         raise LDPruneInputError(
             f"unmapped_strategy must be one of 'variant_count', 'skip', 'drop' (got {unmapped_strategy!r})"
         )
+    # Requirement (prevent this from happening silently): PLINK's own
+    # --indep-pairwise rejects a kb-based window whenever the step size
+    # (variant count) isn't exactly 1 - see _prune_partition's window_arg/
+    # step usage below, and main_app.py's build_ld_prune_config() for the
+    # matching GUI-level check. Validated here too (not just in the GUI) so
+    # a headless/HPC run (run_sequential.py etc., which never goes through
+    # main_app.py at all) gets this same clear, immediate error instead of
+    # a raw PLINK failure partway through _prune_partition().
+    if window_unit == "kb" and step != 1:
+        raise LDPruneInputError(
+            f"PLINK's --indep-pairwise requires step to be exactly 1 when window_unit='kb' "
+            f"(got step={step}) - PLINK itself errors out on any other value for a kb-based "
+            f"window. Either set step=1, or use window_unit='variants' (where a step other "
+            f"than 1 is meaningful and supported)."
+        )
+
     
     #genotype_df_pheno = genotype_df.iloc[:,-1]
     #genotype_df = genotype_df.iloc[:,:-1]
@@ -628,6 +705,34 @@ def ld_prune_snps(
     #genotype_df_test_pheno = genotype_df_test.iloc[:,-1]
     
     snp_info = _validate_inputs(genotype_df, snp_info, window_unit)
+
+    # MAF filtering (see maf_threshold's own docstring above) - deliberately
+    # BEFORE LD pruning, so a low-frequency marker never gets to "win" an
+    # LD-pruning comparison against a more common one it happens to be in
+    # LD with, only to survive here anyway; filtering it out first removes
+    # it from consideration entirely, exactly like a real PLINK
+    # `--maf X --indep-pairwise ...` pipeline would.
+    if maf_threshold and maf_threshold > 0:
+        _n_before_maf = genotype_df.shape[1]
+        _maf_keep_cols = maf_filter(genotype_df, maf_threshold)
+        genotype_df = genotype_df[_maf_keep_cols]
+        if genotype_df_valid.shape[1] != 0:
+            genotype_df_valid = genotype_df_valid[_maf_keep_cols]
+        genotype_df_test = genotype_df_test[_maf_keep_cols]
+        snp_info = snp_info.loc[_maf_keep_cols]
+        # print(), not logger.info() - this module's existing logger.info()
+        # calls are silently dropped under this codebase's default logging
+        # configuration (nothing anywhere calls logging.basicConfig() - see
+        # Preprocess/LD_decay_plot.py's module docstring for the full
+        # explanation of the same issue there). A brand new, user-facing
+        # "did my MAF filter actually do anything?" message should not
+        # inherit that same invisibility.
+        print(
+            f"[LD_pruning] MAF filtering: {_n_before_maf} -> {genotype_df.shape[1]} SNPs "
+            f"(maf >= {maf_threshold}), before LD pruning."
+        )
+        if genotype_df.shape[1] == 0:
+            print("[LD_pruning] MAF filtering removed every marker - nothing left for LD pruning to do.")
 
     cleanup = work_dir is None and not keep_intermediate
     workdir = Path(work_dir) if work_dir else Path(tempfile.mkdtemp(prefix="ld_prune_"))
@@ -723,6 +828,11 @@ def LD_pruning(train, valid, test, ld_config):
     # own defaults otherwise rather than raising a KeyError.
     unmapped_window = ld_config.get('unmapped_window', 50)
     unmapped_step = ld_config.get('unmapped_step', 5)
+    # Optional MAF pre-filter (see ld_prune_snps' own maf_threshold
+    # docstring) - defaults to 0 (disabled) so an older saved LD_PRUNE
+    # config with no 'maf_threshold' key behaves exactly as before this
+    # option existed.
+    maf_threshold = ld_config.get('maf_threshold', 0.0)
 
     # Build the SNP map. window_unit='variants' doesn't strictly need real
     # CHR/POS/CM, so fall back to a placeholder map only when the caller
@@ -736,27 +846,49 @@ def LD_pruning(train, valid, test, ld_config):
         snp_info = make_placeholder_snp_info(genotype_df)
     else:
         snp_info = pd.read_csv(snp_info, index_col=0)
-
-    try:
-        pruned = ld_prune_snps(
-            genotype_df, genotype_df_valid, genotype_df_test, snp_info, 
-            window=window, window_unit=window_unit, 
-            step=step, r2_threshold=r2_threshold,
-            plink_path = plink_path,
-            allow_extra_chr = allow_extra_chr,
-            chr_set = chr_set,
-            work_dir = work_dir,
-            keep_intermediate = keep_intermediate,
-            round_dosage = round_dosage,
-            unmapped_strategy = unmapped_strategy,
-            unmapped_window = unmapped_window,
-            unmapped_step = unmapped_step,
+        # Requirement 8: the SNP info file's columns are documented as
+        # CHR, POS, then optionally CM, A1, A2 - IN THAT ORDER (see this
+        # function's own docstring) - unify by position so a file that
+        # follows the order but uses different header text (e.g.
+        # 'Chromosome'/'Position' instead of 'CHR'/'POS') still works,
+        # rather than those columns being silently treated as absent (see
+        # _validate_inputs' own 'if col not in snp_info.columns' checks).
+        # The index (SNP ID - a marker name, meaningful/user-chosen) is
+        # never touched by this.
+        _snp_info_canonical_order = ['CHR', 'POS', 'CM', 'A1', 'A2']
+        snp_info = unify_columns_by_position(
+            snp_info, _snp_info_canonical_order[:min(snp_info.shape[1], 5)], 'SNP info file'
         )
-        print(f"Pruned: {genotype_df.shape[1]} -> {pruned[0].shape[1]} markers")
-        
-        return pruned[0], pruned[1], pruned[2]
-    
-    except PlinkError as e:
-        print(f"plink2 not available in this environment ({e}); "
-              f"skipping LD pruning and continuing with the unpruned markers.")
-        return genotype_df, genotype_df_valid, genotype_df_test
+
+    # Requirement: LD pruning was explicitly requested (this function was
+    # called at all), so a PlinkError here - whether because plink2 itself
+    # isn't installed/on PATH, or because a plink2 command it ran failed -
+    # must STOP the run rather than silently falling back to the unpruned
+    # markers. Continuing silently would give the person results that
+    # look normal but were never actually LD-pruned, with nothing in the
+    # final output to reveal that - a far worse outcome than a clear,
+    # immediate failure they can see and fix (install/locate plink2, or
+    # fix whatever made the plink2 command itself fail - see the
+    # PlinkError's own message for which). genomic_prediction.py's
+    # per-task checkpoint/rollback (see checkpoint_utils.py) already
+    # handles this exactly like any other task failure: whatever
+    # scenarios completed before this one are saved, and the run can be
+    # resumed once the underlying problem is fixed.
+    pruned = ld_prune_snps(
+        genotype_df, genotype_df_valid, genotype_df_test, snp_info,
+        window=window, window_unit=window_unit,
+        step=step, r2_threshold=r2_threshold,
+        plink_path = plink_path,
+        allow_extra_chr = allow_extra_chr,
+        chr_set = chr_set,
+        work_dir = work_dir,
+        keep_intermediate = keep_intermediate,
+        round_dosage = round_dosage,
+        unmapped_strategy = unmapped_strategy,
+        unmapped_window = unmapped_window,
+        unmapped_step = unmapped_step,
+        maf_threshold = maf_threshold,
+    )
+    print(f"Pruned: {genotype_df.shape[1]} -> {pruned[0].shape[1]} markers")
+
+    return pruned[0], pruned[1], pruned[2]

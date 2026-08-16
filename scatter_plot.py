@@ -3,6 +3,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from pipeline_utils import unify_columns_by_position
+
 
 def scatter_plot(MODEL, PHENOTYPE, predicted_result_test, effect, QTL, SCATTER_CONFIG, RESULT_NAME):
     
@@ -32,6 +34,13 @@ def scatter_plot(MODEL, PHENOTYPE, predicted_result_test, effect, QTL, SCATTER_C
     # Read QTL data if needed
     if QTL != None:
         QTL_info = pd.read_csv(QTL)
+        # Requirement 8: unify by position (phenotype, marker) - 'marker'
+        # here is this file's marker-identifying column HEADER (a fixed,
+        # structural field per the GUI's own documented schema:
+        # 'phenotype|marker name identified as QTL'), not the marker
+        # names themselves (the VALUES, matched against real marker
+        # names elsewhere and left completely untouched).
+        QTL_info = unify_columns_by_position(QTL_info, ['phenotype', 'marker'], 'QTL file')
     
     # Generate a scatter plot per phenotype
     for k in range(len(PHENOTYPE)):

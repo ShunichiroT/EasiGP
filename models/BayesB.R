@@ -20,7 +20,18 @@ BayesB <- function(train, valid, test, params, RESULT_NAME){
   # the same intermediate-file prefix, which otherwise only depended on
   # RESULT_NAME and was shared across every concurrent process.
   run_id <- paste0(Sys.getpid(), '_', sample.int(.Machine$integer.max, 1))
-  
+
+  # BGLR's saveAt writes several of its own diagnostic/trace files (MCMC
+  # variance-component traces, etc.) as a side effect of every call - these
+  # aren't read back by anything else in the pipeline, but shouldn't be left
+  # loose directly in Result/<RESULT_NAME>/ alongside the pipeline's own
+  # output files. showWarnings=FALSE because this is called once per task
+  # (potentially many times, including concurrently across parallel/HPC
+  # processes) - the directory already existing on a later call is expected,
+  # not a problem to warn about.
+  bglr_output_dir <- paste0('./Result/', RESULT_NAME, '/BGLR_output')
+  dir.create(bglr_output_dir, showWarnings = FALSE, recursive = TRUE)
+
   data <- rbind(train, valid, test)
   data_qtl <- data.frame(lapply(data[,1:(ncol(data)-1)], as.numeric))
   data_pheno <- data[,ncol(data):ncol(data)]
@@ -34,7 +45,7 @@ BayesB <- function(train, valid, test, params, RESULT_NAME){
   y_test[(nrow(data)-(nrow(valid)+nrow(test))+1):nrow(data)] <- NA
   
   fm <- BGLR(y=y_test,ETA=list(mrk=list(X=X,model='BayesB',probIn=probIn,counts=counts)),
-             nIter=nIter,burnIn=burnIn,verbose=FALSE,saveAt=paste('./Result/',RESULT_NAME,'/bayes_',run_id,'_', sep = ""))
+             nIter=nIter,burnIn=burnIn,verbose=FALSE,saveAt=paste(bglr_output_dir,'/bayes_',run_id,'_', sep = ""))
   
   y_predicted <- fm$yHat[(nrow(data)-nrow(test)+1):nrow(data)]
   y_actual <- y[(nrow(data)-nrow(test)+1):nrow(data)]

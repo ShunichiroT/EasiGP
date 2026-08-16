@@ -459,4 +459,3 @@ dependencies:
       - torch-sparse==0.6.18
       - torch-spline-conv==1.2.2
       - yarl==1.20.1
-prefix: C:\Anaconda3\envs\EasiGP

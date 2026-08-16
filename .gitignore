@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# EasiGP's own runtime-generated files - local settings/results, not source
+easigp_last_gui_state.json
+Result/*
+!Result/README.md
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
