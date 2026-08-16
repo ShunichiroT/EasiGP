@@ -104,7 +104,7 @@ This token works with either an API-billed Anthropic account or a Claude subscri
      ```
    - Light version:
      ```
-     docker run -p 8501:8501 -it shunichirot/easigp:LIGHT v1 streamlit run main_app.py --server.address=0.0.0.0 --server.port=8501
+     docker run -p 8501:8501 -it shunichirot/easigp:v1_light streamlit run main_app.py --server.address=0.0.0.0 --server.port=8501
      ```
    (If port 8501 is already in use on your machine, change *both* `8501`s before the colon-separated pair, e.g. `-p 8502:8501`, and use that new port number in the next step instead.)
 5. Once you see EasiGP's own startup messages in the terminal, open your browser and go to `http://localhost:8501` (or whichever port you chose in step 4).
@@ -117,14 +117,14 @@ Any files EasiGP creates (results, generated networks, etc.) live inside the con
 Apptainer builds a **sandbox** - an extracted, folder-based copy of the image - then runs EasiGP from that sandbox. Do this once; you can reuse the same sandbox for every future session.
 
 1. Log in to your HPC and make sure Apptainer is available (try `apptainer --version`; if that fails, check your HPC's documentation for how to load it, e.g. `module load apptainer`).
-2. Build the sandbox - see "Getting the image file" above for the exact tag to use in place of `v1`/`LIGHT v1` below. There are two ways to do this, depending on whether your HPC's login node has outbound internet access (many do; some, especially compute nodes, don't):
+2. Build the sandbox - see "Getting the image file" above for the exact tag to use in place of `v1`/`v1_light` below. There are two ways to do this, depending on whether your HPC's login node has outbound internet access (many do; some, especially compute nodes, don't):
 
    **a. Directly from Docker Hub (simplest - try this first):**
    ```
    mkdir -p /scratch/user/$USER/EasiGP
    apptainer build --sandbox /scratch/user/$USER/EasiGP docker://shunichirot/easigp:v1
    ```
-   (Light version: replace both `EasiGP` in the paths with `EasiGP_light`, and `v1` with `LIGHT v1`.) If this works, skip straight to step 3 below.
+   (Light version: replace both `EasiGP` in the paths with `EasiGP_light`, and `v1` with `v1_light`.) If this works, skip straight to step 3 below.
 
    **b. Via a `.tar` file (if step a fails, or your login node has no internet access):**
    - On a *different* computer that has both internet access and Docker installed - your own laptop is usually easiest - download and re-package the image as a single file:
@@ -132,7 +132,7 @@ Apptainer builds a **sandbox** - an extracted, folder-based copy of the image - 
      docker pull shunichirot/easigp:v1
      docker save -o EasiGP.tar shunichirot/easigp:v1
      ```
-     (Light version: use `LIGHT v1` and name the file `EasiGP_light.tar` instead.) This file will be several gigabytes - the same size as the image itself.
+     (Light version: use `v1_light` and name the file `EasiGP_light.tar` instead.) This file will be several gigabytes - the same size as the image itself.
    - Transfer that `.tar` file to your HPC account (e.g. via `scp`/`rsync`, or your HPC's own file-transfer tool) - it doesn't need to go anywhere special, just somewhere in your own storage.
    - Build the sandbox from it:
      ```
