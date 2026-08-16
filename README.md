@@ -73,7 +73,7 @@ A few concepts worth knowing before you start, if you haven't used these before:
 
 #### Getting the image file
 
-EasiGP's ready-made images are published on [Docker Hub](https://hub.docker.com/repository/docker/shunichirot/easigp/general) rather than distributed as downloadable files directly from GitHub - the images are several gigabytes each (over 2GB), too large for GitHub to host directly. That Docker Hub page shows the exact tags available for the Full and Light versions, and the exact `docker pull` command to use for each - you'll need this for the steps below, wherever you see `<TAG>` (Full version) or `<LIGHT TAG>` (Light version).
+EasiGP's ready-made images are published on [Docker Hub](https://hub.docker.com/r/shunichirot/easigp/tags) rather than distributed as downloadable files directly from GitHub - the images are several gigabytes each (over 2GB), too large for GitHub to host directly. That Docker Hub page shows the exact tags available for the Full and Light versions, and the exact `docker pull` command to use for each - you'll need this for the steps below, wherever you see `<v1>` (Full version) or `<v1_light>` (Light version).
 
 - On a **local PC**, using Docker (below), you pull the image directly from that page - no separate download or `.tar` file needed at all.
 - On **HPC**, using Apptainer (below), you can often build directly from Docker Hub too, the same way - a `.tar` file is only needed as a fallback, for an HPC whose login/build environment doesn't have internet access, or if you'd simply rather transfer the image over yourself. See that section for exactly how to create one, if you need it.
