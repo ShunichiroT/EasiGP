@@ -139,6 +139,8 @@ chromosome, start,  end,    name, colour, source,          phenotype,       popu
 1,          100000, 102000, FT1,  red,    Dong et al. 2012, flowering_time, all
 ```
 
+**About the `population` column:** only include it if different populations in your data have chromosomes of different lengths (e.g. different reference genome builds per population). Write `all` for a row that applies across every population. If every population shares the same chromosome lengths, you can leave the `population` column out entirely - EasiGP will automatically apply the same rows to every population plus `all`.
+
 ### 6. Biological prior network files - optional, for the GAT biological prior-knowledge model
 
 These two files together tell the GAT biological prior-knowledge model which *genes* interact with which, instead of asking it to learn marker-level structure from scratch. You can supply both by hand, or generate them automatically from the GUI's "Biological prior network" preprocessing step (the automatic route needs Claude access - see the main README's setup instructions).
