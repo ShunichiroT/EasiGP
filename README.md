@@ -107,7 +107,7 @@ A few concepts worth knowing before you start, if you haven't used these before:
 
 #### Getting the image file
 
-EasiGP's ready-made images are published on [Docker Hub](https://hub.docker.com/r/shunichirot/easigp/tags) rather than distributed as downloadable files directly from GitHub - the images are several gigabytes each (over 2GB), too large for GitHub to host directly. That Docker Hub page shows the exact tags available for the Full and Light versions, and the exact `docker pull` command to use for each - you'll need this for the steps below, wherever you see `v1` (Full version) or `v1_light` (Light version).
+EasiGP's ready-made images are published on [Docker Hub](https://hub.docker.com/r/shunichirot/easigp/tags) rather than distributed as downloadable files directly from GitHub - the images are several gigabytes each (over 2GB), too large for GitHub to host directly. That Docker Hub page shows the exact tags available for the Full and Light versions, and the exact `docker pull` command to use for each - you'll need this for the steps below, wherever you see `<version>` (Full version) or `<version>_light` (Light version).
 
 - On a **local PC**, using Docker (below), you pull the image directly from that page - no separate download or `.tar` file needed at all.
 - On **HPC**, using Apptainer (below), you can often build directly from Docker Hub too, the same way - a `.tar` file is only needed as a fallback, for an HPC whose login/build environment doesn't have internet access, or if you'd simply rather transfer the image over yourself. See that section for exactly how to create one, if you need it.
@@ -126,47 +126,47 @@ This token works with either an API-billed Anthropic account or a Claude subscri
 
 1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) if you don't already have it, and make sure it's running.
 2. Open a terminal (**Command Prompt** or **PowerShell** on Windows; **Terminal** on Mac/Linux).
-3. Pull the image directly from Docker Hub - see "Getting the image file" above for the exact tag to use in place of `v1`/`v1_light` below:
-   - Full version: `docker pull shunichirot/easigp:v1`
-   - Light version: `docker pull shunichirot/easigp:v1_light`
+3. Pull the image directly from Docker Hub - see "Getting the image file" above for the exact tag to use in place of `<version>`/`<version>_light` below:
+   - Full version: `docker pull shunichirot/easigp:<version>`
+   - Light version: `docker pull shunichirot/easigp:<version>_light`
 
    This downloads several gigabytes, so it can take a while the first time - you only need to repeat it when a new version is released.
 4. Run it:
    - Full version:
      ```
-     docker run -p 8501:8501 -it -e CLAUDE_CODE_OAUTH_TOKEN=YOUR TOKEN shunichirot/easigp:v1 streamlit run main_app.py --server.address=0.0.0.0 --server.port=8501
+     docker run -p 8501:8501 -it -e CLAUDE_CODE_OAUTH_TOKEN=YOUR TOKEN shunichirot/easigp:<version> streamlit run main_app.py --server.address=0.0.0.0 --server.port=8501
      ```
    - Light version:
      ```
-     docker run -p 8501:8501 -it shunichirot/easigp:v1_light streamlit run main_app.py --server.address=0.0.0.0 --server.port=8501
+     docker run -p 8501:8501 -it shunichirot/easigp:<version>_light streamlit run main_app.py --server.address=0.0.0.0 --server.port=8501
      ```
    (If port 8501 is already in use on your machine, change *both* `8501`s before the colon-separated pair, e.g. `-p 8502:8501`, and use that new port number in the next step instead.)
 5. Once you see EasiGP's own startup messages in the terminal, open your browser and go to `http://localhost:8501` (or whichever port you chose in step 4).
 6. When you're done, press `Ctrl+C` in the terminal to stop the container.
 
-Any files EasiGP creates (results, generated networks, etc.) live inside the container and are lost when it stops, unless you mount a folder from your own computer into it - add `-v "PATH ON YOUR COMPUTER":/workspace/data` to the `docker run` command above (before `shunichirot/easigp:v1`) to keep a folder in sync, e.g. `-v "$(pwd)/data":/workspace/data` on Mac/Linux or `-v "${PWD}\data":/workspace/data` in PowerShell.
+Any files EasiGP creates (results, generated networks, etc.) live inside the container and are lost when it stops, unless you mount a folder from your own computer into it - add `-v "PATH ON YOUR COMPUTER":/workspace/data` to the `docker run` command above (before `shunichirot/easigp:<version>`) to keep a folder in sync, e.g. `-v "$(pwd)/data":/workspace/data` on Mac/Linux or `-v "${PWD}\data":/workspace/data` in PowerShell.
 
 #### For HPC, using Apptainer
 
 Apptainer builds a **sandbox** - an extracted, folder-based copy of the image - then runs EasiGP from that sandbox. Do this once; you can reuse the same sandbox for every future session.
 
 1. Log in to your HPC and make sure Apptainer is available (try `apptainer --version`; if that fails, check your HPC's documentation for how to load it, e.g. `module load apptainer`).
-2. Build the sandbox - see "Getting the image file" above for the exact tag to use in place of `v1`/`v1_light` below. There are two ways to do this, depending on whether your HPC's login node has outbound internet access (many do; some, especially compute nodes, don't):
+2. Build the sandbox - see "Getting the image file" above for the exact tag to use in place of `<version>`/`<version>_light` below. There are two ways to do this, depending on whether your HPC's login node has outbound internet access (many do; some, especially compute nodes, don't):
 
    **a. Directly from Docker Hub (simplest - try this first):**
    ```
    mkdir -p /scratch/user/$USER/EasiGP
-   apptainer build --sandbox /scratch/user/$USER/EasiGP docker://shunichirot/easigp:v1
+   apptainer build --sandbox /scratch/user/$USER/EasiGP docker://shunichirot/easigp:<version>
    ```
-   (Light version: replace both `EasiGP` in the paths with `EasiGP_light`, and `v1` with `v1_light`.) If this works, skip straight to step 3 below.
+   (Light version: replace both `EasiGP` in the paths with `EasiGP_light`, and `<version>` with `<version>_light`.) If this works, skip straight to step 3 below.
 
    **b. Via a `.tar` file (if step a fails, or your login node has no internet access):**
    - On a *different* computer that has both internet access and Docker installed - your own laptop is usually easiest - download and re-package the image as a single file:
      ```
-     docker pull shunichirot/easigp:v1
-     docker save -o EasiGP.tar shunichirot/easigp:v1
+     docker pull shunichirot/easigp:<version>
+     docker save -o EasiGP.tar shunichirot/easigp:<version>
      ```
-     (Light version: use `v1_light` and name the file `EasiGP_light.tar` instead.) This file will be several gigabytes - the same size as the image itself.
+     (Light version: use `<version>_light` and name the file `EasiGP_light.tar` instead.) This file will be several gigabytes - the same size as the image itself.
    - Transfer that `.tar` file to your HPC account (e.g. via `scp`/`rsync`, or your HPC's own file-transfer tool) - it doesn't need to go anywhere special, just somewhere in your own storage.
    - Build the sandbox from it:
      ```
