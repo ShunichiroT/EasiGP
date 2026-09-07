@@ -13,8 +13,154 @@ import glob
 import tempfile
 import uuid
 import math
+import re
+import time
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 from pipeline_utils import unify_columns_by_position
+
+# ---------------------------------------------------------------------------
+# Performance (multi-CPU circos-plot rendering): circos_plot()'s own
+# (PHENOTYPE x POPULATION) loop below - see that function - draws and
+# saves ONE independent circos PNG per iteration (plus, optionally, a
+# per-model interaction chord diagram). Each iteration's own cost is
+# dominated by pycirclize/matplotlib rendering and a 600 dpi (by default)
+# `_safe_savefig()`, not by anything already sped up by the interaction-
+# assembly fixes elsewhere in this module - and, critically, one
+# iteration's work is fully independent of every other's (each reads the
+# SAME precomputed, read-only lookup tables built once before the loop,
+# and writes its OWN distinct output file, never touching another
+# iteration's). That combination - independent units, each individually
+# expensive, sharing only read-only inputs - is exactly what a process
+# pool is for.
+#
+# `multiprocessing.get_context('spawn')` explicitly, never the platform
+# default (`fork` on Linux) - mirrors intra_batch_parallel.py's/
+# intra_task_parallel.py's own `_MP_CONTEXT`, and that module's own
+# comment on why (see `_MP_CONTEXT` there): a spawned worker starts from
+# a genuinely fresh interpreter, inheriting this process's environment
+# but never its already-initialised native library/thread state - this
+# module has no rpy2/R dependency to protect the way that one does, but
+# `spawn` is also the ONLY start method Windows supports at all, so using
+# it unconditionally here keeps this feature's behaviour identical on
+# every OS this codebase runs on, rather than "usually fine on Linux,
+# untested on Windows".
+_MP_CONTEXT = multiprocessing.get_context('spawn')
+
+# Set by `_init_circos_plot_worker()` once per spawned worker process -
+# see that function's own docstring for why a module-level global (rather
+# than a closure) is what a `spawn`-started worker needs here.
+_CIRCOS_WORKER_CTX = None
+# Update ID ver4-6, R2 (blueprint §3.2/§3.4): the single shared authority
+# on ring radii, text footprint and seam geometry - see that module's own
+# docstring for why it is a separate, pure sibling of this file rather
+# than living in pipeline_utils.py (which would pull matplotlib into
+# every model process) or being re-derived here a second time (the
+# defect R2 exists to fix in the first place).
+import circos_geometry
+
+# ver4-4 R7.b - module-level cache for _load_combined_marker_info() below.
+# Cleared at the top of every circos_plot() call (see that function) so it
+# never serves a stale entry across separate runs/RESULT_NAMEs within one
+# long-lived process (e.g. main_app.py's in-process 'Option B: run now').
+_MARKER_INFO_CACHE = {}
+
+
+# ---------------------------------------------------------------------------
+# Bugfix (see log_step2_local - a Windows run failed with
+# "OSError: [Errno 22] Invalid argument: './Result/MaizeNAM/
+# circos_days2anthesis_1.png'" from inside PIL's own `Image.save()`, at
+# the literal `open(filename, "w+b")` call - i.e. the OS itself refused
+# to open a path that LOOKS unremarkable as plain text. On Windows,
+# `CreateFile` can reject an apparently-ordinary path for reasons that
+# never show up by eye in a log line: a component that is (or, after
+# Windows' own trailing-character stripping, resolves to) a reserved
+# device name (CON, PRN, AUX, NUL, COM1-9, LPT1-9), a component ending in
+# a space or a period, or a handful of characters that are reserved on
+# Windows but legal on the OS this codebase is normally developed and
+# tested on (: < > " | ? *) - and PHENOTYPE/POPULATION/model names here
+# are exactly the kind of free-text, user-authored values (a phenotype
+# column header typed by a scientist, e.g. containing '/', ':', or a
+# trailing space copied out of a spreadsheet) that can carry exactly one
+# of those without ever being validated as a filename anywhere upstream.
+#
+# Two independent, complementary fixes follow:
+#   1. sanitise every free-text value that becomes part of a saved
+#      filename here, so a value that is perfectly fine as DATA (a
+#      population/phenotype/model label) can never itself make the
+#      resulting path invalid for the OS actually running this - see
+#      `_sanitize_path_component()`;
+#   2. save through `_safe_savefig()`, a small wrapper that also retries
+#      briefly on any OSError - the same symptom is also a well-known,
+#      genuinely transient nuisance on Windows when the target folder is
+#      inside an actively-syncing cloud folder (OneDrive/Dropbox) or
+#      briefly held by antivirus/indexing right after creation, cases a
+#      sanitised filename alone would not fix.
+# Neither fix is destructive: a filename with no reserved characters at
+# all is returned byte-for-byte unchanged by `_sanitize_path_component()`,
+# and `_safe_savefig()` only ever retries - it never silently drops or
+# renames a plot the person didn't ask it to.
+# ---------------------------------------------------------------------------
+_WINDOWS_RESERVED_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+_WINDOWS_RESERVED_NAMES = {
+    'CON', 'PRN', 'AUX', 'NUL',
+    *{f'COM{i}' for i in range(1, 10)}, *{f'LPT{i}' for i in range(1, 10)},
+}
+
+
+def _sanitize_path_component(value) -> str:
+    """Makes an arbitrary, free-text value (a phenotype name, population
+    label, or model name) SAFE to use as one component of a saved
+    filename on every OS this codebase runs on - never touches the
+    actual DATA (marker/trait/model identifiers used as join keys
+    elsewhere in the pipeline are untouched; only the string used here,
+    for a file NAME, is affected). Replaces any character Windows
+    forbids in a filename with '_', strips trailing spaces/periods
+    (silently dropped by Windows but a well-documented cause of
+    'Invalid argument' from other tools/APIs that don't drop them first),
+    and appends '_' to a bare Windows-reserved device name (CON, LPT1,
+    ...) so it no longer collides with one. A value that was already
+    clean is returned completely unchanged."""
+    text = str(value)
+    cleaned = _WINDOWS_RESERVED_CHARS.sub('_', text).strip().rstrip('. ')
+    if not cleaned:
+        cleaned = '_'
+    if cleaned.upper() in _WINDOWS_RESERVED_NAMES:
+        cleaned = cleaned + '_'
+    return cleaned
+
+
+def _safe_savefig(fig, path, *, dpi=600, attempts=3, base_delay=0.5, **kwargs):
+    """`fig.savefig(path, dpi=dpi, **kwargs)`, with two defensive
+    additions (see the module-level note above): the parent directory is
+    (re-)created immediately before writing (`exist_ok=True` - a no-op if
+    it's already there), and a transient `OSError` (the target briefly
+    locked by a sync client/antivirus/indexer, or - see the CPython
+    tracker's own long-running discussion of Windows' 'Invalid argument'
+    - a momentary filesystem hiccup unrelated to the path's own text) is
+    retried a few times with a short backoff before finally propagating,
+    with a clear, actionable message rather than the bare, unhelpful one
+    that would otherwise surface deep inside PIL/matplotlib."""
+    os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            fig.savefig(path, dpi=dpi, **kwargs)
+            return
+        except OSError as exc:
+            last_exc = exc
+            if attempt == attempts:
+                break
+            time.sleep(base_delay * attempt)
+    raise OSError(
+        f"[circos_plot] Could not write '{path}' after {attempts} attempt(s): {last_exc!r}. "
+        f"This is usually a transient OS-level issue (the file briefly locked by a sync client, "
+        f"antivirus, or file indexer - especially if this folder is inside a OneDrive/Dropbox-"
+        f"synced location) rather than a problem with the plot itself - re-running the export "
+        f"usually succeeds. If it keeps failing, check that '{os.path.dirname(path) or '.'}' is "
+        f"writable and not inside a cloud-sync folder that is currently paused/offline."
+    ) from last_exc
 
 
 def _visible_edge_color(fill_color, min_contrast=90.0, min_factor=0.15):
@@ -122,39 +268,80 @@ def _add_cytoband_tracks_with_border(circos, r_lim, cytoband_file, track_name, c
     in sync with. Tooltips (pycirclize's own hover-text feature, only
     relevant for interactive/HTML output) are deliberately omitted here,
     since this codebase only ever saves static PNGs.
+
+    ver4-4 R7.d: the per-sector, per-record scan used to be a plain
+    O(sectors x records) double loop over EVERY record for EVERY sector,
+    checking `sector.name == rec.chr` record-by-record - wasteful once a
+    genome has many chromosomes and/or many marker/gene records.
+    `cytoband_records` is now bucketed by `rec.chr` ONCE, up front, into
+    a dict - turning the scan into O(records) total (each record visited
+    exactly once, then looked up by its own sector directly) plus
+    O(sectors) for track creation, rather than re-scanning the full
+    record list once per sector.
+
+    Also returns the set of `str(rec.score)` values that were actually
+    drawn onto a real sector (i.e. `rec.score`, which is this codebase's
+    own 'colour' value - see `data_conversion()`'s own note on why gene/
+    marker colour values are written into a BED file's 'score' column)
+    - this is exactly the same set `plot()` used to recover by
+    RE-READING the same `cytoband_file` a second time via a plain
+    `pd.read_csv(...)['colour'].unique()` call, purely to know which
+    colours need a legend entry (Requirement 13's own "only colours that
+    ACTUALLY appear on this plot" rule). Returning it here as a
+    byproduct of the drawing loop this function was already doing lets
+    `plot()` drop that second read entirely - see that function's own
+    R7.d note. (A record whose chromosome isn't among `circos.sectors`
+    at all was never drawn in the FIRST implementation either - its
+    colour simply never matched any `sector.name == rec.chr` comparison
+    - so it is correctly excluded here too, and doing so is at worst a
+    tightening of Requirement 13's own "only actually-drawn colours"
+    rule, not a behaviour change to anything that could ever have been
+    visibly rendered.)
+
+    Returns
+    -------
+    set[str]
+        Every `str(rec.score)` value actually drawn onto some sector.
     """
     if cytoband_cmap is None:
         cytoband_cmap = _pycirclize_config.CYTOBAND_COLORMAP
     cytoband_records = Bed(cytoband_file).records
+    _records_by_chr = {}
+    for rec in cytoband_records:
+        _records_by_chr.setdefault(rec.chr, []).append(rec)
+
+    used_colours = set()
     for sector in circos.sectors:
         track = sector.add_track(r_lim, name=track_name)
         track.axis()
-        for rec in cytoband_records:
-            if sector.name == rec.chr:
-                color = cytoband_cmap.get(str(rec.score), 'white')
-                # Requirement 3 (bugfix - ValueError: x=... is invalid
-                # range of '...' sector): the widened start/end written by
-                # quantile_conversion()/data_conversion() are ALREADY meant
-                # to be clamped to their own chromosome's bounds at write
-                # time (see those functions' own per-chromosome clamping
-                # loops) - but that clamp depends on a SEPARATE lookup
-                # against a chrom_info file read independently of what
-                # circos itself was actually initialized with, and can
-                # silently skip a chromosome entirely (falls through via
-                # `continue`) if that lookup ever fails to find a matching
-                # row (e.g. a chromosome present in marker/gene info but
-                # missing - or named slightly differently - in the
-                # chrom_info file). Clamping AGAIN here, directly against
-                # THIS sector's own authoritative bounds (exactly what
-                # circos was actually initialized with, so this can never
-                # itself be wrong) guarantees pycirclize is never handed an
-                # out-of-range coordinate, regardless of whether the
-                # earlier, separate clamp ran into that edge case - a
-                # defensive second layer, not a replacement for fixing the
-                # data itself to be correctly widened in the first place.
-                _start = max(sector.start, min(rec.start, sector.end))
-                _end = max(sector.start, min(rec.end, sector.end))
-                track.rect(_start, _end, fc=color, ec=_visible_edge_color(color), lw=edge_width)
+        for rec in _records_by_chr.get(sector.name, []):
+            color_key = str(rec.score)
+            color = cytoband_cmap.get(color_key, 'white')
+            used_colours.add(color_key)
+            # Requirement 3 (bugfix - ValueError: x=... is invalid
+            # range of '...' sector): the widened start/end written by
+            # quantile_conversion()/data_conversion() are ALREADY meant
+            # to be clamped to their own chromosome's bounds at write
+            # time (see those functions' own per-chromosome clamping
+            # loops) - but that clamp depends on a SEPARATE lookup
+            # against a chrom_info file read independently of what
+            # circos itself was actually initialized with, and can
+            # silently skip a chromosome entirely (falls through via
+            # `continue`) if that lookup ever fails to find a matching
+            # row (e.g. a chromosome present in marker/gene info but
+            # missing - or named slightly differently - in the
+            # chrom_info file). Clamping AGAIN here, directly against
+            # THIS sector's own authoritative bounds (exactly what
+            # circos was actually initialized with, so this can never
+            # itself be wrong) guarantees pycirclize is never handed an
+            # out-of-range coordinate, regardless of whether the
+            # earlier, separate clamp ran into that edge case - a
+            # defensive second layer, not a replacement for fixing the
+            # data itself to be correctly widened in the first place.
+            _start = max(sector.start, min(rec.start, sector.end))
+            _end = max(sector.start, min(rec.end, sector.end))
+            track.rect(_start, _end, fc=color, ec=_visible_edge_color(color), lw=edge_width)
+    return used_colours
 
 
 def _load_combined_marker_info(marker_info, RESULT_NAME, PHENOTYPE):
@@ -175,7 +362,38 @@ def _load_combined_marker_info(marker_info, RESULT_NAME, PHENOTYPE):
     common case - every non-gene-level model), this is exactly equivalent
     to the plain `pd.read_csv(marker_info)` it replaces: zero behaviour
     change for SNP-only results.
+
+    ver4-4 R7.b: this used to re-read marker_info.csv AND re-run
+    glob.glob() AND re-read every matching gene-coordinate side file on
+    EVERY call - and this function is called once per model per phenotype
+    per population from plot()/quantile_conversion()/interaction()
+    combined (measured: ~480 reads for a modest 5-phenotype x
+    6-population x 12-model run, ~22ms/read, ~10s of pure re-parsing on
+    top of everything else). Now cached at module level, keyed by
+    `(marker_info, mtime, RESULT_NAME, PHENOTYPE)` - the SAME
+    "path + mtime" pattern `pipeline_utils.phenotype_file_mtime_key()`
+    already establishes elsewhere in this codebase, so a marker_info.csv
+    edited BETWEEN runs (or mid-run, however unlikely) is still re-read
+    rather than silently served stale. The cache is cleared at the top of
+    every `circos_plot()` call (see that function), so it never persists
+    stale entries across separate runs/RESULT_NAMEs within one long-lived
+    process (e.g. main_app.py's in-process 'Option B: run now' path).
+
+    The returned DataFrame is served directly from the cache on a hit
+    (no defensive copy) - safe because every current caller only ever
+    reads from it via `pd.merge(...)`, never mutates it in place; adding
+    a copy here would spend back part of the very cost this cache exists
+    to remove.
     """
+    try:
+        _mtime = os.path.getmtime(marker_info)
+    except OSError:
+        _mtime = -1.0
+    _cache_key = (marker_info, _mtime, RESULT_NAME, PHENOTYPE)
+    _cached = _MARKER_INFO_CACHE.get(_cache_key)
+    if _cached is not None:
+        return _cached
+
     marker = pd.read_csv(marker_info)
     # Requirement 8: unify by position (chromosome, name, start, end) -
     # 'name' here is the MARKER's identifying column HEADER (a fixed,
@@ -188,14 +406,16 @@ def _load_combined_marker_info(marker_info, RESULT_NAME, PHENOTYPE):
     pattern = os.path.join('.', 'Result', RESULT_NAME, f'*_gene_coordinates_{PHENOTYPE}.csv')
     gene_coord_files = glob.glob(pattern)
     if not gene_coord_files:
-        return marker
+        combined = marker
+    else:
+        gene_tables = [pd.read_csv(f) for f in gene_coord_files]
+        combined = pd.concat([marker] + gene_tables, ignore_index=True)
+        # A name should resolve to exactly one location; if a gene coordinate
+        # table and marker_info somehow both define the same name, keep
+        # marker_info's own entry (read first, so kept by keep='first').
+        combined = combined.drop_duplicates(subset=['name'], keep='first')
 
-    gene_tables = [pd.read_csv(f) for f in gene_coord_files]
-    combined = pd.concat([marker] + gene_tables, ignore_index=True)
-    # A name should resolve to exactly one location; if a gene coordinate
-    # table and marker_info somehow both define the same name, keep
-    # marker_info's own entry (read first, so kept by keep='first').
-    combined = combined.drop_duplicates(subset=['name'], keep='first')
+    _MARKER_INFO_CACHE[_cache_key] = combined
     return combined
 
 
@@ -242,8 +462,14 @@ def data_conversion(chrom_info, gene_info, PHENOTYPE, RESULT_NAME, gene_adjust=0
     chromosome['population'] = chromosome['population'].astype(str)
     chromosome_population = pd.unique(chromosome['population'])
     
-    chromosome['start'] =[int(round(chromosome.loc[k, 'start'])) for k in range(chromosome.shape[0])]
-    chromosome['end'] =[int(round(chromosome.loc[k, 'end'])) for k in range(chromosome.shape[0])]
+    # ver4-4 R7.a (blueprint §2.7.1/§2.7.2, root-cause finding R7.a):
+    # replaces a Python-level list comprehension that called int(round(...))
+    # once per row with the equivalent vectorised pandas op. Benchmarked at
+    # 219x faster on 200k rows with byte-identical output (Series.round()
+    # uses the same round-half-to-even convention as the builtin round()
+    # this replaces) - see the R7 design record.
+    chromosome['start'] = chromosome['start'].round().astype('int64')
+    chromosome['end'] = chromosome['end'].round().astype('int64')
     chromosome['chromosome'] = chromosome['chromosome'].astype(str)
     
     for i in range(len(chromosome_population)):
@@ -300,8 +526,15 @@ def data_conversion(chrom_info, gene_info, PHENOTYPE, RESULT_NAME, gene_adjust=0
         # plain int first, for the same reason (a non-integer widening
         # amount doesn't correspond to a real base-pair distance anyway).
         _gene_adjust_int = int(round(gene_adjust))
-        gene['start'] = [int(gene.loc[k, 'start']) - _gene_adjust_int for k in range(gene.shape[0])]
-        gene['end'] = [int(gene.loc[k, 'end']) + _gene_adjust_int for k in range(gene.shape[0])]
+        # ver4-4 R7.a - see the chromosome start/end vectorisation above.
+        # NOTE: unlike the chromosome conversion above, this one never
+        # rounded - it truncated via plain int(...) - so this uses
+        # .astype('int64') (which truncates toward zero, exactly like
+        # Python's int() on a float) rather than .round().astype('int64'),
+        # to reproduce that exact (documented, deliberate - see the
+        # overflow-safety comment above) truncating behaviour.
+        gene['start'] = gene['start'].astype('int64') - _gene_adjust_int
+        gene['end'] = gene['end'].astype('int64') + _gene_adjust_int
 
         chromosome_total = pd.unique(gene['chromosome'])
         _unmatched_chromosomes = [c for c in chromosome_total if chromosome.loc[chromosome['chromosome'] == c].shape[0] == 0]
@@ -383,8 +616,32 @@ def data_conversion(chrom_info, gene_info, PHENOTYPE, RESULT_NAME, gene_adjust=0
         
     return pop_source
 
-def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_adjust, POPULATION, WINDOW, RESULT_NAME, ASCENDING):
-    
+def quantile_conversion(effect_grouped_all, effect_grouped_pop, marker_info, chrom_info, PHENOTYPE, MODEL, end_adjust, POPULATION, WINDOW, RESULT_NAME, ASCENDING):
+    """Assign each marker a 10-level colour bucket ('<hue><0-9>') from its
+    mean effect for one (PHENOTYPE, POPULATION) pair, per model, and write
+    one `marker_effect_<model>_<phenotype>_<population>.tsv` per surviving
+    model. Returns `MODEL` with any model that had no data for this
+    (PHENOTYPE, POPULATION) pair removed (`REMOVE`, below) - the caller
+    (`circos_plot()`) keeps this filtered result PER ITERATION rather than
+    rebinding its own loop-invariant `MODEL` (ver4-4 R7, the latent
+    MODEL-rebinding bug fixed in Stage 1).
+
+    ver4-4 R7.f: `effect_grouped_all`/`effect_grouped_pop` are the
+    ALREADY-``abs()``ed, ALREADY-grouped-and-averaged frames
+    `circos_plot()` computes exactly ONCE, before its own PHENOTYPE x
+    POPULATION loop (see that function) - `effect_grouped_all` for
+    `POPULATION == 'all'` (grouped by phenotype+model only) and
+    `effect_grouped_pop` for every other, real population (grouped by
+    population+phenotype+model). This function used to take the RAW
+    `effect` frame and redo BOTH the `.abs()` cast AND the full
+    `.groupby().mean()` itself, on EVERY call - i.e. once per (phenotype,
+    population) pair, even though neither computation's result actually
+    varies across that loop. Worse, the old `effect.iloc[:,5:] =
+    effect.iloc[:,5:].abs().astype(float)` line mutated the CALLER's own
+    `effect` object in place (a correctness bug in its own right - see
+    the R7.f note in `circos_plot()`, which now hands this function an
+    already-abs'd COPY instead of raw data it could mutate).
+    """
     chromosome = pd.read_csv(_circos_intermediate_dir(RESULT_NAME)+'/chrom_'+str(POPULATION)+'.bed', delimiter='\t')
     chromosome['chromosome'] = chromosome['chromosome'].astype(str)
     
@@ -396,22 +653,13 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
             cnt += 1
             if WINDOW*cnt > int(chromosome['end'].max()):
                 break
-    # Convert genomic marker effects into ten level quantiles
-    effect.iloc[:,5:] = effect.iloc[:,5:].abs().astype(float)
-    effect = effect.drop('ratio', axis=1)
-    
-    if POPULATION == 'all':
-        effect_grouped = effect.iloc[:,1:].groupby(['phenotype','model']).mean()
-        effect_grouped = effect_grouped.reset_index(drop=False)
-    else:
-        effect_grouped = effect.groupby(['population','phenotype','model']).mean()
-        effect_grouped = effect_grouped.reset_index(drop=False)
-        effect_grouped['population'] = effect_grouped['population'].astype(str)
+
+    effect_grouped = effect_grouped_all if POPULATION == 'all' else effect_grouped_pop
     
     REMOVE = []
     
     for iii in range(len(MODEL)):
-        colour = 'red' if MODEL[iii] in ['ensemble', 'Linear transformation', 'Nelder Mead', 'Bayesian optimisation'] else 'blue'
+        colour = 'red' if MODEL[iii] in ['ensemble', 'Linear transformation', 'Nelder Mead', 'Bayesian optimisation', 'Analytic least-squares'] else 'blue'
         if POPULATION == 'all':
             effect_selected = effect_grouped[(effect_grouped['model']==MODEL[iii]) & (effect_grouped['phenotype']==PHENOTYPE)].iloc[:,3:].T
         else:
@@ -477,29 +725,29 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
 
             if WINDOW == 0:
                 effect_selected_copy = effect_selected.copy().astype(object)
-                
+
                 if _all_zero_effect:
                     effect_selected_copy.iloc[:,0] = colour+'0'
                 else:
-                    effect_selected_copy.iloc[:,0] = colour+'0'
-                    tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.1)].dropna().index)
-                    effect_selected_copy.loc[tmp,:] = colour+'1'
-                    tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.2)].dropna().index)
-                    effect_selected_copy.loc[tmp,:] = colour+'2'
-                    tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.3)].dropna().index)
-                    effect_selected_copy.loc[tmp,:] = colour+'3'
-                    tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.4)].dropna().index)
-                    effect_selected_copy.loc[tmp,:] = colour+'4'
-                    tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.5)].dropna().index)
-                    effect_selected_copy.loc[tmp,:] = colour+'5'
-                    tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.6)].dropna().index)
-                    effect_selected_copy.loc[tmp,:] = colour+'6'
-                    tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.7)].dropna().index)
-                    effect_selected_copy.loc[tmp,:] = colour+'7'
-                    tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.8)].dropna().index)
-                    effect_selected_copy.loc[tmp,:] = colour+'8'
-                    tmp = list(effect_selected[effect_selected>= np.quantile(effect_selected.to_numpy().flatten(), 0.9)].dropna().index)
-                    effect_selected_copy.loc[tmp,:] = colour+'9'
+                    # ver4-4 R7.e - vectorised equivalent of the previous
+                    # nine separate np.quantile(...) calls (each
+                    # re-flattening and re-scanning the SAME array) plus
+                    # nine separate boolean-mask '>= threshold' passes.
+                    # Computed ONCE as a single ascending array of the 9
+                    # decile thresholds, then np.searchsorted(...,
+                    # side='right') assigns each value's level directly:
+                    # side='right' counts every threshold a value is
+                    # >= to (ties included, matching '>=' exactly),
+                    # reproducing the ORIGINAL cumulative overwrite
+                    # chain's own "highest threshold this value meets or
+                    # exceeds" semantics exactly, level-for-level and
+                    # tie-for-tie - verified directly against the
+                    # original nine-call chain on a fixture with ties and
+                    # exact-threshold values (R7.7 acceptance criterion).
+                    _values = effect_selected.to_numpy(dtype=float).flatten()
+                    _thresholds = np.quantile(_values, [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+                    _levels = np.searchsorted(_thresholds, _values, side='right')
+                    effect_selected_copy.iloc[:, 0] = [f"{colour}{lvl}" for lvl in _levels]
                 
                 effect_selected_copy.columns = ['colour']
                 if ASCENDING is not None:
@@ -574,8 +822,19 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
 
                 effect_selected = effect_selected.groupby(['chromosome',pd.cut((effect_selected['range']), bins=division)]).sum().drop(['start','end', 'range'],axis=1).reset_index(drop=False)
                 effect_selected = effect_selected.rename(columns={'range':'interval'})
-                effect_selected['start'] =[int(round(effect_selected['interval'][k].left)) for k in range(effect_selected['interval'].shape[0])]
-                effect_selected['end'] =[int((effect_selected['interval'][k].right)) for k in range(effect_selected['interval'].shape[0])]
+                # ver4-4 R7.a - vectorised equivalent of the previous
+                # per-row [int(round(iv.left)) for k in range(...)] /
+                # [int(iv.right) for k in range(...)] loops over this
+                # column's pandas Interval objects (from the pd.cut(...)
+                # bins used to group effect_selected just above).
+                # IntervalArray.left/.right already return the per-bin
+                # edges as a single vectorised array - this only adds the
+                # SAME int(round(...)) / int(...) casts the loops applied,
+                # preserving the deliberate asymmetry between the two
+                # (start is rounded, end is truncated - unchanged here).
+                _interval_arr = effect_selected['interval'].array
+                effect_selected['start'] = np.round(np.asarray(_interval_arr.categories.left[_interval_arr.codes], dtype=float)).astype('int64')
+                effect_selected['end'] = np.asarray(_interval_arr.categories.right[_interval_arr.codes], dtype=float).astype('int64')
                 
                 effect_selected = effect_selected.drop('interval',axis=1)
                 # Requirement (bugfix): clamp to each bin's own
@@ -603,24 +862,18 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
                 effect_selected_copy = effect_selected_copy.astype({effect_selected_copy.columns[2]: object})
                 effect_selected_copy.iloc[:,2] = colour+'0'
                 if not _all_zero_effect:
-                    tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.1)].dropna().index)
-                    effect_selected_copy.iloc[tmp,2] = colour+'1'
-                    tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.2)].dropna().index)
-                    effect_selected_copy.iloc[tmp,2] = colour+'2'
-                    tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.3)].dropna().index)
-                    effect_selected_copy.iloc[tmp,2] = colour+'3'
-                    tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.4)].dropna().index)
-                    effect_selected_copy.iloc[tmp,2] = colour+'4'
-                    tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.5)].dropna().index)
-                    effect_selected_copy.iloc[tmp,2] = colour+'5'
-                    tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.6)].dropna().index)
-                    effect_selected_copy.iloc[tmp,2] = colour+'6'
-                    tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.7)].dropna().index)
-                    effect_selected_copy.iloc[tmp,2] = colour+'7'
-                    tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.8)].dropna().index)
-                    effect_selected_copy.iloc[tmp,2] = colour+'8'
-                    tmp = list(effect_selected[effect_selected['effect']>= np.quantile(effect_selected['effect'].to_numpy().flatten(), 0.9)].dropna().index)
-                    effect_selected_copy.iloc[tmp,2] = colour+'9'
+                    # ver4-4 R7.e - same vectorisation as the WINDOW==0
+                    # branch above: one ascending array of 9 decile
+                    # thresholds, one np.searchsorted(..., side='right')
+                    # call assigns every row's level directly, reproducing
+                    # the original nine-call cumulative-overwrite chain's
+                    # "highest threshold this value meets or exceeds"
+                    # semantics exactly (see the WINDOW==0 branch's own
+                    # comment for the full boundary-semantics argument).
+                    _values = effect_selected['effect'].to_numpy(dtype=float)
+                    _thresholds = np.quantile(_values, [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9])
+                    _levels = np.searchsorted(_thresholds, _values, side='right')
+                    effect_selected_copy.iloc[:, 2] = [f"{colour}{lvl}" for lvl in _levels]
                 
                 merged = effect_selected_copy.loc[:,['chromosome', 'start', 'end', 'index', 'effect']]
                 merged = merged.rename(columns={'effect':'colour'})
@@ -655,91 +908,430 @@ def quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE, MODEL, end_a
     
     return MODEL
 
-def interaction(interaction, marker_info, PHENOTYPE, circos_config, POPULATION, RESULT_NAME, attention_original):
-    
+def _select_top_interactions(df, circos_config):
+    """Requirements.md item 4: select which marker-pair interactions are
+    strong enough to draw as links on the circos plot - either the top
+    N% by value (this module's original, still-default behaviour) or
+    the top M (an absolute count), whichever
+    `circos_config['interaction_top_mode']` selects.
+
+    Shared by both branches of interaction() below (the RF branch and
+    the GAT-attention branch) - previously each duplicated its own
+    identical quantile-filtering line independently; centralising the
+    decision here means the two branches can't drift apart on HOW 'top'
+    is defined, only on which 'value'-bearing rows are being ranked.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Already phenotype-filtered, grouped rows with a 'value' column
+        (higher = a stronger interaction/attention weight) - the exact
+        shape both call sites already build before calling this.
+    circos_config : dict
+        'interaction_top_mode' : 'percentage' (default - every existing
+            config that predates this feature has no such key, and
+            reproduces EXACTLY today's behaviour) or 'count'.
+          - 'percentage': keeps a RANK-based top `interaction_top`% of
+            `df` (`round(df.shape[0] * interaction_top / 100)` rows, by
+            `.nlargest`), restricted to rows with a genuinely nonzero
+            'value' - see "Bug fix" below.
+          - 'count': keeps exactly the top `interaction_top_count` rows
+            by `value` (fewer than that if `df` has fewer rows to begin
+            with) - a literal top-M selection, no quantile involved.
+            Unaffected by the bug fix below.
+
+    Returns
+    -------
+    A filtered, index-reset copy of `df` - never mutates the input.
+
+    Bug fix (quantile-threshold collapse under tied/zero values)
+    --------------------------------------------------------------
+    The original 'percentage' implementation (`df['value'] >=
+    quantile(df['value'], 1 - interaction_top/100)`) silently breaks
+    whenever a large share of `df['value']` is TIED at (or below) the
+    computed quantile - most commonly at EXACTLY 0.0. This is not rare:
+    every marker-pair-interaction extractor this codebase has
+    (`models/interaction_extraction.py`) writes `value=0.0` for every
+    pair it did NOT genuinely evaluate - most consequentially, every
+    UNSCREENED pair whenever that module's own `h_statistic_interactions
+    (screen=...)` pre-filter is enabled (`screen_keep` defaults to a
+    mere 2%). Every 'value' column this function ever receives is
+    non-negative by construction (SHAP-interaction magnitudes, Friedman's
+    H^2, GAT attention weights, EBM/NID importances - see
+    models.interaction_extraction.normalize_task_interactions()'s own
+    docstring), so once that large zero-tied mass exceeds
+    `100 - interaction_top` percent of `df`, `np.quantile(...)` itself
+    resolves to `0.0` and `value >= 0.0` becomes true for EVERY row -
+    confirmed directly: with a 98%-zero-tied reproduction (pre-screen at
+    its own 2% default), this function jumped from a correctly-
+    thresholded selection at `interaction_top=1` to keeping 100% of the
+    table (every row, including every never-evaluated pair) at
+    `interaction_top` in {5, 10, 50}. This is exactly the reported
+    symptom: a circos interaction ring for one model/setting rendering a
+    dense web of many more links than another model's ring at the
+    IDENTICAL "top N%" setting, purely because that model's own
+    interaction-value distribution happens to have a large tied-at-zero
+    mass and the other's does not.
+
+    The fix ranks by value instead of thresholding by quantile - `m =
+    round(df.shape[0] * interaction_top / 100)` rows, taken by
+    `.nlargest`, is always approximately `interaction_top`% of `df`
+    regardless of how many rows tie at any given value. It is further
+    capped to `df`'s own count of rows with `value > 0`, so a pair that
+    was never actually evaluated (screened-out or degenerate, `value ==
+    0.0` by construction) is never drawn as a link purely to pad the
+    requested count out to `m` - drawing a link with no evidence behind
+    it is worse than drawing fewer links than requested. This mirrors
+    (and must be kept in sync with) the identical fix in
+    `models.interaction_extraction.top_select()`'s own 'percentage'
+    mode - see that function's own "Bug fix" note for the full
+    reproduction.
+    """
+    mode = circos_config.get('interaction_top_mode', 'percentage')
+    if mode == 'count':
+        _m = circos_config.get('interaction_top_count', 0) or 0
+        _m = max(0, min(int(_m), df.shape[0]))
+        return df.nlargest(_m, 'value').reset_index(drop=True)
+    # 'percentage' (default) - rank-based top-N%, not a quantile
+    # threshold. See this function's own "Bug fix" note above.
+    nonzero = df[df['value'] > 0]
+    _m = int(round(df.shape[0] * (circos_config['interaction_top'] / 100)))
+    _m = max(0, min(_m, nonzero.shape[0]))
+    return nonzero.nlargest(_m, 'value').reset_index(drop=True)
+
+
+def _ensure_marker_pair_sum_count(df):
+    """OOM fix (large Interaction.csv/Attention.csv files): normalise
+    whatever `df` was handed in to a uniform 'value_sum'/'value_count'
+    shape, so every caller below can always finish with one single
+    `sum -> divide` step (`_regroup_and_finalize_mean()`), regardless of
+    whether `df` is:
+
+      - the ORIGINAL shape this module has always accepted: one row per
+        raw (population, model, phenotype, marker1, marker2) OBSERVATION,
+        carrying a single 'value' column - run_sequential.py and
+        main_app.py's in-process 'run now' path still hand this in
+        completely unchanged (GP()'s own in-memory accumulators were
+        never the source of the OOM this fixes, only reading a large
+        on-disk Interaction.csv/Attention.csv back in for Step-2
+        plotting was - see batch_reader.aggregate_marker_pair_sums()'s
+        own docstring); or
+      - the NEW, memory-bounded shape `batch_reader.
+        aggregate_marker_pair_sums()` produces for exactly that Step-2
+        case: already collapsed to one row per (population, model,
+        phenotype, marker1, marker2) COMBINATION, carrying 'value_sum'/
+        'value_count' instead of a single 'value'.
+
+    Either way, callers apply the row-level 'factor' sentinel filter
+    BEFORE this function, so a 'factor' row from either shape is dropped
+    identically before it can contribute to any sum."""
+    if 'value_sum' in df.columns and 'value_count' in df.columns:
+        return df
+    df = df.copy()
+    df['value_sum'] = df['value']
+    df['value_count'] = 1
+    return df
+
+
+def _regroup_and_finalize_mean(df, group_cols):
+    """The single `sum -> divide` step every caller finishes with, after
+    `_ensure_marker_pair_sum_count()` above: sums 'value_sum'/
+    'value_count' across whatever rows still share the same `group_cols`
+    key - correctly RE-combining, e.g., two originally-different
+    'between'-scenario population labels that `circos_plot()`'s own
+    `str.split('->')` step upstream can leave mapped to the identical
+    population string (see that call site's own comment) - then divides
+    ONCE to produce the final per-key mean.
+
+    Replaces every `.groupby(keys, as_index=False).mean(numeric_only=True)`
+    call this module used to make directly on a raw-row 'value' column.
+    For a `df` that started as one row per raw observation (i.e. came
+    through `_ensure_marker_pair_sum_count()`'s pass-through branch,
+    'value_count' all 1s), summing N ones and dividing the summed values
+    by N is arithmetically the exact same number pandas' own `.mean()`
+    would have produced - nothing changes for that caller except the
+    intermediate column name.
+
+    Update ID ver4-10 (performance fix): `interaction()`'s own two
+    branches no longer call this function directly - see
+    `_precompute_interaction_groups()`, which performs this EXACT same
+    sum-then-divide reduction, but as ONE combined `.groupby(...).sum()`
+    across every key at once rather than one call per (population, model,
+    phenotype) key (hundreds of separate calls' worth of avoidable
+    per-call overhead on a many-population/many-phenotype run - see that
+    function's own docstring). This function is kept, unchanged, as the
+    single documented reference for what that reduction IS and why it
+    must happen this way (`batch_reader.py` still points here by name to
+    explain why `aggregate_marker_pair_sums()` returns sum/count rather
+    than a pre-finalised mean) - it is no longer on the hot path itself,
+    but the invariant it documents still is.
+    """
+    grouped = df.groupby(list(group_cols), as_index=False)[['value_sum', 'value_count']].sum()
+    grouped['value'] = grouped['value_sum'] / grouped['value_count']
+    return grouped.drop(columns=['value_sum', 'value_count'])
+
+
+def _precompute_interaction_groups(df, *, scope_model_order_by_population):
+    """Requirement (performance fix - circos plot generation "taking
+    forever" once more than one interaction-emitting model is selected,
+    e.g. RKHS + RF + SVR + KNN together):
+
+    Before this function existed, `interaction()` below re-derived its
+    per-(POPULATION, model, PHENOTYPE) marker-pair table from the FULL
+    `interactions`/`attention` DataFrame from scratch, EVERY time it was
+    called - and `circos_plot()` calls it once per (PHENOTYPE[i],
+    POPULATION[j]) pair, i.e. `len(PHENOTYPE) * len(POPULATION)` times in
+    total. Each of those calls re-ran the SAME 'factor'-row filter,
+    `_ensure_marker_pair_sum_count()` normalisation, and
+    `.groupby(...).mean()` reduction over the ENTIRE table (every model,
+    every phenotype, every population at once), even though only a tiny
+    slice of it was actually used by that one call. This was already
+    wasteful with a single interaction-emitting model (RF, historically
+    the only one); it now scales directly with how many models are
+    selected, since `model_registry.py` wires up rrBLUP/GBLUP/BayesB/
+    RKHS/RF/SVR/KNN/MLP as additional interaction emitters - four models
+    selected together means a table roughly 4x the size, re-scanned in
+    full the exact same `len(PHENOTYPE) * len(POPULATION)` number of
+    times, for a roughly 4x-and-growing wall-clock cost with no change in
+    what actually gets drawn.
+
+    This mirrors the ver4-4 R7.f treatment already given to the `effect`
+    frames in `circos_plot()` (`_effect_grouped_all`/`_effect_grouped_pop`,
+    computed ONCE before that function's own (PHENOTYPE, POPULATION) loop
+    rather than once per iteration inside `quantile_conversion()`) -
+    `interaction()`'s two branches (the RF-family/interaction branch and
+    the GAT-attention branch) never received the same treatment until
+    now, which is why this symptom is specific to the marker-pair
+    interaction/attention rings and not the per-marker effect rings.
+
+    Runs the EXACT SAME reduction as before - the row-level 'factor'
+    filter, then `_ensure_marker_pair_sum_count()`, then a
+    `.groupby(...).mean()` - just ONCE up front over the whole table,
+    keyed by every (population-or-'all', model, phenotype) combination
+    actually present, instead of once per loop iteration. Numerically
+    identical output to the pre-fix code; only WHEN the work happens
+    changes. Accepts either the raw one-row-per-observation shape
+    (Sequential/in-process "Option B: run now" - see `circos_plot.py`
+    call sites) or the pre-aggregated 'value_sum'/'value_count' shape
+    `batch_reader.aggregate_marker_pair_sums()`/`ResultSet.
+    interactions_grouped()`/`attention_grouped()` produce (Parallel Step
+    2 assemble, and the GUI's own "load an assembled result" path) -
+    `_ensure_marker_pair_sum_count()` already normalises either shape
+    identically, so this one function is what makes the fix apply the
+    same way regardless of which of the three ways a run's interactions/
+    attention data reached `circos_plot()` in the first place.
+
+    Implementation note (found while benchmarking this fix against a
+    many-population, many-phenotype run): the first version of this
+    function still called `_regroup_and_finalize_mean()` - itself one
+    `.groupby(...).sum()` call - once PER (population, model, phenotype)
+    key, i.e. still hundreds of separate pandas groupby invocations, just
+    no longer `len(PHENOTYPE) * len(POPULATION)` times each. Each
+    invocation's fixed per-call overhead (hashing/sorting the grouping
+    keys from scratch) dominated at that key-count, so this does the
+    sum-and-divide reduction with exactly TWO combined `.groupby(...)
+    .sum()` calls total (one for the 'all' cross-population aggregate,
+    one for every named population at once) and only THEN splits each
+    already-small reduced result into its per-key slices - splitting a
+    `.groupby()` object that has already computed its group index is
+    cheap per key; computing that index from scratch hundreds of times
+    was not.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        The full `interactions` or `attention_original` table handed to
+        `circos_plot()` - every model, every phenotype, every population
+        at once (or empty).
+    scope_model_order_by_population : bool
+        Preserves a pre-existing, historical INCONSISTENCY between the
+        two branches of `interaction()` exactly as it always behaved,
+        rather than opportunistically "fixing" it as a side effect of
+        this performance change: the interaction/RF-family branch always
+        derived its per-model iteration order (`.unique()`) from the
+        table ALREADY FILTERED to one POPULATION; the GAT-attention
+        branch always derived its own model order from the FULL,
+        population-UNFILTERED table. True reproduces the former
+        (`interactions`); False reproduces the latter (`attention`).
+
+    Returns
+    -------
+    (groups, model_order) :
+        groups : dict {(population_key, model_name, phenotype_value):
+            DataFrame[marker1, marker2, value]} - the fully reduced,
+            per-key marker-pair table `interaction()` used to derive
+            inline. `population_key` is either the literal 'all' (the
+            cross-population aggregate `POPULATION == 'all'` has always
+            used - population dropped entirely, never filtered) or the
+            population's own `str(...)` label (matches a specific,
+            already-`_clean_population_label()`-normalised
+            `POPULATION[j]`).
+        model_order : dict {population_key: [model_name, ...]} - the
+            same first-appearance `.unique()` order the pre-fix code
+            derived inline, computed once instead of once per
+            (PHENOTYPE, POPULATION) call. Always has exactly one key
+            ('all') when `scope_model_order_by_population` is False.
+    """
+    if df.shape[0] == 0:
+        return {}, {}
+
+    _value_cols = [c for c in ('value', 'value_sum', 'value_count') if c in df.columns]
+    has_population = 'population' in df.columns
+
+    keep_cols = (['population'] if has_population else []) + ['model', 'phenotype', 'marker1', 'marker2'] + _value_cols
+    work = df.loc[:, keep_cols]
+    work = work[(work['marker1'] != 'factor') & (work['marker2'] != 'factor')]
+    work = _ensure_marker_pair_sum_count(work)
+    if has_population:
+        work = work.copy()
+        work['population'] = work['population'].astype(str)
+
+    groups = {}
+
+    # The 'all' cross-population aggregate: population dropped entirely
+    # before grouping - matches the original `POPULATION == 'all'`
+    # branch's own column selection (never a filter to one population).
+    # ONE combined `.groupby(...).sum()` across every (model, phenotype,
+    # marker1, marker2) combination - collapses ratio/sample duplicates
+    # for every key at once - then a SECOND, cheap split of that already-
+    # small result into its per-(model, phenotype) slices.
+    _all_reduced = work.groupby(['model', 'phenotype', 'marker1', 'marker2'], as_index=False)[['value_sum', 'value_count']].sum()
+    _all_reduced['value'] = _all_reduced['value_sum'] / _all_reduced['value_count']
+    for (model_name, phenotype_value), sub in _all_reduced.groupby(['model', 'phenotype'], sort=False):
+        groups[('all', model_name, phenotype_value)] = sub[['marker1', 'marker2', 'value']]
+    model_order = {'all': work['model'].drop_duplicates().tolist()}
+
+    if has_population:
+        _pop_reduced = work.groupby(['population', 'model', 'phenotype', 'marker1', 'marker2'], as_index=False)[['value_sum', 'value_count']].sum()
+        _pop_reduced['value'] = _pop_reduced['value_sum'] / _pop_reduced['value_count']
+        for (population_value, model_name, phenotype_value), sub in _pop_reduced.groupby(['population', 'model', 'phenotype'], sort=False):
+            groups[(population_value, model_name, phenotype_value)] = sub[['marker1', 'marker2', 'value']]
+        if scope_model_order_by_population:
+            for population_value, sub in work.groupby('population', sort=False):
+                model_order[population_value] = sub['model'].drop_duplicates().tolist()
+
+    return groups, model_order
+
+
+def _build_interaction_ring(selected, circos_config, marker_info, PHENOTYPE, RESULT_NAME, model_name):
+    """The shared tail end of both branches below, factored out
+    unchanged (byte-for-byte the same operations, same order) so the
+    performance fix's new dict-lookup front end doesn't have to keep two
+    copies of it in sync: top-N/top-% selection, sum-to-1 normalisation,
+    marker-name -> chromosome/position resolution via `loc_info`, and the
+    final `[chromosome_marker1, start, end, chromosome_marker2, start,
+    end, value]` shape `plot()` expects, tagged with `model_name`.
+
+    `selected` is already the small, single-(population, model,
+    phenotype) slice `_precompute_interaction_groups()` produced -
+    exactly the `interaction_model[interaction_model['phenotype'] ==
+    PHENOTYPE]` / post-`_regroup_and_finalize_mean()` frame the pre-fix
+    code built inline at this point, just arrived at without re-scanning
+    the full table to get here. Returns `None` when there is nothing to
+    draw (no data for this key, or `_select_top_interactions()` narrowed
+    it to zero rows) - callers `continue` on that, matching the pre-fix
+    code's own early-`continue` checks.
+    """
+    if selected is None or selected.shape[0] == 0:
+        return None
+    selected = _select_top_interactions(selected, circos_config)
+    if selected.shape[0] == 0:
+        return None
+    selected = selected.copy()
+    selected['value'] = selected['value'] / selected['value'].sum()
+
+    loc_info = _load_combined_marker_info(marker_info, RESULT_NAME, PHENOTYPE)
+    start = pd.merge(selected['marker1'], loc_info, 'inner', left_on='marker1', right_on='name')
+    end = pd.merge(selected['marker2'], loc_info, 'inner', left_on='marker2', right_on='name')
+
+    # ver4-4 R7.a - see the vectorisation note in data_conversion()
+    # above; identical int(round(...)) row-loop pattern, replaced the
+    # same way.
+    start['start'] = start['start'].round().astype('int64')
+    start['end'] = start['end'].round().astype('int64')
+    end['start'] = end['start'].round().astype('int64')
+    end['end'] = end['end'].round().astype('int64')
+
+    chrom_start = start['chromosome'].astype(str)
+    chrom_end = end['chromosome'].astype(str)
+
+    selected = pd.concat([chrom_start, start.loc[:, ['start', 'end']],
+                           chrom_end, end.loc[:, ['start', 'end']],
+                           selected['value']], axis=1)
+    selected.columns = ['chromosome_marker1', 'start', 'end', 'chromosome_marker2', 'start', 'end', 'value']
+    selected['model'] = model_name
+    return selected
+
+
+def interaction(interaction_groups, interaction_model_order, marker_info, PHENOTYPE, circos_config, POPULATION, RESULT_NAME, attention_groups, attention_model_order):
+    """Requirement 2 (Update ID ver4-5): `interaction` can now hold rows
+    from MORE THAN ONE model (model_registry.emits_interactions() decides
+    which models are allowed to write to Interaction.csv - previously
+    RF-only). This function mirrors the attention branch immediately
+    below it, which already did the right thing for multiple GAT
+    variants: one independent ring per model, never averaged together.
+
+    Previously this branch dropped the 'model' column BEFORE grouping by
+    (phenotype, marker1, marker2) and relabelled the combined result 'RF'
+    unconditionally - harmless with exactly one emitter selected (the
+    only configuration that existed before this update), but silently
+    AVERAGED two different models' values for the same pair into one ring
+    whenever a second interaction-emitting model was selected, and
+    mislabelled the result as RF's regardless. An RF-only run takes
+    exactly the same code path as before (one iteration of the loop
+    below, with model_selected==['RF']) and produces byte-identical
+    output - see EasiGP_ver4-5_Change_Summary.md §10 for the fixture this
+    was checked against.
+
+    Requirement (performance fix, Update ID ver4-10): this function used
+    to take the FULL `interactions`/`attention_original` tables and
+    re-derive its own per-model slice from scratch on every call -
+    `circos_plot()` calls it once per (PHENOTYPE, POPULATION) pair, so
+    that full-table work happened `len(PHENOTYPE) * len(POPULATION)`
+    times over. With more than one interaction-emitting model selected
+    (RKHS/RF/SVR/KNN, etc. - see `model_registry.py`), that full table is
+    several times larger than the RF-only case this was originally
+    written for, which is what made circos-plot generation "take
+    forever". `circos_plot()` now calls `_precompute_interaction_groups()`
+    ONCE, before its (PHENOTYPE, POPULATION) loop, for `interactions` and
+    for `attention` independently, and hands this function the resulting
+    small lookup dicts instead of the raw tables - see that function's
+    own docstring for the full rationale and for why this applies
+    identically regardless of whether the run was Sequential, an
+    in-process GUI "Option B: run now", or a Parallel Step 2 assemble
+    (raw vs pre-aggregated 'value_sum'/'value_count' shape - both were,
+    and still are, handled transparently). This function's own
+    observable output - which rings get drawn, with which values - is
+    unchanged; only how expensively it gets there.
+
+    `interaction_model_order`/`attention_model_order` reproduce the
+    pre-fix code's own per-branch model-iteration order exactly (see
+    `_precompute_interaction_groups()`'s `scope_model_order_by_population`
+    parameter for the historical inconsistency between the two branches
+    that this preserves rather than "fixes").
+    """
     interaction_selected_total = pd.DataFrame()
-    model_selected = []    
-    
-    if interaction.shape[0]==0 and attention_original.shape[0]==0:
-        return pd.DataFrame()
-    else:
-        if interaction.shape[0] != 0:
-            model_selected += ['RF'] 
-        
-            # Extract key gmarker-by-marker interaction patterns
-            if POPULATION == 'all' and interaction.shape[0]!=0:
-                interaction = interaction.loc[:,['phenotype','marker1','marker2', 'value']]
-            elif POPULATION != 'all' and interaction.shape[0]!=0:
-                interaction = interaction.loc[:,['population','phenotype','marker1','marker2', 'value']]
-                interaction = interaction[interaction['population'].astype(str)==str(POPULATION)].reset_index(drop=False)
-            
-            interaction = interaction[(interaction['marker1'] != 'factor') & (interaction['marker2'] != 'factor')]
-            interaction = interaction.groupby(['phenotype','marker1','marker2'], as_index=False).mean(numeric_only=True)
-            
-            interaction_selected = interaction[interaction['phenotype'] == PHENOTYPE]
-            interaction_selected = interaction_selected[interaction_selected['value'] >= np.quantile(interaction_selected['value'], (1-(circos_config['interaction_top']/100)))].reset_index(drop=True)
-            interaction_selected['value'] = interaction_selected['value'] / interaction_selected['value'].sum()
-            
-            loc_info = _load_combined_marker_info(marker_info, RESULT_NAME, PHENOTYPE)
-            
-            start = pd.merge(interaction_selected['marker1'], loc_info, 'inner', left_on='marker1', right_on='name')
-            end = pd.merge(interaction_selected['marker2'], loc_info, 'inner', left_on='marker2', right_on='name')
-            
-            start['start'] =[int(round(start.loc[k, 'start'])) for k in range(start.shape[0])]
-            start['end'] =[int(round(start.loc[k, 'end'])) for k in range(start.shape[0])]
-            end['start'] =[int(round(end.loc[k, 'start'])) for k in range(end.shape[0])]
-            end['end'] =[int(round(end.loc[k, 'end'])) for k in range(end.shape[0])]
-            
-            chrom_start = start['chromosome'].astype(str)
-            chrom_end = end['chromosome'].astype(str)
-        
-            interaction_selected = pd.concat([chrom_start, start.loc[:,['start','end']],
-                                       chrom_end, end.loc[:,['start','end']],
-                                       interaction_selected['value']],axis=1)
-            interaction_selected.columns = ['chromosome_marker1', 'start','end','chromosome_marker2','start','end','value']
-            interaction_selected['model'] = 'RF'
 
-            interaction_selected_total = pd.concat([interaction_selected_total, interaction_selected])
-        if attention_original.shape[0]!=0:
-            models_GAT = attention_original['model'].unique().tolist()
-            model_selected += models_GAT
+    models_interaction = interaction_model_order.get(POPULATION, [])
+    for model_name in models_interaction:
+        selected = interaction_groups.get((POPULATION, model_name, PHENOTYPE))
+        ring = _build_interaction_ring(selected, circos_config, marker_info, PHENOTYPE, RESULT_NAME, model_name)
+        if ring is None:
+            continue
+        interaction_selected_total = pd.concat([interaction_selected_total, ring])
 
-            for i in range(len(models_GAT)):
-                # Extract key gmarker-by-marker interaction patterns
-                if POPULATION == 'all' and attention_original.shape[0]!=0:
-                    attention = attention_original[attention_original['model']==models_GAT[i]].reset_index(drop=False)
-                    attention = attention.loc[:,['phenotype','marker1','marker2', 'value']]
-                elif POPULATION != 'all' and attention_original.shape[0]!=0:
-                    attention = attention_original[attention_original['model']==models_GAT[i]].reset_index(drop=False)
-                    attention = attention.loc[:,['population','phenotype','marker1','marker2', 'value']]
-                    attention = attention[attention['population'].astype(str)==str(POPULATION)].reset_index(drop=False)
-                attention = attention[(attention['marker1'] != 'factor') & (attention['marker2'] != 'factor')]
-                attention = attention.groupby(['phenotype','marker1','marker2'], as_index=False).mean(numeric_only=True)
-                
-                attention = attention[attention['phenotype'] == PHENOTYPE]
-                attention = attention[attention['value'] >= np.quantile(attention['value'], (1-(circos_config['interaction_top']/100)))].reset_index(drop=True)
-                attention['value'] = attention['value'] / attention['value'].sum()
-                
-                loc_info = _load_combined_marker_info(marker_info, RESULT_NAME, PHENOTYPE)
-                
-                start = pd.merge(attention['marker1'], loc_info, 'inner', left_on='marker1', right_on='name')
-                end = pd.merge(attention['marker2'], loc_info, 'inner', left_on='marker2', right_on='name')
-                
-                start['start'] =[int(round(start.loc[k, 'start'])) for k in range(start.shape[0])]
-                start['end'] =[int(round(start.loc[k, 'end'])) for k in range(start.shape[0])]
-                end['start'] =[int(round(end.loc[k, 'start'])) for k in range(end.shape[0])]
-                end['end'] =[int(round(end.loc[k, 'end'])) for k in range(end.shape[0])]
-                
-                chrom_start = start['chromosome'].astype(str)
-                chrom_end = end['chromosome'].astype(str)
-            
-                attention = pd.concat([chrom_start, start.loc[:,['start','end']],
-                                           chrom_end, end.loc[:,['start','end']],
-                                           attention['value']],axis=1)
-                attention.columns = ['chromosome_marker1', 'start','end','chromosome_marker2','start','end','value']
-                attention['model'] = models_GAT[i]
-                interaction_selected_total = pd.concat([interaction_selected_total, attention])
-            
+    # The GAT-attention branch's model order has never been scoped by
+    # POPULATION (see `_precompute_interaction_groups()`'s docstring) -
+    # always the single 'all' key, regardless of which POPULATION this
+    # call is for.
+    models_GAT = attention_model_order.get('all', [])
+    for model_name in models_GAT:
+        selected = attention_groups.get((POPULATION, model_name, PHENOTYPE))
+        ring = _build_interaction_ring(selected, circos_config, marker_info, PHENOTYPE, RESULT_NAME, model_name)
+        if ring is None:
+            continue
+        interaction_selected_total = pd.concat([interaction_selected_total, ring])
+
     return interaction_selected_total
 
 def _circos_axis_unit_label(circos_config):
@@ -827,7 +1419,7 @@ class _GradientSwatchHandler(mlegend_handler.HandlerBase):
         return patches
 
 
-def _build_circos_legend_handles(colours_used_by_hue, CYTOBAND_COLORMAP, gene_colours_used, has_inter_chr_link, has_intra_chr_link):
+def _build_circos_legend_handles(colours_used_by_hue, CYTOBAND_COLORMAP, gene_colours_used, has_inter_chr_link, has_intra_chr_link, truncated_labels=None):
     """Requirement 13 (and its Requirement 1 correction): build the
     legend entries for the current plot - ONLY for colours/categories
     that actually appear on THIS specific rendering, never every colour
@@ -871,7 +1463,15 @@ def _build_circos_legend_handles(colours_used_by_hue, CYTOBAND_COLORMAP, gene_co
     (not a single 'has_links' flag) - a plot could have EITHER only
     within-chromosome or only between-chromosome interactions among
     whatever's actually displayed, and showing both colours regardless
-    would list one that never appears as a line anywhere on the plot."""
+    would list one that never appears as a line anywhere on the plot.
+
+    `truncated_labels` (Update ID ver4-6, R2, blueprint §3.2 Defence 2):
+    optional `{truncated ring-label text: full original label}` dict -
+    one invisible-swatch legend row per entry, e.g.
+    'GAT_biological_pri... = GAT_biological_prior_knowledge__Bayesian',
+    so a ring label shortened for space never loses the reader's ability
+    to look up what it actually stands for. `None`/empty adds nothing -
+    the common case, since most configs never trigger a truncation."""
     handles = []
     handler_map = {}
     if CYTOBAND_COLORMAP is None:
@@ -909,13 +1509,91 @@ def _build_circos_legend_handles(colours_used_by_hue, CYTOBAND_COLORMAP, gene_co
     if has_intra_chr_link:
         handles.append(mlines.Line2D([0], [0], color='red', lw=2, label='intra-chr link'))
 
+    # Update ID ver4-6, R2 (blueprint §3.2 Defence 2): one invisible-swatch
+    # row per shortened ring label, so the full name a truncated label
+    # stands for is always still readable somewhere on the page.
+    if truncated_labels:
+        for _truncated, _full in sorted(truncated_labels.items()):
+            handles.append(mpatches.Patch(facecolor='none', edgecolor='none',
+                                           label=f'{_truncated}  =  {_full}'))
+
     return handles, handler_map
 
 
-def _save_circos_legend(handles, handler_map, save_path):
+def _new_legend_accumulator():
+    """ver4-5 (single session-wide legend): the mutable, shared record of
+    every legend-relevant thing actually drawn across ALL circos plots
+    produced by one `circos_plot()` call - one instance is created at
+    the top of that function and threaded through every `plot()` call
+    made during its (PHENOTYPE x POPULATION) loop, so the SAME shape
+    `_build_circos_legend_handles()` already expects for a single plot
+    (a {hue: {colour strings}} dict, a set of gene colours, and two
+    booleans for the two link types) is simply accumulated - unioned -
+    across every one of those calls instead of being rebuilt fresh, and
+    thrown away, for each one. Mirrors exactly what a single plot() call
+    used to compute for itself right before saving its own
+    '<...>_legend.png' - see `_merge_into_legend_accumulator()`."""
+    return {
+        'colours_used_by_hue': {},
+        'gene_colours_used': set(),
+        'has_inter_chr_link': False,
+        'has_intra_chr_link': False,
+        # Update ID ver4-6, R2 (blueprint §3.2 Defence 2): {truncated
+        # ring-label text -> full original label}, unioned across every
+        # plot() call this circos_plot() invocation makes - empty unless
+        # `ring_label_fit` actually had to shorten something anywhere in
+        # the whole run. See `_build_circos_legend_handles()`'s own new
+        # parameter for how this becomes legend rows.
+        'truncated_labels': {},
+    }
+
+
+def _merge_into_legend_accumulator(accumulator, *, colours_used_by_hue=None, gene_colours_used=None,
+                                    has_inter_chr_link=None, has_intra_chr_link=None,
+                                    truncated_labels=None):
+    """Folds one plot() call's own legend-relevant findings into the
+    shared, session-wide `accumulator` (see `_new_legend_accumulator()`).
+    Every argument is optional and merged only if provided, since
+    `plot()` calls this twice per render - once for colours/gene-colours
+    (computed once per call, before its own per-model loop) and once per
+    model for the two link-type flags (which DO vary per model - see
+    plot()'s own has_inter_chr_link_for_legend/has_intra_chr_link_for_legend)
+    - so a single call site would otherwise have to pass placeholder
+    values for whichever half it doesn't yet have. Colours are UNIONED
+    (a level seen on any one plot in the session belongs in the combined
+    legend), and the link-type flags are OR'd (the combined legend shows
+    a link type if it appeared on ANY plot this session, not only the
+    last one)."""
+    if colours_used_by_hue is not None:
+        for hue, levels in colours_used_by_hue.items():
+            accumulator['colours_used_by_hue'].setdefault(hue, set()).update(levels)
+    if gene_colours_used is not None:
+        accumulator['gene_colours_used'].update(gene_colours_used)
+    if has_inter_chr_link is not None:
+        accumulator['has_inter_chr_link'] = accumulator['has_inter_chr_link'] or has_inter_chr_link
+    if has_intra_chr_link is not None:
+        accumulator['has_intra_chr_link'] = accumulator['has_intra_chr_link'] or has_intra_chr_link
+    if truncated_labels:
+        accumulator['truncated_labels'].update(truncated_labels)
+
+
+def _save_circos_legend(handles, handler_map, save_path, *, dpi=600):
     """Requirement 1 (correction - separate legend file): builds and saves
     a small, STANDALONE figure containing ONLY the legend - no circos plot
     at all - to its own PNG file.
+
+    ver4-5: called exactly ONCE per `circos_plot()` call now, from
+    `circos_plot()` itself after its whole (PHENOTYPE x POPULATION) loop
+    has finished calling `plot()` for every combination - not once per
+    individual circos plot image as before. `handles`/`handler_map` are
+    built from the SESSION-WIDE `legend_accumulator` (every colour/link
+    type used on ANY plot generated this call), so the single PNG this
+    writes is the combined legend for the whole run, covering every
+    component that appears anywhere in `Result/<RESULT_NAME>/`'s circos
+    plots - not just one of them. This function's own drawing logic is
+    otherwise unchanged: it still does nothing (no file written) if
+    there's nothing to show a legend for, and is still sized to the
+    actual number of legend rows it's asked to draw.
 
     Replaces the earlier approach of widening the main plot's own figure
     and shifting its axes to carve out room for the legend inside the SAME
@@ -937,7 +1615,13 @@ def _save_circos_legend(handles, handler_map, save_path):
     Sized to the ACTUAL number of legend rows about to be drawn - a short
     legend gets a small image, a long one (dozens of gene-pathway colours)
     gets a taller one - rather than a fixed guess either way. Does nothing
-    (no file written) if there's nothing to show a legend for."""
+    (no file written) if there's nothing to show a legend for.
+
+    ver4-4 R7.h: `dpi` (default 600, this function's own legacy-preserving
+    value) replaces what used to be a hard-coded `dpi=600` in the
+    `_safe_savefig()` call below - callers thread the run's actual
+    `PLOT_DPI` config value through (default 300, per the blueprint's
+    §4a reproducibility policy)."""
     if not handles:
         return
     n_rows = len(handles)
@@ -945,140 +1629,298 @@ def _save_circos_legend(handles, handler_map, save_path):
     legend_fig = plt.figure(figsize=(3.2, fig_height_in))
     legend_fig.legend(handles=handles, handler_map=handler_map, loc='center left',
                        fontsize=8, title='Legend', title_fontsize=9, frameon=True)
-    legend_fig.savefig(save_path, dpi=600, bbox_inches='tight')
+    _safe_savefig(legend_fig, save_path, dpi=dpi, bbox_inches='tight')
     plt.close(legend_fig)
 
 
-def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MODEL, circos_config, CYTOBAND_COLORMAP, POPULATION, RESULT_NAME):
+def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MODEL, circos_config, CYTOBAND_COLORMAP, POPULATION, RESULT_NAME, plot_dpi=600, legend_accumulator=None):
+    """ver4-5 (single session-wide legend): `legend_accumulator`, when
+    provided, is a mutable dict shared across EVERY plot() call made
+    during one circos_plot() invocation - see that function's own
+    `_new_legend_accumulator()`/`_merge_into_legend_accumulator()`. Each
+    call to plot() now merges the colours/link-types it actually drew
+    into that shared dict INSTEAD of building and saving its own,
+    per-plot '<...>_legend.png' file - circos_plot() builds and saves
+    the ONE combined legend, covering everything used across every
+    phenotype/population/model rendered in that call, only once, after
+    its own (i, j) loop over PHENOTYPE x POPULATION has finished calling
+    plot() for every combination. `legend_accumulator=None` (the
+    default) is kept only so plot() still has a well-defined, harmless
+    behaviour (accumulate nothing, save nothing) if ever called without
+    one; circos_plot() itself always passes one.
+    """
     
     if interactions_original.shape[0] != 0:
         model_selected = interactions_original['model'].unique().tolist()
     else:
         model_selected = ['not_returned']
 
+    # ver4-4 R7.c (blueprint §2.7.2, PC-3): Circos.initialize_from_bed(...)
+    # and every marker-effect / gene-region / tick track added below do
+    # NOT depend on `n` (model_selected[n]) - only the chord LINKS added
+    # further down, inside the per-model loop, do. This whole block used
+    # to be rebuilt from scratch, in full, once PER MODEL (i.e. once per
+    # element of model_selected, re-reading and re-drawing every marker-
+    # effect/gene track from disk each time) - it now runs exactly ONCE
+    # for this whole (PHENOTYPE, POPULATION) plot.
+    #
+    # Verified via a REAL pre-check (blueprint's PC-3), not just reasoned
+    # about: run directly against pycirclize 1.10.1 (the tree pins
+    # 1.9.1 on Linux / 1.10.0 on Windows - close enough for this specific
+    # internal-API behaviour to be trusted). A single Circos object CAN
+    # be rendered to MORE THAN ONE figure via repeated .plotfig() calls -
+    # each call creates a fresh Figure/PolarAxes (ax=None) and reads
+    # (never mutates) the object's own patch/plot-function lists via an
+    # internal deepcopy (pycirclize's own Circos._get_all_patches()), so
+    # calling .plotfig() a second time does not consume or alter
+    # anything an earlier call already drew.
+    #
+    # The ONE thing that DOES accumulate across repeated .plotfig() calls
+    # on the same object - because pycirclize exposes no public "clear
+    # links" method - is exactly what THIS function adds via
+    # circos.link() (the chord links, added per-model inside the loop
+    # below): Circos.link() appends its own patch to the private
+    # `circos._patches` list (confirmed directly from pycirclize's own
+    # source). `_base_patch_count`, recorded once here before the loop
+    # ever adds a link, is truncated back to at the START of every
+    # iteration (`del circos._patches[_base_patch_count:]`) so each
+    # model's render starts from the same clean, link-free state rather
+    # than accumulating every previously-rendered model's links onto
+    # every subsequent one. This exact sequence (add a link, render,
+    # truncate, add a DIFFERENT link, render again) was run directly
+    # against a real pycirclize Circos object during this pre-check: the
+    # two renders' link geometry differed exactly as expected and never
+    # accumulated the earlier call's link.
+    circos = Circos.initialize_from_bed(_circos_intermediate_dir(RESULT_NAME)+'/chrom_'+str(POPULATION)+".bed", space=circos_config['space'], start=circos_config['start']+2+3, end=circos_config['end']-3)
+
+    # Update ID ver4-6, R2 (blueprint §3.2 Defence 2): `gene_source` is
+    # hoisted ABOVE the model ring-drawing loop (it used to be computed
+    # only once the "Add known gene regions" block itself started) so the
+    # TOTAL ring count for this specific (PHENOTYPE, POPULATION) plot -
+    # model rings plus gene-source rings - is known BEFORE any ring is
+    # drawn. `ring_layout='fit'` (see circos_geometry.ring_geometry())
+    # needs that total up front to thin the per-ring stride so every ring
+    # fits; `ring_layout='legacy'` (the absent-key default) does not
+    # depend on it at all (I11, AC2.5) - this hoist is a no-op for that
+    # path. `gene_source` itself is unchanged: the same
+    # `pd.unique(pop_source.loc[...])` read that already existed here,
+    # just moved earlier - it depends only on `pop_source`/`POPULATION`/
+    # `PHENOTYPE`, none of which the model loop below touches.
+    if gene_info is not None:
+        gene_source = pd.unique(pop_source.loc[(pop_source['population'].astype(str)==str(POPULATION)) & (pop_source['phenotype']==str(PHENOTYPE)),'source'])
+    else:
+        gene_source = np.array([], dtype=object)
+    _n_rings_total = len(MODEL) + len(gene_source)
+
+    # Update ID ver4-6, R2: `circos_config.get(..., <legacy default>)`
+    # throughout this block is what makes an absent-key (pre-ver4-6)
+    # config render byte-identically (I11, AC2.5) - 'legacy'/'off'/8.0
+    # reproduce the exact pre-ver4-6 literals this block used to hard-code.
+    _ring_layout = circos_config.get('ring_layout', 'legacy')
+    _ring_label_size_cfg = circos_config.get('ring_label_size', 8.0)
+    _ring_label_fit = circos_config.get('ring_label_fit', 'off')
+    _ring_label_max_chars = int(circos_config.get('ring_label_max_chars', 0) or 0)
+    _ring_geometries = circos_geometry.ring_geometry(_n_rings_total, layout=_ring_layout)
+    # The seam gap this specific render is ACTUALLY using - not a
+    # suggestion, the real, resolved `start`/`end` this call was given -
+    # so Defence 2 guards against whatever gap is really on the page,
+    # including an old config's hand-set angles (blueprint §3.8: "old
+    # config with start/end hand-set to an overlapping pair" - I11 wins;
+    # `ring_label_fit='off'`, the absent-key default, renders exactly as
+    # before regardless of this calculation ever running).
+    _seam_gap_deg = 360.0 - (circos_config['end'] - circos_config['start'])
+    # {truncated label -> full original label}, collected across both
+    # ring-drawing loops below and folded into the shared legend
+    # accumulator (alongside colours/gene-colours) so no information is
+    # lost when a label is shortened for space - see
+    # `_build_circos_legend_handles()`'s own new parameter.
+    _truncated_ring_labels = {}
+
+    def _resolve_ring_label(raw_label, r_centre):
+        """Defence 2 (blueprint §3.2): the renderer-side guard that makes
+        ring-label overlap impossible regardless of whether Defence 1's
+        own GUI-time PREDICTION of the ring-label list was right, a
+        config predates this update, or a person hand-edited the seam
+        angles. Returns (label_text, size_pt) to actually draw.
+
+        `ring_label_fit='off'` (the absent-key legacy default) returns
+        `raw_label` and the configured/legacy size UNCHANGED - this is
+        the path that keeps a pre-ver4-6 config byte-identical (AC2.5).
+        """
+        label_text = raw_label
+        if _ring_label_max_chars > 0 and len(label_text) > _ring_label_max_chars:
+            _hard_capped = label_text[:_ring_label_max_chars].rstrip() + '\u2026'
+            _truncated_ring_labels[_hard_capped] = raw_label
+            label_text = _hard_capped
+
+        if _ring_label_fit == 'off':
+            return label_text, _ring_label_size_cfg
+
+        size_pt = circos_geometry.fit_label_size(
+            label_text, r_centre, _seam_gap_deg, size_pt=_ring_label_size_cfg, min_size_pt=4.0,
+        )
+        # Update ID ver4-6, R3 (bugfix - Defence 2 rendered with zero
+        # headroom): this used to compare the raw, zero-margin
+        # `seam_gap_deg_for_label()` requirement directly against
+        # `_seam_gap_deg` - a THIRD, separately-maintained "does it fit"
+        # check that could (and, on a real render, did - see
+        # `circos_geometry.RENDER_SAFETY`'s own note) disagree with the
+        # margin `fit_label_size()` itself just used to pick `size_pt`.
+        # `label_fits()` is the same single authority both of those
+        # already call internally, so this final check can never drift
+        # out of sync with them again.
+        _still_overflows = not circos_geometry.label_fits(
+            label_text, size_pt, r_centre, _seam_gap_deg,
+        )
+        if _still_overflows and 'truncate' in _ring_label_fit:
+            _truncated = circos_geometry.truncate_label(label_text, r_centre, _seam_gap_deg, 4.0)
+            _truncated_ring_labels[_truncated] = raw_label
+            return _truncated, 4.0
+        return label_text, size_pt
+
+    cnt = 0
+    # Add genomic marker effects
+    _colours_used_by_hue = {}  # e.g. {'blue': {'blue0', 'blue3', 'blue7'}, ...}
+    for i in range(len(MODEL)):
+         _tsv_path = _circos_intermediate_dir(RESULT_NAME)+'/marker_effect_'+MODEL[i]+'_'+PHENOTYPE+'_'+str(POPULATION)+'.tsv'
+         _r_lo, _r_hi, _r_centre = _ring_geometries[cnt]
+         # ver4-4 R7.d: _add_cytoband_tracks_with_border() now RETURNS the
+         # set of colour values it actually drew (a byproduct of its own,
+         # now-bucketed, drawing loop) - replaces the second, dedicated
+         # pd.read_csv(_tsv_path, ...)['colour'].unique() read this line
+         # used to do purely to recover the same information (Requirement
+         # 13's "only colours that actually appear on this plot" rule).
+         _tsv_colours = _add_cytoband_tracks_with_border(circos, (_r_lo, _r_hi), _tsv_path, track_name=MODEL[i], cytoband_cmap=CYTOBAND_COLORMAP)
+         _label_text, _label_size = _resolve_ring_label(MODEL[i], circos.tracks[-1].r_center - 1)
+         circos.text(_label_text, r=circos.tracks[-1].r_center-1, deg=0, size=_label_size, color="black")
+         cnt+=1
+         _hue = 'red' if MODEL[i] in ['ensemble', 'Linear transformation', 'Nelder Mead', 'Bayesian optimisation', 'Analytic least-squares'] else 'blue'
+         _colours_used_by_hue.setdefault(_hue, set()).update(_tsv_colours)
+    
+    # Add known gene regions
+    gene_colours_used = set()
+    if gene_info is not None:
+        for i in range(len(gene_source)):    
+            _gene_tsv_path = _circos_intermediate_dir(RESULT_NAME)+'/gene_info_'+str(PHENOTYPE)+'_'+str(gene_source[i])+'_'+str(POPULATION)+'.tsv'
+            _r_lo, _r_hi, _r_centre = _ring_geometries[cnt]
+            # ver4-4 R7.d: _add_cytoband_tracks_with_border() now RETURNS
+            # the set of colour values it actually drew (a byproduct of
+            # its own, now-bucketed, drawing loop) - replaces this
+            # block's own second, dedicated
+            # pd.read_csv(_gene_tsv_path, ...)['colour'].unique() read
+            # that used to run purely to recover the same information.
+            # 'source' (leaf/SAM/QTL/wisser_et_al, etc.) is only ever a
+            # RING LABEL identifying which data source a gene annotation
+            # came from - it's never itself a colour-coded category; the
+            # actual fill colour comes from gene_info.csv's own 'colour'
+            # column (a pathway/category name, e.g. 'photoperiod'),
+            # which data_conversion() writes into this tsv's 'score'
+            # column (see _add_cytoband_tracks_with_border()'s own note
+            # on why 'colour' lives in a BED file's 'score' column).
+            _gene_colours = _add_cytoband_tracks_with_border(circos, (_r_lo, _r_hi), _gene_tsv_path, track_name=gene_source[i], cytoband_cmap=CYTOBAND_COLORMAP)
+            _label_text, _label_size = _resolve_ring_label(gene_source[i], circos.tracks[-1].r_center - 1)
+            circos.text(_label_text, r=circos.tracks[-1].r_center-1, deg=0, size=_label_size, color="black")
+            cnt+=1
+            gene_colours_used.update(_gene_colours)
+
+    # ver4-5: fold this plot's own colour usage into the session-wide
+    # accumulator immediately (rather than at the bottom of this
+    # function, alongside the link-type flags) - it doesn't depend on
+    # `n`/model_selected at all (see the comment above `circos =
+    # Circos.initialize_from_bed(...)`), so it's only computed once per
+    # plot() call, same as `_colours_used_by_hue`/`gene_colours_used`
+    # themselves. Update ID ver4-6, R2: `truncated_labels` (empty unless
+    # `ring_label_fit` actually shortened something) is folded in
+    # alongside them, for the exact same reason.
+    if legend_accumulator is not None:
+        _merge_into_legend_accumulator(
+            legend_accumulator, colours_used_by_hue=_colours_used_by_hue,
+            gene_colours_used=gene_colours_used, truncated_labels=_truncated_ring_labels,
+        )
+
+    # Add ticks to the outermost ring
+    for sector in circos.sectors:
+        # Requirement 6: a bit more radial space between the tick
+        # numbers and the chromosome name text above them - label_margin
+        # (pycirclize's own gap between a tick and its number label,
+        # default 0.5) pushes the tick numbers a little further out,
+        # and the chromosome name's own radius is nudged out to match
+        # (105 -> 108) so the two don't end up crowding each other -
+        # modest increases on both sides rather than a single large
+        # jump, so the gap grows without leaving an awkwardly empty
+        # ring between them.
+        #
+        # Requirement 1 (bugfix - the actual root cause of labels still
+        # overlapping ring/tick data on a many-chromosome genome, e.g.
+        # a real 26-chromosome cotton assembly): the chromosome NAME
+        # text below used to be size=10, hardcoded - completely
+        # unaffected by circos_config['label_size'] (the GUI's own
+        # 'Label font size' field, and everything the Requirement 1
+        # start/end-angle fix was calibrated against). The chromosome
+        # name is the WIDER of the two texts (e.g. 'A01', vs a tick's
+        # 1-3 digit number), so it was always the real driver of
+        # overlap on a genome with many, densely-packed sectors - and
+        # a fixed size=10 never shrank no matter how small
+        # 'Label font size' was suggested/set to, which is exactly why
+        # a real render still showed overlap despite that suggestion
+        # already being smaller for many chromosomes.
+        #
+        # Tick numbers get their OWN, separately-derived size instead
+        # of directly sharing circos_config['label_size'] - short
+        # numeric ticks don't need to shrink nearly as aggressively as
+        # a multi-character chromosome name does to avoid the same
+        # overlap, and forcing them down to the (usually smaller)
+        # chromosome-name size made them harder to read for no
+        # actual benefit (a real, reported regression). Floored at
+        # 5pt and capped at 8pt regardless of how small the
+        # chromosome name itself gets.
+        # Requirement (chromosome name now matches tick size): the
+        # chromosome name used to render at circos_config['label_size']
+        # directly (the smaller of the two sizes, deliberately kept
+        # small so it wouldn't overlap neighbouring ticks/data on a
+        # many-chromosome genome) while tick numbers got their own,
+        # separately-derived _tick_label_size (see the comment above)
+        # - by explicit request, the chromosome name now renders at
+        # THAT SAME, larger size instead, to read more consistently
+        # with the ticks around it. Since the chromosome name is the
+        # WIDER of the two texts to begin with (e.g. 'A01', vs a
+        # tick's 1-3 digit number), this makes it the same size AND
+        # still the wider text - so it remains the real driver of how
+        # much seam-gap room is needed, now more so than before. See
+        # main_app.py's own _circos_suggest_start_end_angle() - it
+        # applies this SAME size transform to whatever label size it's
+        # given before calculating the gap, specifically so the two
+        # stay in sync and this size increase doesn't reintroduce the
+        # overlap it was originally calibrated against.
+        _tick_label_size = max(5.0, min(8.0, circos_config['label_size'] * 1.8))
+        sector.text(sector.name, r=108, size=_tick_label_size)
+        sector.get_track(MODEL[0]).xticks_by_interval(
+            circos_config['scale'],
+            label_size=_tick_label_size,
+            label_orientation="vertical",
+            label_margin=1.5,
+            label_formatter=lambda v: f"{v / circos_config['scale']:.0f}",
+        )
+
+    # ver4-4 R7.c - see the note above `circos = Circos.
+    # initialize_from_bed(...)` for the full rationale/verification
+    # behind this truncation technique. Recorded ONCE, after every
+    # loop-invariant track has been added and BEFORE the per-model loop
+    # below ever calls circos.link() for the first time.
+    _base_patch_count = len(circos._patches)
+
     for n in range(len(model_selected)):
-        cnt = 0
-        circos = Circos.initialize_from_bed(_circos_intermediate_dir(RESULT_NAME)+'/chrom_'+str(POPULATION)+".bed", space=circos_config['space'], start=circos_config['start'], end=circos_config['end'])
-        
-        # Add genomic marker effects
-        _colours_used_by_hue = {}  # e.g. {'blue': {'blue0', 'blue3', 'blue7'}, ...}
-        for i in range(len(MODEL)):
-             _tsv_path = _circos_intermediate_dir(RESULT_NAME)+'/marker_effect_'+MODEL[i]+'_'+PHENOTYPE+'_'+str(POPULATION)+'.tsv'
-             _add_cytoband_tracks_with_border(circos, (97-(3*cnt), 100-(3*cnt)), _tsv_path, track_name=MODEL[i], cytoband_cmap=CYTOBAND_COLORMAP)
-             circos.text(MODEL[i], r=circos.tracks[-1].r_center-1, deg=0, size=8, color="black")
-             cnt+=1
-             # Requirement 13 (correction): the legend should only ever
-             # show colours that ACTUALLY appear on this specific plot,
-             # not every colour the quantile scheme could theoretically
-             # produce - read the SAME tsv file just rendered above and
-             # record which 'colour' values are genuinely present (e.g.
-             # an all-zero-effect model - see the all-zero-effect fix
-             # elsewhere in this file - would leave EVERY marker at
-             # 'blue0', and a legend hardcoded to always show 'blue9' as
-             # 'high effect' would then be showing a colour that never
-             # actually appears anywhere on the ring).
-             try:
-                 _tsv_colours = pd.read_csv(_tsv_path, sep='\t')['colour'].unique().tolist()
-             except Exception:
-                 _tsv_colours = []
-             _hue = 'red' if MODEL[i] in ['ensemble', 'Linear transformation', 'Nelder Mead', 'Bayesian optimisation'] else 'blue'
-             _colours_used_by_hue.setdefault(_hue, set()).update(_tsv_colours)
-        
-        # Add known gene regions
-        gene_colours_used = set()
-        if gene_info is not None:
-            gene_source = pd.unique(pop_source.loc[(pop_source['population'].astype(str)==str(POPULATION)) & (pop_source['phenotype']==str(PHENOTYPE)),'source'])
-            for i in range(len(gene_source)):    
-                _gene_tsv_path = _circos_intermediate_dir(RESULT_NAME)+'/gene_info_'+str(PHENOTYPE)+'_'+str(gene_source[i])+'_'+str(POPULATION)+'.tsv'
-                _add_cytoband_tracks_with_border(circos, (97-(3*cnt), 100-(3*cnt)), _gene_tsv_path, track_name=gene_source[i], cytoband_cmap=CYTOBAND_COLORMAP)
-                circos.text(gene_source[i], r=circos.tracks[-1].r_center-1, deg=0, size=8, color="black")
-                cnt+=1
-                # Requirement 1 (correction): 'source' (leaf/SAM/QTL/
-                # wisser_et_al, etc.) is only ever a RING LABEL identifying
-                # which data source a gene annotation came from - it's
-                # never itself a colour-coded category, and was never a
-                # key in CYTOBAND_COLORMAP at all (the previous version's
-                # bug - every such legend swatch silently fell back to
-                # white). The actual fill colour comes from gene_info.csv's
-                # 'colour' column (a pathway/category name, e.g.
-                # 'photoperiod') - data_conversion() writes it as this
-                # file's 5th/'score' column once 'source' is dropped, so
-                # read it back here the same way the marker-effect legend
-                # fix already reads its own tsv's 'colour' column.
-                try:
-                    gene_colours_used.update(pd.read_csv(_gene_tsv_path, sep='\t')['colour'].unique().tolist())
-                except Exception:
-                    pass
-                
-        # Add ticks to the outermost ring
-        for sector in circos.sectors:
-            # Requirement 6: a bit more radial space between the tick
-            # numbers and the chromosome name text above them - label_margin
-            # (pycirclize's own gap between a tick and its number label,
-            # default 0.5) pushes the tick numbers a little further out,
-            # and the chromosome name's own radius is nudged out to match
-            # (105 -> 108) so the two don't end up crowding each other -
-            # modest increases on both sides rather than a single large
-            # jump, so the gap grows without leaving an awkwardly empty
-            # ring between them.
-            #
-            # Requirement 1 (bugfix - the actual root cause of labels still
-            # overlapping ring/tick data on a many-chromosome genome, e.g.
-            # a real 26-chromosome cotton assembly): the chromosome NAME
-            # text below used to be size=10, hardcoded - completely
-            # unaffected by circos_config['label_size'] (the GUI's own
-            # 'Label font size' field, and everything the Requirement 1
-            # start/end-angle fix was calibrated against). The chromosome
-            # name is the WIDER of the two texts (e.g. 'A01', vs a tick's
-            # 1-3 digit number), so it was always the real driver of
-            # overlap on a genome with many, densely-packed sectors - and
-            # a fixed size=10 never shrank no matter how small
-            # 'Label font size' was suggested/set to, which is exactly why
-            # a real render still showed overlap despite that suggestion
-            # already being smaller for many chromosomes.
-            #
-            # Tick numbers get their OWN, separately-derived size instead
-            # of directly sharing circos_config['label_size'] - short
-            # numeric ticks don't need to shrink nearly as aggressively as
-            # a multi-character chromosome name does to avoid the same
-            # overlap, and forcing them down to the (usually smaller)
-            # chromosome-name size made them harder to read for no
-            # actual benefit (a real, reported regression). Floored at
-            # 5pt and capped at 8pt regardless of how small the
-            # chromosome name itself gets.
-            # Requirement (chromosome name now matches tick size): the
-            # chromosome name used to render at circos_config['label_size']
-            # directly (the smaller of the two sizes, deliberately kept
-            # small so it wouldn't overlap neighbouring ticks/data on a
-            # many-chromosome genome) while tick numbers got their own,
-            # separately-derived _tick_label_size (see the comment above)
-            # - by explicit request, the chromosome name now renders at
-            # THAT SAME, larger size instead, to read more consistently
-            # with the ticks around it. Since the chromosome name is the
-            # WIDER of the two texts to begin with (e.g. 'A01', vs a
-            # tick's 1-3 digit number), this makes it the same size AND
-            # still the wider text - so it remains the real driver of how
-            # much seam-gap room is needed, now more so than before. See
-            # main_app.py's own _circos_suggest_start_end_angle() - it
-            # applies this SAME size transform to whatever label size it's
-            # given before calculating the gap, specifically so the two
-            # stay in sync and this size increase doesn't reintroduce the
-            # overlap it was originally calibrated against.
-            _tick_label_size = max(5.0, min(8.0, circos_config['label_size'] * 1.8))
-            sector.text(sector.name, r=108, size=_tick_label_size)
-            sector.get_track(MODEL[0]).xticks_by_interval(
-                circos_config['scale'],
-                label_size=_tick_label_size,
-                label_orientation="vertical",
-                label_margin=1.5,
-                label_formatter=lambda v: f"{v / circos_config['scale']:.0f}",
-            )
-            
+        # Remove any chord links a PREVIOUS iteration of this SAME loop
+        # added, so this iteration starts from the same clean (no-link)
+        # state every time - a no-op on the very first iteration, since
+        # nothing has been added past _base_patch_count yet.
+        del circos._patches[_base_patch_count:]
+
         # Add marker-by-marker interactions
         has_inter_chr_link_for_legend = False
         has_intra_chr_link_for_legend = False
         if interactions_original.shape[0] != 0:
-            interactions = interactions_original[interactions_original['model']==model_selected[n]].reset_index(drop=True)
+            interactions = interactions_original[interactions_original['model']==model_selected[n]].dropna().reset_index(drop=True)
             # Requirement: link OPACITY (not width) encodes each link's
             # relative importance ('value') - a higher value means a more
             # solid/opaque (visually "thicker-looking") link, while every
@@ -1123,7 +1965,18 @@ def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MO
                 circos.link(region1, region2, lw=link_lw, alpha=float(interactions.loc[ii,'_alpha']), color=colour)
                 
         # Store the circos plot
-        fig = circos.plotfig()
+        # Update ID ver4-6, R2 (blueprint §3.4/S3): `circos_config.get(
+        # 'figsize')` is absent (None) for every pre-ver4-6 config, in
+        # which case `circos.plotfig()` is called exactly as before this
+        # option existed (pycirclize's own (8, 8)-inch default) - I11,
+        # AC2.5. A configured figsize (e.g. widened for a many-ring plot)
+        # is forwarded as a square `(f, f)` tuple, matching pycirclize's
+        # own `figsize: tuple[float, float]` parameter.
+        _figsize_cfg = circos_config.get('figsize')
+        if _figsize_cfg:
+            fig = circos.plotfig(figsize=(_figsize_cfg, _figsize_cfg))
+        else:
+            fig = circos.plotfig()
         # Requirement (bugfix - unit label overlapping a chromosome name):
         # a fixed-position fig.text(0.5, 0.02, ...) worked for a modest
         # chromosome count, but for a genome with MANY chromosomes (e.g.
@@ -1176,28 +2029,45 @@ def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MO
         # a tall legend regardless of how the two were arranged on one
         # shared canvas.
         #
-        # Saved as a completely separate PNG instead - this sidesteps the
-        # whole problem rather than trying to precisely predict it: the
-        # circos plot's own layout is now COMPLETELY UNCHANGED from
-        # before the legend feature existed (this exact fig.text() call
-        # and the plain, un-widened fig = circos.plotfig() above are both
-        # back to their pre-legend form), and the legend lives in its own
-        # image, sized only for its own content, with nothing else on the
-        # page it could ever collide with. See _save_circos_legend().
-        _legend_handles, _legend_handler_map = _build_circos_legend_handles(
-            _colours_used_by_hue, CYTOBAND_COLORMAP, gene_colours_used,
-            has_inter_chr_link_for_legend, has_intra_chr_link_for_legend,
-        )
+        # ver4-5 (single session-wide legend, supersedes the earlier
+        # "separate PNG per plot" correction described above): rather
+        # than building this render's own legend handles and saving them
+        # to a dedicated '<...>_legend.png' right here, only the RAW
+        # ingredients that would have gone into that legend - which
+        # link-type colours actually appear on THIS render - are folded
+        # into the shared, session-wide `legend_accumulator` (colours/
+        # gene-colours were already merged in above, before this n-loop,
+        # since they don't vary with `n`). circos_plot() itself builds
+        # and saves the ONE combined legend, covering every phenotype/
+        # population/model plotted during its call, after its own loop
+        # over all of them has finished - see
+        # `_merge_into_legend_accumulator()` and the end of
+        # circos_plot(). The circos plot image itself is completely
+        # unaffected: `fig = circos.plotfig()` and the fig.text() unit
+        # label above are unchanged from before the legend feature
+        # existed, exactly as when each render still saved its own
+        # legend file.
+        if legend_accumulator is not None:
+            _merge_into_legend_accumulator(
+                legend_accumulator,
+                has_inter_chr_link=has_inter_chr_link_for_legend,
+                has_intra_chr_link=has_intra_chr_link_for_legend,
+            )
+        # Bugfix (see module-level note above `_sanitize_path_component`):
+        # PHENOTYPE/POPULATION/model_selected[n] are free-text values that
+        # were never validated as filename-safe anywhere upstream - sanitise
+        # them here, immediately before they become part of a saved path,
+        # and save through `_safe_savefig()` rather than `fig.savefig()`
+        # directly.
+        _phenotype_fs = _sanitize_path_component(PHENOTYPE)
+        _population_fs = _sanitize_path_component(POPULATION)
         if model_selected[n] == 'not_returned':
-            _plot_path = './Result/'+RESULT_NAME+'/circos_'+str(PHENOTYPE)+'_'+str(POPULATION)+'.png'
-            fig.savefig(_plot_path, dpi=600)
-            _save_circos_legend(_legend_handles, _legend_handler_map,
-                                 './Result/'+RESULT_NAME+'/circos_'+str(PHENOTYPE)+'_'+str(POPULATION)+'_legend.png')
+            _plot_path = './Result/'+RESULT_NAME+'/circos_'+_phenotype_fs+'_'+_population_fs+'.png'
+            _safe_savefig(fig, _plot_path, dpi=plot_dpi)
         else:
-            _plot_path = './Result/'+RESULT_NAME+'/circos_'+str(PHENOTYPE)+'_'+str(POPULATION)+'_interaction_'+str(model_selected[n])+'.png'
-            fig.savefig(_plot_path, dpi=600)
-            _save_circos_legend(_legend_handles, _legend_handler_map,
-                                 './Result/'+RESULT_NAME+'/circos_'+str(PHENOTYPE)+'_'+str(POPULATION)+'_interaction_'+str(model_selected[n])+'_legend.png')
+            _model_fs = _sanitize_path_component(model_selected[n])
+            _plot_path = './Result/'+RESULT_NAME+'/circos_'+_phenotype_fs+'_'+_population_fs+'_interaction_'+_model_fs+'.png'
+            _safe_savefig(fig, _plot_path, dpi=plot_dpi)
 
 def _clamp_region_to_chromosome(df, mask, chrom_start, chrom_end):
     """Requirement (bugfix - a widened marker/gene position could come out
@@ -1377,7 +2247,149 @@ def _broadcast_population_info(path, target_populations, description):
     return tmp_path
 
 
-def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULATION, PHENOTYPE, circos_config, end_adjust, WINDOW, CYTOBAND_COLORMAP, RESULT_NAME, attention, SCENARIO, ASCENDING, gene_adjust=0):
+def _init_circos_plot_worker(ctx):
+    """Spawned-worker initializer for circos_plot()'s optional multi-process
+    (phenotype, population) fan-out (``CIRCOS_PLOT_WORKERS`` / `n_workers`
+    below). Stashes the read-only, per-run context every worker needs
+    (the precomputed effect/interaction/attention lookup tables, config
+    dicts, file paths, etc. that circos_plot() itself computes ONCE before
+    its loop) in a module-level global exactly ONCE per worker process,
+    via ``ProcessPoolExecutor(initializer=..., initargs=(ctx,))`` - rather
+    than re-pickling that same, potentially large, context onto every one
+    of what can be dozens-to-hundreds of individual (phenotype, population)
+    tasks the way passing it as a per-call argument would.
+
+    A `spawn`-started worker (see `_MP_CONTEXT`) is a fresh interpreter
+    that re-imports this module but does NOT share the parent's memory, so
+    this global is genuinely private to the one worker process that set
+    it - never shared or raced between workers, and never visible back in
+    the parent process either (see `_render_one_circos_plot()`'s own
+    return value for how a worker's findings get back to the parent).
+
+    Also forces the non-interactive 'Agg' matplotlib backend inside the
+    worker: a spawned process has no display to attach to, and leaving
+    backend selection to whatever matplotlib would otherwise auto-detect
+    risks it trying (and failing, or behaving inconsistently across
+    platforms) to initialise a GUI toolkit that was never actually needed
+    for saving PNGs to disk.
+    """
+    global _CIRCOS_WORKER_CTX
+    _CIRCOS_WORKER_CTX = ctx
+    import matplotlib
+    matplotlib.use('Agg', force=True)
+
+
+def _render_one_circos_plot(phenotype_value, population_value):
+    """One (phenotype, population) unit of work for circos_plot()'s
+    parallel fan-out - performs exactly what one iteration of that
+    function's own serial loop does (`quantile_conversion()` ->
+    `interaction()` -> `plot()`), just reading its shared, read-only
+    inputs from `_CIRCOS_WORKER_CTX` (set once per worker by
+    `_init_circos_plot_worker()`) instead of from the enclosing
+    function's closure, since a `spawn`-started worker process cannot see
+    the parent's closure state at all - only what was explicitly passed
+    through `initargs`.
+
+    Returns this ONE plot's own LOCAL legend accumulator, rather than
+    mutating circos_plot()'s own session-wide `_legend_accumulator` the
+    serial loop mutates directly - a separate process can never see or
+    modify the parent's Python objects, so there is nothing for it to
+    mutate here; the parent instead merges every worker's returned
+    accumulator into its own after all tasks complete (see
+    `circos_plot()`'s own merge loop). Merge order does not matter:
+    `_merge_into_legend_accumulator()` is a pure, commutative,
+    associative union/OR over sets and booleans, so the combined result
+    is identical regardless of which (phenotype, population) task
+    happens to finish first.
+    """
+    ctx = _CIRCOS_WORKER_CTX
+    model_for_plot = quantile_conversion(
+        ctx['effect_grouped_all'], ctx['effect_grouped_pop'], ctx['marker_info'], ctx['chrom_info'],
+        phenotype_value, ctx['MODEL'], ctx['end_adjust'], population_value, ctx['WINDOW'],
+        ctx['RESULT_NAME'], ctx['ASCENDING'],
+    )
+    interaction_selected = interaction(
+        ctx['interaction_groups'], ctx['interaction_model_order'], ctx['marker_info'], phenotype_value,
+        ctx['circos_config'], population_value, ctx['RESULT_NAME'], ctx['attention_groups'], ctx['attention_model_order'],
+    )
+    local_legend_accumulator = _new_legend_accumulator()
+    plot(
+        interaction_selected, ctx['chrom_info'], ctx['gene_info'], ctx['pop_source'], phenotype_value, model_for_plot,
+        ctx['circos_config'], ctx['CYTOBAND_COLORMAP'], population_value, ctx['RESULT_NAME'],
+        plot_dpi=ctx['plot_dpi'], legend_accumulator=local_legend_accumulator,
+    )
+    return local_legend_accumulator
+
+
+def _resolve_circos_plot_workers(requested):
+    """Effective worker-process count for circos_plot()'s optional
+    (phenotype, population) fan-out - daemon-safe, mirroring
+    `pipeline_utils.dataloader_num_workers()`/`nested_safe_n_jobs()`'s own
+    fresh-per-call daemon check (never cached, since the correct answer
+    depends on whichever process is actually about to call
+    `ProcessPoolExecutor()`, not on whatever process originally read the
+    config).
+
+    Returns ``1`` (fully serial - today's behaviour, byte-for-byte)
+    whenever:
+      - the CALLING process is itself an already-daemonic `multiprocessing`
+        worker (e.g. circos_plot() invoked from inside an
+        intra_batch_parallel/intra_task_parallel worker) - Python forbids
+        a daemonic process from spawning children at all, so a
+        `ProcessPoolExecutor()` would otherwise raise the moment it tried
+        to start, rather than degrading gracefully; and
+      - ``requested`` is absent, ``None``, or <= 1 - i.e. every existing
+        config/call site that predates this feature (no `CIRCOS_PLOT_
+        WORKERS` key at all) reproduces exactly today's serial loop.
+
+    ``requested`` above the number of CPUs actually visible to this
+    process is capped down to `os.cpu_count()` - asking for more worker
+    processes than there are cores cannot make rendering faster and only
+    adds process-startup overhead for no benefit.
+    """
+    try:
+        if multiprocessing.current_process().daemon:
+            return 1
+    except Exception:
+        pass
+    try:
+        _requested = int(requested) if requested else 1
+    except (TypeError, ValueError):
+        _requested = 1
+    if _requested <= 1:
+        return 1
+    return max(1, min(_requested, os.cpu_count() or 1))
+
+
+def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULATION, PHENOTYPE, circos_config, end_adjust, WINDOW, CYTOBAND_COLORMAP, RESULT_NAME, attention, SCENARIO, ASCENDING, gene_adjust=0, plot_dpi=600, n_workers=1):
+
+    # ver4-4 R7.b - start every circos_plot() call from a clean
+    # _load_combined_marker_info() cache: this run's own marker_info.csv/
+    # gene-coordinate side files are the only things that cache should
+    # ever ever hand back, never a stale entry left over from an earlier
+    # RESULT_NAME/run inside the same long-lived process (e.g. main_app.py's
+    # in-process 'Option B: run now' path, which can call circos_plot()
+    # for more than one RESULT_NAME across a single Streamlit session).
+    _MARKER_INFO_CACHE.clear()
+
+    # Update ID ver4-6, R2 (blueprint §3.4/S3, I11): log every R2 config
+    # key's RESOLVED value unconditionally, on every run, naming "absent
+    # from config, using legacy default" whenever the key itself is
+    # missing - the codebase's own "log the negative/resolved state
+    # unconditionally" convention (architecture document §17), applied
+    # here so a person looking at a run's log can always tell, without
+    # opening the config JSON, whether this render used the old, fixed
+    # geometry or the new, fitted one.
+    def _resolved_note(key):
+        return 'from config' if key in circos_config else 'absent from config, using legacy default'
+    print(f"[circos_plot] R2 geometry config resolved for RESULT_NAME={RESULT_NAME!r}: "
+          f"ring_layout={circos_config.get('ring_layout', 'legacy')!r} ({_resolved_note('ring_layout')}), "
+          f"ring_label_fit={circos_config.get('ring_label_fit', 'off')!r} ({_resolved_note('ring_label_fit')}), "
+          f"ring_label_size={circos_config.get('ring_label_size', 8.0)!r} ({_resolved_note('ring_label_size')}), "
+          f"ring_label_max_chars={circos_config.get('ring_label_max_chars', 0)!r} "
+          f"({_resolved_note('ring_label_max_chars')}), "
+          f"figsize={circos_config.get('figsize') or '8.0 (pycirclize default)'} "
+          f"({_resolved_note('figsize') if circos_config.get('figsize') else 'absent from config, using pycirclize default'}).")
 
     pop_source =  data_conversion(chrom_info, gene_info, PHENOTYPE, RESULT_NAME, gene_adjust=gene_adjust)
     
@@ -1418,9 +2430,168 @@ def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULA
     POPULATION = ('all',) + tuple(_clean_population_label(p) for p in POPULATION)
         
     MODEL = pd.unique(effect['model'])
-    
-    for i in range(len(PHENOTYPE)):
-        for j in range(len(POPULATION)):
-            MODEL = quantile_conversion(effect, marker_info, chrom_info, PHENOTYPE[i], MODEL, end_adjust, POPULATION[j], WINDOW, RESULT_NAME, ASCENDING)
-            interaction_selected = interaction(interactions, marker_info, PHENOTYPE[i], circos_config, POPULATION[j],RESULT_NAME, attention)
-            plot(interaction_selected, chrom_info, gene_info, pop_source, PHENOTYPE[i], MODEL, circos_config, CYTOBAND_COLORMAP, POPULATION[j],RESULT_NAME)
+
+    # ver4-4 R7.f - compute the abs()'d, grouped-and-averaged marker-effect
+    # frames used by quantile_conversion() exactly ONCE here, rather than
+    # once per (phenotype, population) pair inside the loop below (neither
+    # computation's result actually depends on which specific phenotype/
+    # population is being rendered at that moment - only the SELECTION
+    # of which precomputed frame to read, and which rows/columns to filter
+    # out of it, varies per iteration; that filtering still happens inside
+    # quantile_conversion() itself, unchanged).
+    #
+    # Also FIXES a correctness bug in the same motion: quantile_conversion()
+    # used to run `effect.iloc[:,5:] = effect.iloc[:,5:].abs().astype(float)`
+    # directly on the CALLER's own `effect` object, mutating it in place -
+    # e.g. run_step2_assemble.py's own cached ResultSet frame, already used
+    # once by scatter_plot() earlier in the very same call, silently
+    # modified before circos_plot() itself was even done reading it.
+    # `.copy()` here means every downstream read of the ORIGINAL `effect`
+    # argument (there are none left in this function after this point, but
+    # a future caller/change might reasonably still hold a reference to
+    # it) is never affected by what circos_plot() does internally.
+    _effect_abs = effect.copy()
+    _effect_abs.iloc[:, 5:] = _effect_abs.iloc[:, 5:].abs().astype(float)
+    _effect_abs = _effect_abs.drop('ratio', axis=1)
+    _effect_abs['population'] = _effect_abs['population'].astype(str)
+    _effect_grouped_all = _effect_abs.iloc[:, 1:].groupby(['phenotype', 'model']).mean()
+    _effect_grouped_all = _effect_grouped_all.reset_index(drop=False)
+    _effect_grouped_pop = _effect_abs.groupby(['population', 'phenotype', 'model']).mean()
+    _effect_grouped_pop = _effect_grouped_pop.reset_index(drop=False)
+    _effect_grouped_pop['population'] = _effect_grouped_pop['population'].astype(str)
+
+    # Requirement (performance fix, Update ID ver4-10): apply the exact
+    # same "compute once, outside the (PHENOTYPE, POPULATION) loop"
+    # treatment ver4-4 R7.f already gave `_effect_grouped_all`/
+    # `_effect_grouped_pop` above to the marker-pair interaction/
+    # attention tables too - see `_precompute_interaction_groups()`'s own
+    # docstring for the full rationale (circos-plot generation "taking
+    # forever" once more than one interaction-emitting model - RKHS, RF,
+    # SVR, KNN, etc. - is selected together). `interaction()` below now
+    # does a cheap dict lookup per (PHENOTYPE[i], POPULATION[j]) call
+    # instead of re-scanning the full `interactions`/`attention` table
+    # from scratch every time - this one change is what fixes the
+    # slowdown identically for all three ways a run's interactions/
+    # attention data reaches this function (Sequential, in-process GUI
+    # "Option B: run now", and Parallel Step 2 assemble), since all three
+    # converge on this same shared `circos_plot()` call.
+    _interaction_groups, _interaction_model_order = _precompute_interaction_groups(
+        interactions, scope_model_order_by_population=True)
+    _attention_groups, _attention_model_order = _precompute_interaction_groups(
+        attention, scope_model_order_by_population=False)
+
+    # ver4-5 (single session-wide legend, replaces one '<...>_legend.png'
+    # per circos plot image): one shared accumulator, created here and
+    # passed into every plot() call below, collects the union of every
+    # colour/link-type actually drawn across the WHOLE (PHENOTYPE x
+    # POPULATION) loop - i.e. across every circos plot this one
+    # circos_plot() call produces. See `_new_legend_accumulator()`/
+    # `_merge_into_legend_accumulator()` and the single
+    # `_save_circos_legend()` call after the loop below.
+    _legend_accumulator = _new_legend_accumulator()
+
+    # Performance (multi-CPU circos-plot rendering): `_effective_workers`
+    # resolves to 1 (the loop below then behaves EXACTLY as before this
+    # feature existed - same call order, same shared, mutated-in-place
+    # `_legend_accumulator`) for every config/caller that predates
+    # `n_workers`/`CIRCOS_PLOT_WORKERS`, or that explicitly asks for 1, or
+    # that is itself already running inside a daemonic worker process -
+    # see `_resolve_circos_plot_workers()`'s own docstring. Only a
+    # request for 2+ workers from a non-daemonic process takes the
+    # parallel branch.
+    _effective_workers = _resolve_circos_plot_workers(n_workers)
+
+    if _effective_workers <= 1:
+        for i in range(len(PHENOTYPE)):
+            for j in range(len(POPULATION)):
+                # ver4-4 R7 latent-bug fix (blueprint §2.7.2, found while
+                # implementing R7.a): quantile_conversion() returns MODEL minus
+                # any model with no data for THIS (phenotype, population) pair
+                # (its own REMOVE list - see that function's docstring/L586,
+                # L753). The ORIGINAL code here rebound the shared,
+                # loop-INVARIANT `MODEL` variable itself from that return
+                # value, so a model dropped for one (phenotype, population)
+                # combination stayed missing from EVERY SUBSEQUENT iteration's
+                # plot too - even for a phenotype/population where it DOES
+                # have data - because the loop accumulated removals across
+                # iterations instead of recomputing them fresh each time.
+                # Fixed by always passing the ORIGINAL, never-rebound `MODEL`
+                # list into quantile_conversion() and keeping its filtered
+                # return in a per-iteration local (`model_for_plot`) instead -
+                # quantile_conversion()'s own contract/return shape is
+                # unchanged.
+                model_for_plot = quantile_conversion(_effect_grouped_all, _effect_grouped_pop, marker_info, chrom_info, PHENOTYPE[i], MODEL, end_adjust, POPULATION[j], WINDOW, RESULT_NAME, ASCENDING)
+                interaction_selected = interaction(_interaction_groups, _interaction_model_order, marker_info, PHENOTYPE[i], circos_config, POPULATION[j], RESULT_NAME, _attention_groups, _attention_model_order)
+                plot(interaction_selected, chrom_info, gene_info, pop_source, PHENOTYPE[i], model_for_plot, circos_config, CYTOBAND_COLORMAP, POPULATION[j],RESULT_NAME, plot_dpi=plot_dpi, legend_accumulator=_legend_accumulator)
+    else:
+        # Every (phenotype, population) pair reads the SAME read-only
+        # inputs (only the SELECTION of which phenotype/population varies
+        # per task - see the ver4-4 R7.f comment above these are computed
+        # once for exactly this reason) and writes its OWN distinct output
+        # file, so the whole `PHENOTYPE x POPULATION` unit-of-work space
+        # can be hashed out across a process pool with no coordination
+        # needed beyond merging each task's own small legend-accumulator
+        # return value afterwards (see `_render_one_circos_plot()`'s own
+        # docstring for why that return-and-merge shape, rather than a
+        # "shared" mutable accumulator, is what a process pool requires).
+        print(f"[circos_plot] Rendering {len(PHENOTYPE) * len(POPULATION)} "
+              f"(phenotype, population) circos plots across {_effective_workers} "
+              f"worker processes.")
+        _ctx = {
+            'effect_grouped_all': _effect_grouped_all, 'effect_grouped_pop': _effect_grouped_pop,
+            'marker_info': marker_info, 'chrom_info': chrom_info, 'gene_info': gene_info,
+            'MODEL': MODEL, 'end_adjust': end_adjust, 'WINDOW': WINDOW, 'RESULT_NAME': RESULT_NAME,
+            'ASCENDING': ASCENDING, 'interaction_groups': _interaction_groups,
+            'interaction_model_order': _interaction_model_order, 'circos_config': circos_config,
+            'attention_groups': _attention_groups, 'attention_model_order': _attention_model_order,
+            'pop_source': pop_source, 'CYTOBAND_COLORMAP': CYTOBAND_COLORMAP, 'plot_dpi': plot_dpi,
+        }
+        with ProcessPoolExecutor(
+            max_workers=_effective_workers, mp_context=_MP_CONTEXT,
+            initializer=_init_circos_plot_worker, initargs=(_ctx,),
+        ) as _executor:
+            _futures = {
+                _executor.submit(_render_one_circos_plot, PHENOTYPE[i], POPULATION[j]): (PHENOTYPE[i], POPULATION[j])
+                for i in range(len(PHENOTYPE)) for j in range(len(POPULATION))
+            }
+            # as_completed(), not map(): a plot's rendering time can vary
+            # widely by how many markers/links it draws, so this drains
+            # whichever task finishes first rather than waiting on
+            # submission order - and still re-raises the FIRST exception
+            # any task hit (via .result()) exactly like the serial loop's
+            # own fail-fast behaviour would, identifying which (phenotype,
+            # population) pair it came from in the process.
+            for _future in as_completed(_futures):
+                _phenotype_value, _population_value = _futures[_future]
+                try:
+                    _local_legend_accumulator = _future.result()
+                except Exception:
+                    print(f"[circos_plot] FAILED while rendering phenotype={_phenotype_value!r} "
+                          f"population={_population_value!r} (see traceback below).")
+                    raise
+                _merge_into_legend_accumulator(
+                    _legend_accumulator,
+                    colours_used_by_hue=_local_legend_accumulator['colours_used_by_hue'],
+                    gene_colours_used=_local_legend_accumulator['gene_colours_used'],
+                    has_inter_chr_link=_local_legend_accumulator['has_inter_chr_link'],
+                    has_intra_chr_link=_local_legend_accumulator['has_intra_chr_link'],
+                    truncated_labels=_local_legend_accumulator['truncated_labels'],
+                )
+
+    # ver4-5 (single session-wide legend): build and save the ONE
+    # combined legend now that every plot() call above has finished
+    # merging its own findings into `_legend_accumulator` - covers every
+    # colour/link-type used anywhere across this circos_plot() call,
+    # rather than a separate, plot-specific file for each one.
+    # `_build_circos_legend_handles()` itself is unchanged - it already
+    # only ever draws what it's given, and a session-wide accumulator is
+    # exactly the same shape a single plot's own (now-removed) local
+    # variables used to be, just unioned across more than one render.
+    _legend_handles, _legend_handler_map = _build_circos_legend_handles(
+        _legend_accumulator['colours_used_by_hue'], CYTOBAND_COLORMAP, _legend_accumulator['gene_colours_used'],
+        _legend_accumulator['has_inter_chr_link'], _legend_accumulator['has_intra_chr_link'],
+        truncated_labels=_legend_accumulator['truncated_labels'],
+    )
+    _save_circos_legend(_legend_handles, _legend_handler_map,
+                         './Result/'+RESULT_NAME+'/circos_legend.png',
+                         dpi=plot_dpi)

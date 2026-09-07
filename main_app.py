@@ -51,11 +51,17 @@ from metric_plot import *
 from scatter_plot import *
 from circos_plot import *
 from circos_plot import _clean_population_label, _broadcast_population_info
+# Update ID ver4-6, R2 (blueprint §3.2/§3.4): the same shared geometry
+# authority circos_plot.py itself renders through - importing it here is
+# a downward import (Layer 6 -> Layer 3c), the same direction as the
+# existing `from checkpoint_utils import (...)` below.
+import circos_geometry
 from attention_histogram import *
 from Preprocess.LD_decay_plot import (
-    average_and_plot_ld_decay, ld_decay_data_exists,
+    average_and_plot_ld_decay, ld_decay_data_exists, resolve_snp_info_for_decay,
     WINDOW_UNITS as LD_DECAY_WINDOW_UNITS, DEFAULT_MAX_DISTANCE as LD_DECAY_DEFAULT_MAX_DISTANCE,
     DEFAULT_BIN_WIDTH as LD_DECAY_DEFAULT_BIN_WIDTH,
+    DEFAULT_MAX_PAIRS_PER_CHR as LD_DECAY_DEFAULT_MAX_PAIRS_PER_CHR,
 )
 from checkpoint_utils import (
     find_incomplete_batches, sequential_run_status, describe_incomplete_batch, check_batch_status,
@@ -69,8 +75,28 @@ _UNIT_LABEL_FOR_GUI = {'kb': 'kb', 'cm': 'cM', 'variants': 'markers'}
 from pipeline_utils import (
     BATCH_ID_SOURCES, configure_r_environment, init_rpy2_conversion,
     detect_array_job_env, restore_ratio, resolve_batch_id_from_env,
-    TimestampedWriter, make_run_log_path,
+    TimestampedWriter, make_run_log_path, list_phenotype_columns,
+    resolve_compute_resources, count_unique_populations, result_dir_path,
 )
+from resource_profiles import (
+    estimate_resources, _GADI_GPU_NCPUS_PER_GPU, _GPU_PREPROCESS_CPU_HEADROOM,
+    HPC_RESOURCE_PROFILES, DEFAULT_HPC_PROFILE, resolve_hpc_profile,
+    # ver4-4, R1 (blueprint §2.1) - every exact-dividing (batch_size,
+    # n_batches) pair for the 'Suggested job-array size' selector.
+    enumerate_array_layouts,
+)
+from metric_summary import write_metric_summary
+# Update ID ver4-9, R5.
+from diversity_summary import build_dpt_terms, write_dpt_summary, resolve_ensemble_members, dpt_model_order
+# Update ID ver4-9, R6.
+from weight_plot import weight_plot
+# ver4-4 R7.g: the SAME "5 leading metadata columns, everything past that
+# is a marker" convention batch_reader.ResultSet.effect() already uses for
+# its own float32 downcast - imported here so the Sequential in-process
+# block below (which has no ResultSet - `effect` is GP()'s own in-memory
+# accumulator) can apply the identical downcast without re-declaring the
+# same literal width a second time.
+from batch_reader import _EFFECT_METADATA_WIDTH, load_combined
 
 # The biological prior-knowledge GAT model's preprocessing helpers
 # (Preprocess/gene_network_prior.py, flash_p_integration.py,
@@ -146,8 +172,49 @@ GUI_STATE_FILE = os.path.join('.', 'easigp_last_gui_state.json')
 _CIRCOS_AUTOFILL_FIELDS = {
     'circos_space', 'circos_start', 'circos_end', 'circos_link_alpha_min',
     'circos_labelsize', 'circos_scale', 'window_size', 'end_adjust', 'gene_adjust',
+    # Update ID ver4-6, R2 (blueprint §3.4 S4): the one further field this
+    # update adds that auto-fills the same way as the fields above.
+    'circos_ring_label_size',
 }
 _CIRCOS_AUTOFILL_TRACKING_KEYS = {f'_{_f}_last_autofill' for _f in _CIRCOS_AUTOFILL_FIELDS}
+
+# Requirement 2 (crash fix - StreamlitValueAssignmentNotAllowedError):
+# Streamlit refuses to let ANY code (including load_gui_state()'s generic
+# session_state.setdefault() loop below) programmatically set the value of
+# an `st.file_uploader` / `st.camera_input` widget - an uploaded file is a
+# live, non-serialisable browser buffer, not a plain settable value, and
+# Streamlit enforces this by raising StreamlitValueAssignmentNotAllowedError.
+# The whole-of-session_state persistence mechanism (see GUI_STATE_FILE's own
+# comment above) doesn't know about this restriction on its own, so on a
+# later app launch it would try to restore a previously-uploaded file's key
+# and crash the entire GUI before the rest of gather_config()'s widget
+# restoration ever runs - "previously set configurations were not used" is
+# the direct, whole-app-crash symptom of this.
+#
+# Fix, matching the already-existing _CIRCOS_AUTOFILL_FIELDS pattern above:
+# every upload-type widget's key is listed here explicitly, ONCE, so
+# save_gui_state()/load_gui_state() stay in sync automatically. Every
+# `st.file_uploader(`/`st.camera_input(` call site in this file must have
+# its `key=` added here (audited as part of Requirement 2 - currently just
+# the one bash-file-conversion uploader in render_hpc_export_section()).
+_NON_RESTORABLE_WIDGET_KEYS = {
+    f'_{_kp}_sh_convert_upload' for _kp in ('sequential', 'step1', 'step2')
+}
+
+
+def _is_non_restorable_widget_key(key):
+    """True for any key known (or, via the '_upload'/'_uploader'/'_camera'
+    suffix heuristic below, suspected) to belong to an `st.file_uploader` /
+    `st.camera_input` widget - see _NON_RESTORABLE_WIDGET_KEYS's own
+    comment. The explicit set is the primary check (exact, no false
+    positives); the suffix heuristic is a defence-in-depth net for any
+    upload-type widget added later whose key wasn't (yet) added to that
+    set explicitly - it only matches the conventional naming this codebase
+    already uses for such widgets, so it should never trip on an ordinary
+    text/number/select field."""
+    if key in _NON_RESTORABLE_WIDGET_KEYS:
+        return True
+    return key.endswith(('_upload', '_uploader', '_camera_input'))
 
 
 def load_gui_state():
@@ -176,11 +243,29 @@ def load_gui_state():
         # reintroduce the same staleness problem this fix exists for.
         if key in _CIRCOS_AUTOFILL_FIELDS or key in _CIRCOS_AUTOFILL_TRACKING_KEYS:
             continue
+        # Requirement 2 (crash fix, primary mitigation): never even attempt
+        # to restore a known non-restorable (uploader/camera) widget key -
+        # see _NON_RESTORABLE_WIDGET_KEYS's own comment. save_gui_state()
+        # never writes these going forward, but an OLDER state file saved
+        # before this fix existed could still contain one.
+        if _is_non_restorable_widget_key(key):
+            continue
         try:
             st.session_state.setdefault(key, value)
         except Exception:
-            continue  # a small number of widget types can't be pre-seeded
-                      # this way - just skip those
+            # Requirement 2 (crash fix, defence-in-depth safety net): catch
+            # broadly here (Streamlit's own
+            # StreamlitValueAssignmentNotAllowedError, plus any other
+            # currently-unknown non-restorable widget type added later and
+            # not yet covered by _is_non_restorable_widget_key()) rather
+            # than a narrow except - this converts what used to be a
+            # whole-GUI-crashing exception into a graceful, logged, single-
+            # key skip, so the rest of this restoration loop (every other
+            # saved field) still runs normally.
+            print(f"[EasiGP] load_gui_state(): could not restore session_state "
+                  f"key {key!r} (widget type likely doesn't support "
+                  f"programmatic restoration) - skipping just this one key.")
+            continue
 
 
 def save_gui_state():
@@ -217,6 +302,17 @@ def save_gui_state():
         # persists to the NEXT app launch.
         if key in _CIRCOS_AUTOFILL_FIELDS or key in _CIRCOS_AUTOFILL_TRACKING_KEYS:
             continue
+        # Requirement 2 (crash fix, primary mitigation): never persist an
+        # uploader/camera widget's own value - an uploaded file cannot
+        # outlive the browser session regardless of what persistence layer
+        # tries to hold onto it, and attempting to restore it on the next
+        # launch is exactly what raises StreamlitValueAssignmentNotAllowedError
+        # (see _NON_RESTORABLE_WIDGET_KEYS's own comment). The *metadata*
+        # (last-used filename) each such widget's call site persists
+        # instead is a plain string under a different, non-widget key, so
+        # it's saved normally by this same generic loop.
+        if _is_non_restorable_widget_key(key):
+            continue
         try:
             json.dumps(value)
         except (TypeError, ValueError):
@@ -238,10 +334,21 @@ load_gui_state()
 # --------------------------------------------------------------------------- #
 
 AVAILABLE_MODELS = [
-    'rrBLUP', 'GBLUP', 'BayesB', 'RKHS', 'RF', 'SVR', 'KNN', 'MLP',
+    'rrBLUP', 'GBLUP', 'BayesB', 'RKHS', 'RF', 'ExtraTrees', 'XGBoost', 'EBM',
+    'SVR', 'KNN', 'MLP',
     'GAT_infinitesimal', 'GAT_fully_connected', 'GAT_prior_knowledge',
     'GAT_biological_prior_knowledge', 'ensemble'
 ]
+
+# Update ID ver4-5, R2 Stage 11 (decision D2): Tier 2 models need an
+# OPTIONAL third-party package (model_registry.optional_dependency_for())
+# - AVAILABLE_MODELS above still lists them unconditionally (so a saved
+# GUI state / headless config referencing them keeps resolving to a real
+# name), but the model-picker loop below (Tab 3) filters them out of the
+# SELECTABLE checkboxes whenever their package isn't importable in this
+# environment, replacing the checkbox with an explanatory caption naming
+# the missing package - never a silent omission.
+TIER_2_MODELS = frozenset({'XGBoost', 'EBM'})
 
 MODEL_DESCRIPTIONS = {
     'rrBLUP': "Ridge regression: assumes every marker has a small effect, and shrinks them all towards zero by a similar amount. A solid, fast general-purpose baseline.",
@@ -249,6 +356,9 @@ MODEL_DESCRIPTIONS = {
     'BayesB': "Like rrBLUP, but assumes only a subset of markers have a real effect (sparser) - a good fit when you expect a few large-effect markers rather than many small ones.",
     'RKHS': "Captures non-linear relationships between individuals' genetics and their trait, using a flexible similarity-based (kernel) approach rather than assuming purely additive marker effects.",
     'RF': "Random Forest: an ensemble of decision trees. Handles non-linear effects and marker interactions well, and can rank markers by importance.",
+    'ExtraTrees': "Extremely Randomised Trees: a sibling of Random Forest that picks split thresholds at random rather than searching for the best one. Often a genuinely different, sometimes less overfitted, alternative to RF on high-dimensional genotype data.",
+    'XGBoost': "A fast, widely-used gradient-boosting implementation. Requires the optional 'xgboost' package.",
+    'EBM': "Explainable Boosting Machine: a 'glass-box' model whose pairwise marker interactions are part of the fit itself, not a separate explanation step computed afterwards. Requires the optional 'interpret' package.",
     'SVR': "Support Vector Regression: fits a flexible boundary through the data, with a tunable margin of error. Can capture non-linear patterns via its kernel setting.",
     'KNN': "K-Nearest Neighbours: predicts a trait as an average of the most genetically similar individuals in the training set. Simple and intuitive, but can be slow on large datasets.",
     'MLP': "Multi-Layer Perceptron: a small neural network. Can capture complex, non-linear patterns, but typically needs more data and tuning than the other models to do so reliably.",
@@ -259,12 +369,13 @@ MODEL_DESCRIPTIONS = {
     'ensemble': "Combines the predictions of every other selected model together (a simple average, unless a weight-optimisation method is also chosen in '4. Ensemble'), often giving more robust predictions than any single model alone. Selected on the '4. Ensemble' tab.",
 }
 
-W_OPT_METHODS = ['Nelder Mead', 'Linear transformation', 'Bayesian optimisation']
+W_OPT_METHODS = ['Nelder Mead', 'Linear transformation', 'Bayesian optimisation', 'Analytic least-squares']
 
 W_OPT_METHOD_DESCRIPTIONS = {
     'Nelder Mead': "Searches for the best per-model weights using a direct, gradient-free numerical search. Simple and generally reliable.",
     'Linear transformation': "Learns the per-model weights using a small neural network (see its settings below), rather than a direct numerical search.",
     'Bayesian optimisation': "Searches for the best per-model weights intelligently, using past attempts to decide where to try next - can find good weights in fewer attempts than Nelder Mead, at the cost of more setup overhead per attempt.",
+    'Analytic least-squares': "Solves directly (in milliseconds, via scipy) for the exact, closed-form least-squares combination of your selected models - no iterative search at all, so there's nothing to tune and no randomness between runs.",
 }
 
 # Each hyperparameter field is a dict:
@@ -277,6 +388,16 @@ W_OPT_METHOD_DESCRIPTIONS = {
 #               is greyed out unless the field at controller_index (within
 #               the same model's list, 0-indexed) currently equals
 #               required_value.
+#   visible_when: (optional) (controller_index, required_value) - like
+#               depends_on, but stronger: this field's widget(s) are not
+#               rendered AT ALL (not just greyed out) unless the field at
+#               controller_index currently equals required_value. Used for
+#               settings that are meaningless - not merely inactive - under
+#               the controller's other values (e.g. RF's friedman_h-only
+#               interaction pre-screen settings, irrelevant whenever
+#               'Marker interaction method' is 'pairwise_shap'). A field may
+#               carry both keys: 'visible_when' governs whether it appears
+#               at all, 'depends_on' still governs greying out once it does.
 #
 # Field order within each model matches the positional order the backend
 # expects in HPARAMETERS[model] - do not reorder.
@@ -287,6 +408,7 @@ W_OPT_METHOD_DESCRIPTIONS = {
 # changed - hparam_specs.py's fields are byte-identical to what used to be defined
 # inline here, with 'tunable' ranges merged in on top for the fields that affect fit.
 from hparam_specs import HPARAM_SPECS
+from model_registry import is_available, optional_dependency_for
 # 'ensemble' has no hyperparameters of its own (it combines other models' output).
 
 HYPERPARAM_OPT_SPECS = {
@@ -315,16 +437,46 @@ HYPERPARAM_OPT_SPECS = {
                   "several times from different random starting points, keeping the best run "
                   "- this sets how many times it tries. More attempts are more likely to find "
                   "a good set of weights, but take longer.")},
+        # Phase 2, Requirement 4/5 follow-up (§4.4 of the audit) - appended-
+        # only, indices 6-8, read positionally by Linear_transformation.py.
+        # Every default below exactly reproduces this method's original
+        # (pre-Phase-2) behaviour, so an old saved config round-trips
+        # unchanged.
+        {'label': 'Diversity penalty (lambda)', 'type': 'float', 'default': 0.0,
+         'help': ("Optional extra regularisation: an additional ridge-to-uniform penalty on "
+                  "the model's own combining weights, discouraging them from drifting far from "
+                  "equal weighting. 0 (the default) leaves this method's original loss "
+                  "unchanged. Not structurally required for this method the way it is for "
+                  "Nelder-Mead/Bayesian optimisation - see the tooltip on those two.")},
+        {'label': 'Use simplex (non-negative, sum-to-1) weights', 'type': 'bool', 'default': False,
+         'help': ("By default this method's combining weights are completely unconstrained, "
+                  "which allows negative or extrapolating combinations of models. Enabling "
+                  "this reparameterises them through a softmax, so they are always "
+                  "non-negative and sum to 1 - a more conservative, blend-only combination, "
+                  "at the cost of being unable to represent negative-weight corrections.")},
+        {'label': 'Naive-shrinkage alpha', 'type': 'float', 'default': 1.0,
+         'help': ("Blends this method's own predictions toward the plain equal-weighted "
+                  "(naive) ensemble as an extra safety margin against overfitting the "
+                  "validation split: 1.0 (the default) uses this method's predictions as-is; "
+                  "lower values shrink further toward the naive average; 0.0 reproduces the "
+                  "naive ensemble exactly. Combined with a built-in guard that never performs "
+                  "worse than the naive ensemble on the validation split.")},
     ],
     'Nelder Mead': [
         {'label': 'Initial value', 'type': 'float', 'default': 0.5,
          'help': ("The starting weight given to every model before the search begins. Since "
                   "all models start equal, the exact value doesn't usually matter much - it "
-                  "just needs to be a valid starting point within the boundaries below.")},
-        {'label': 'Minimum boundary', 'type': 'float', 'default': 0.1,
+                  "just needs to be a valid starting point within the boundaries below. This "
+                  "equal-weighting point is also always evaluated as one of several restarts "
+                  "the search tries (see 'Adaptive' below), and the search is now guaranteed "
+                  "to never return something worse than it.")},
+        {'label': 'Minimum boundary', 'type': 'float', 'default': 0.0,
          'help': ("The smallest weight any individual model is allowed to be given during "
-                  "the search.")},
-        {'label': 'Maximum boundary', 'type': 'float', 'default': 10,
+                  "the search. 0 (the default) lets the search effectively drop a "
+                  "consistently weak model from the ensemble entirely, rather than always "
+                  "keeping it at some small nonzero share - now safe to allow, since an "
+                  "all-zero-weight combination is automatically detected and handled.")},
+        {'label': 'Maximum boundary', 'type': 'float', 'default': 1,
          'help': ("The largest weight any individual model is allowed to be given during "
                   "the search.")},
         {'label': 'fatol', 'type': 'float', 'default': 1e-8,
@@ -334,15 +486,70 @@ HYPERPARAM_OPT_SPECS = {
         {'label': 'xatol', 'type': 'float', 'default': 1e-8,
          'help': ("Similar to fatol above, but based on how much the weights themselves stop "
                   "changing between attempts, rather than how much the fit improves.")},
-        {'label': 'Adaptive', 'type': 'bool', 'default': False,
+        {'label': 'Adaptive', 'type': 'bool', 'default': True,
          'help': ("Automatically adjusts the search's internal step sizes for problems with "
-                  "many models being weighted at once. Worth trying if the search seems to "
-                  "struggle when combining a large number of models.")},
+                  "many models being weighted at once - recommended (and now the default) "
+                  "whenever more than a handful of models are being combined, which is the "
+                  "common case for this method; scipy's own guidance is to enable this "
+                  "once the number of models being weighted climbs much past 4-5.")},
+        # Phase 2, Requirement 5 - appended-only, indices 6-9, read
+        # positionally via ensemble_regularization.read_regularization_
+        # settings(start_index=6). Every default below reproduces this
+        # method's original (pre-Phase-2) behaviour exactly, so an old
+        # saved config round-trips unchanged.
+        {'label': 'Diversity penalty (lambda)', 'type': 'float', 'default': 0.0,
+         'help': ("Strength of a regulariser added before optimising, needed to fix a "
+                  "structural issue in the ORIGINAL 'dpt_ratio' objective below: it always "
+                  "pushes toward one model dominating and the rest collapsing to the boundary, "
+                  "rather than a genuine blend. Only relevant when Objective (below) is set to "
+                  "'dpt_ratio' - the default 'ensemble_mse' objective doesn't need it (it has a "
+                  "genuine interior optimum on its own). 0 (default) disables it; a small "
+                  "positive value (e.g. 0.01-0.1) helps if you deliberately use 'dpt_ratio' and "
+                  "see near-one-hot weights.")},
+        {'label': 'Objective', 'type': 'str', 'default': 'ensemble_mse',
+         'choices': ['dpt_ratio', 'ensemble_mse'],
+         'help': ("'ensemble_mse' (default since ver4-6) directly minimises the combined "
+                  "ensemble's own error against the validation target - a naturally "
+                  "well-behaved, interior-optimised objective. 'dpt_ratio' is the original "
+                  "published Diversity Prediction Theorem objective; its own optimum is "
+                  "provably a single-model selection (a simplex vertex), not a genuine blend, "
+                  "which measured 43% worse validation error than simple equal weighting in "
+                  "this update's own testing - kept selectable to reproduce published DPT "
+                  "results, but not recommended for prediction accuracy. Whichever you choose, "
+                  "a validation-MSE floor (see the resource-advisor settings) now guarantees "
+                  "the returned weights are never worse than equal weighting.")},
+        {'label': 'Naive-shrinkage alpha', 'type': 'float', 'default': 1.0,
+         'help': ("Blends the search's own weights toward equal (naive) weighting as an extra "
+                  "safety margin: 1.0 (default) uses the search's weights as-is; lower values "
+                  "shrink further toward equal weighting; 0.0 reproduces equal weighting "
+                  "exactly.")},
+        {'label': 'Diversity penalty method', 'type': 'str', 'default': 'ridge_to_uniform',
+         'choices': ['ridge_to_uniform', 'entropy'],
+         'help': ("How the diversity penalty above is computed. 'ridge_to_uniform' (default) "
+                  "penalises squared distance from equal weighting. 'entropy' instead "
+                  "penalises the shortfall from maximum (uniform) entropy - a softer penalty "
+                  "that tolerates moderate imbalance more than ridge-to-uniform.")},
+        # ver4-5 R1.d (blueprint §3.6) - appended-only, index 10 (after
+        # the Requirement-5 regularisation fields above, which occupy
+        # 6-9). Default True reproduces this update's own new default -
+        # NOT ver4-4's pre-R1.d behaviour, which had no vectorised path
+        # at all; setting this False is the escape hatch back to the
+        # exact original floating-point summation order.
+        {'label': 'Vectorised objective', 'type': 'bool', 'default': True,
+         'help': ("Evaluates the weight-search objective as a single fast matrix computation "
+                  "instead of a per-model loop - mathematically the same formula, agreeing "
+                  "with the original computation to about 1 part in a trillion, but the tiny "
+                  "floating-point rounding differences can occasionally nudge the search onto "
+                  "a different (equally valid) answer. Turn off to reproduce the exact original "
+                  "computation.")},
     ],
     'Bayesian optimisation': [
-        {'label': 'Minimum boundary', 'type': 'float', 'default': 0.0001,
+        {'label': 'Minimum boundary', 'type': 'float', 'default': 0.0,
          'help': ("The smallest weight any individual model is allowed to be given during "
-                  "the search.")},
+                  "the search. 0 (the default) lets the search effectively drop a "
+                  "consistently weak model from the ensemble entirely, rather than always "
+                  "keeping it at some small nonzero share - now safe to allow, since an "
+                  "all-zero-weight combination is automatically detected and handled.")},
         {'label': 'Maximum boundary', 'type': 'float', 'default': 10.0,
          'help': ("The largest weight any individual model is allowed to be given during "
                   "the search.")},
@@ -350,14 +557,105 @@ HYPERPARAM_OPT_SPECS = {
          'help': ("How many rounds of weight combinations this search tries before settling "
                   "on the best one found. More iterations search more thoroughly but take "
                   "longer.")},
-        {'label': 'Point numbers', 'type': 'int', 'default': 1,
+        {'label': 'Point numbers', 'type': 'int', 'default': 3,
          'help': ("How many random weight combinations are tried before the search starts "
-                  "using what it's learned so far to make smarter guesses. Usually fine left "
-                  "at the default.")},
+                  "using what it's learned so far to make smarter guesses (in addition to "
+                  "equal weighting, which is always tried first regardless of this setting). "
+                  "A handful gives the search a better initial sense of the weight space to "
+                  "build on before it starts making targeted guesses.")},
         {'label': 'Allow duplicate points', 'type': 'bool', 'default': True,
          'help': ("Whether the search is allowed to try the exact same weight combination "
                   "more than once. Leaving this on avoids the search getting stuck if it "
                   "runs out of new combinations to try.")},
+        # Phase 2, Requirement 5 - appended-only, indices 5-8, read
+        # positionally via ensemble_regularization.read_regularization_
+        # settings(start_index=5). Same fields/defaults as Nelder Mead
+        # above (see its comments) - this method's own original params
+        # list is one field shorter (5 vs 6), hence the different
+        # start_index.
+        {'label': 'Diversity penalty (lambda)', 'type': 'float', 'default': 0.0,
+         'help': ("Strength of a regulariser added before optimising, needed to fix a "
+                  "structural issue in the ORIGINAL 'dpt_ratio' objective below: it always "
+                  "pushes toward one model dominating and the rest collapsing to the boundary, "
+                  "rather than a genuine blend. Only relevant when Objective (below) is set to "
+                  "'dpt_ratio' - the default 'ensemble_mse' objective doesn't need it (it has a "
+                  "genuine interior optimum on its own). 0 (default) disables it; a small "
+                  "positive value (e.g. 0.01-0.1) helps if you deliberately use 'dpt_ratio' and "
+                  "see near-one-hot weights.")},
+        {'label': 'Objective', 'type': 'str', 'default': 'ensemble_mse',
+         'choices': ['dpt_ratio', 'ensemble_mse'],
+         'help': ("'ensemble_mse' (default since ver4-6) directly minimises the combined "
+                  "ensemble's own error against the validation target - a naturally "
+                  "well-behaved, interior-optimised objective. 'dpt_ratio' is the original "
+                  "published Diversity Prediction Theorem objective; its own optimum is "
+                  "provably a single-model selection (a simplex vertex), not a genuine blend, "
+                  "which measured 43% worse validation error than simple equal weighting in "
+                  "this update's own testing - kept selectable to reproduce published DPT "
+                  "results, but not recommended for prediction accuracy. Whichever you choose, "
+                  "a validation-MSE floor (see the resource-advisor settings) now guarantees "
+                  "the returned weights are never worse than equal weighting.")},
+        {'label': 'Naive-shrinkage alpha', 'type': 'float', 'default': 1.0,
+         'help': ("Blends the search's own weights toward equal (naive) weighting as an extra "
+                  "safety margin: 1.0 (default) uses the search's weights as-is; lower values "
+                  "shrink further toward equal weighting; 0.0 reproduces equal weighting "
+                  "exactly.")},
+        {'label': 'Diversity penalty method', 'type': 'str', 'default': 'ridge_to_uniform',
+         'choices': ['ridge_to_uniform', 'entropy'],
+         'help': ("How the diversity penalty above is computed. 'ridge_to_uniform' (default) "
+                  "penalises squared distance from equal weighting. 'entropy' instead "
+                  "penalises the shortfall from maximum (uniform) entropy - a softer penalty "
+                  "that tolerates moderate imbalance more than ridge-to-uniform.")},
+        # ver4-5 R1.e/R1.f/R1.d (blueprint §3.6) - appended-only, indices
+        # 9-12 (after the Requirement-5 regularisation fields above,
+        # which occupy 5-8). Every default reproduces this update's own
+        # new defaults; W_OPT_BAYES_RESTARTS=1 alone reproduces ver4-4's
+        # exact single-search behaviour regardless of the other three.
+        {'label': 'Restarts', 'type': 'int', 'default': 1,
+         'help': ("Runs this many independent weight searches (from different random seeds) "
+                  "and keeps the best - each restart uses its own CPU core when more than one "
+                  "is available, so this is the setting that actually uses multiple CPUs for "
+                  "weight optimisation. 1 (default) reproduces the original single-search "
+                  "behaviour exactly.")},
+        {'label': 'Batch suggestion', 'type': 'bool', 'default': True,
+         'help': ("Asks for several candidate weight combinations per round instead of one at "
+                  "a time, which can reduce how often the search needs to re-fit its own "
+                  "internal model as the iteration budget above grows. This objective is cheap "
+                  "to evaluate, so the benefit is modest; safe to leave on.")},
+        {'label': 'Batch liar strategy', 'type': 'str', 'default': 'max',
+         'choices': ['max', 'mean', 'believer'],
+         'help': ("How a not-yet-evaluated candidate within the same batch round is "
+                  "provisionally scored so the next candidate in that round isn't just a "
+                  "repeat of it. 'max' (default, recommended) is the standard, cautious "
+                  "choice. Only relevant when Batch suggestion above is on.")},
+        {'label': 'Vectorised objective', 'type': 'bool', 'default': True,
+         'help': ("Evaluates the weight-search objective as a single fast matrix computation "
+                  "instead of a per-model loop - mathematically the same formula, agreeing "
+                  "with the original computation to about 1 part in a trillion, but the tiny "
+                  "floating-point rounding differences can occasionally nudge the search onto "
+                  "a different (equally valid) answer. Turn off to reproduce the exact original "
+                  "computation.")},
+    ],
+    # Requirements.md item 5: the same closed-form least-squares solve
+    # previously only reachable as the other three methods' opt-in
+    # W_OPT_ANALYTIC_SEED seed/floor candidate (models/ensemble_
+    # regularization.py::analytic_simplex_weights()), now offered as its
+    # own, independent weight-optimisation method - see models/
+    # Analytic_least_squares.py.
+    'Analytic least-squares': [
+        {'label': 'Ridge regularisation', 'type': 'float', 'default': 1e-6,
+         'help': ("A small conditioning term added to the least-squares solve, needed when "
+                  "your selected models' predictions are highly correlated - without it, the exact solve can "
+                  "become numerically unstable. The default is small enough to leave a "
+                  "well-conditioned solve essentially unaffected; only raise it if you see a "
+                  "'[ensemble_regularization] NOTE: ... SLSQP solve did not converge' message "
+                  "in the run log.")},
+        {'label': 'Naive-shrinkage alpha', 'type': 'float', 'default': 1.0,
+         'help': ("Blends this method's own exact solution toward the plain equal-weighted "
+                  "(naive) ensemble as an extra safety margin against overfitting the "
+                  "validation split: 1.0 (the default) uses the exact solution as-is; lower "
+                  "values shrink further toward the naive average; 0.0 reproduces the naive "
+                  "ensemble exactly. Combined with a built-in guard that never performs worse "
+                  "than the naive ensemble on the validation split.")},
     ],
 }
 
@@ -693,6 +991,33 @@ def _circos_chromosome_count():
 
 
 
+def _circos_chrom_lengths_dict():
+    """Update ID ver4-6, R2 (blueprint §3.2 Defence 1): `{chromosome
+    name: length}` for every chromosome in the 'Chromosome info file
+    path' currently set in the GUI - the per-chromosome basis
+    `circos_geometry.suggest_scale()`/`suggest_window()`/
+    `suggest_chrom_label_size()` all need (the pre-ver4-6 helpers above
+    only ever exposed the LONGEST chromosome's length, the chromosome
+    COUNT, or the TOTAL length - never the full per-chromosome
+    breakdown, which is what fixes RC-2/RC-3's "only the longest
+    chromosome was ever checked" root cause). Returns `{}` if no valid
+    chromosome info file is set - every `circos_geometry` function
+    handles an empty `chrom_lengths` dict gracefully (never raises)."""
+    chrom_path = st.session_state.get('chrom_info_path', '').strip()
+    if not chrom_path or not os.path.isfile(chrom_path):
+        return {}
+    try:
+        chrom = pd.read_csv(chrom_path)
+        chrom = unify_columns_by_position(
+            chrom, ['chromosome', 'start', 'end'], 'chromosome info file'
+        )
+        chrom = chrom.drop_duplicates(subset=['chromosome'])
+        lengths = (chrom['end'] - chrom['start']).astype(float)
+        return dict(zip(chrom['chromosome'].astype(str), lengths))
+    except Exception:
+        return {}
+
+
 def _circos_total_chromosome_length():
     """Requirement 4: total genome size (sum of every chromosome's own
     length), read from the 'Chromosome info file path' currently set in
@@ -867,6 +1192,77 @@ def _circos_suggest_gene_adjust():
     return _widen_suggestion_from_positions(gene, _circos_max_chromosome_length(), "genes", _circos_total_chromosome_length())
 
 
+def _circos_predicted_ring_labels():
+    """Update ID ver4-6, R2 (blueprint §3.2 Defence 1, §3.4 S4): predicts
+    the ring-label list `circos_plot.py::plot()` will actually draw for
+    the CURRENT GUI configuration - mirrors that module's own `MODEL`
+    (`pd.unique(effect['model'])`, which in practice is every selected
+    model expanded for multi-algorithm tuning via
+    `models.hyperparameter_tuning.expand_model_list()`, plus `'ensemble'`
+    plus every selected weighted-ensemble method's own label - see
+    `genomic_prediction.py`'s finalisation block) and `gene_source`
+    (`pd.unique(pop_source['source'])`, sourced here directly from the
+    'Gene info file path' currently set) construction.
+
+    A PREDICTION, not a guarantee - RK-6 (blueprint §8), accepted by
+    design: the GUI cannot know in advance exactly which models will end
+    up with data for every (phenotype, population) combination
+    (`quantile_conversion()`'s own per-combination REMOVE list, see the
+    architecture document's own note on that), and a hand-edited config
+    could differ from what this function assumes entirely. This is
+    exactly why Defence 2 (`circos_plot.py::plot()`'s own per-ring fit
+    guard) exists independently - it is radius-and-string exact at
+    render time and makes overlap impossible regardless of whether this
+    prediction was right (blueprint §3.2: "Defence 1 makes the common
+    case look right; Defence 2 makes overlap impossible even when the
+    prediction was wrong").
+
+    Cheap by design, like every other suggestion function on this tab:
+    reads only the current GUI session state plus, optionally, one small
+    CSV (the gene info file) - never genotype/marker/interaction data.
+
+    Returns
+    -------
+    list of str - possibly empty (e.g. no model selected yet).
+    """
+    selected_models = [m for m in AVAILABLE_MODELS if st.session_state.get(f'model_selected_{m}', False)]
+    if not selected_models:
+        return []
+
+    base_models = [m for m in selected_models if m != 'ensemble']
+    hp_tune = {}
+    for model in base_models:
+        model_hp_tune = resolve_hp_tune(model)
+        if model_hp_tune is not None:
+            hp_tune[model] = model_hp_tune
+
+    try:
+        labels = expand_model_list(base_models, hp_tune)
+    except Exception:
+        # Never let a prediction failure block rendering the tab - fall
+        # back to the plain (un-expanded) selection.
+        labels = list(base_models)
+    if 'ensemble' in selected_models and 'ensemble' not in labels:
+        labels.append('ensemble')
+
+    selected_wopt = [m for m in W_OPT_METHODS if st.session_state.get(f'wopt_selected_{m}', False)]
+    labels.extend(selected_wopt)
+
+    gene_path = st.session_state.get('gene_info_path', '').strip()
+    if gene_path and os.path.isfile(gene_path):
+        try:
+            gene = pd.read_csv(gene_path)
+            gene = unify_columns_by_position(
+                gene, ['chromosome', 'start', 'end', 'name', 'colour', 'source', 'phenotype'],
+                'gene info file'
+            )
+            labels.extend(str(s) for s in pd.unique(gene['source']))
+        except Exception:
+            pass  # Defence 2 still guarantees no overlap without this basis (blueprint §3.8)
+
+    return labels
+
+
 def _circos_suggest_space():
     """Requirement 5: fills 'Space between rings' automatically. Cheap by
     design (Requirement: must not be computationally heavy like the old
@@ -884,67 +1280,73 @@ def _circos_suggest_space():
 
 
 def _circos_suggest_start_end_angle():
-    """Requirement 1 (correction): fills 'Start angle'/'End angle'
-    automatically - leaves a gap at the seam (where the circle's start
-    meets its end) so labels near the seam have room without
-    unnecessarily shrinking the rest of the plot.
+    """Update ID ver4-6, R2 (blueprint §3.2 Defence 1, §3.4 S4): fills
+    'Start angle'/'End angle' automatically - now a thin wrapper over
+    `circos_geometry.seam_gap_for_labels()`, called TWICE and combined
+    with `max()`:
 
-    Font size determined FIRST, then used here: calls
-    _circos_suggest_label_size() directly (a plain, stateless function of
-    chromosome count only - no widget-ordering dependency needed) rather
-    than assuming some particular render order already ran, so the gap
-    this computes is always consistent with the CURRENT label size
-    suggestion, whichever order the fields happen to render in.
+      1. once for the chromosome NAME (`r=108`, the same radius
+         `circos_plot.py` itself draws it at) - this alone is what the
+         pre-ver4-6 formula measured (RC-1's own root cause: "the
+         seam-gap formula measures the wrong text" - it measured ONLY
+         this, never any ring label);
+      2. once for every PREDICTED ring label
+         (`_circos_predicted_ring_labels()`), each at its own ring's
+         `r_centre` from `circos_geometry.ring_geometry()` - the text
+         that actually overlaps on a many-ring plot, and the one the
+         pre-ver4-6 formula never read at all.
 
-    The gap itself is the larger of two candidates: one scaled to the
-    label's own footprint (bigger font needs more room) and one scaled to
-    chromosome count as before (more sectors sharing the same seam still
-    needs some minimum share of it) - taking the max of the two, rather
-    than just chromosome count alone, is what was missing before: a
-    genome with many small chromosomes (e.g. a real 26-chromosome cotton
-    assembly) drives the label size down, but the SEAM gap based on
-    chromosome count alone could still end up too tight for whatever
-    label size was actually chosen. An additional small buffer scales in
-    for large chromosome counts specifically (Requirement 1's own 'a bit
-    more extra buffer space when chromosome numbers is large'), since
-    that's exactly where sectors are most tightly packed and the least
-    forgiving of a slightly-too-small gap.
+    Widening the gap alone cannot fix the worst realistic case (blueprint
+    §3.1: `GAT_biological_prior_knowledge__Bayesian` on an inner ring can
+    need over 70 degrees, above any sane seam-gap cap) - so the result is
+    capped at `seam_gap_max` (default 40 degrees) here, and
+    `circos_plot.py::plot()`'s own Defence 2 (shrink, then truncate,
+    long ring labels at render time) is what actually guarantees no
+    overlap when the true requirement exceeds that cap, not this
+    suggestion. The note says so explicitly when capping occurs, rather
+    than silently returning a gap insufficient for the worst label.
 
-    Same cheap chromosome-count-only read as _circos_suggest_space().
-    Returns (start, end, note) or (None, None, warning_text).
-
-    Requirement 1 (SECOND correction): the label-footprint multiplier
-    (2.2) is now 2.6, calibrated directly against a real, manually-tuned
-    reference point - an actual user found start=9/end=351 (an 18-degree
-    seam gap) looked right on a real 26-chromosome genome. Working that
-    backward through this formula (alongside the same label-size
-    recalibration in _circos_suggest_label_size()) lands almost exactly
-    on 18 degrees at 26 chromosomes, rather than being tuned against a
-    smaller, simplified test case as before.
-
-    Requirement (chromosome name now matches tick size): the chromosome
-    name's own ACTUAL rendered size (circos_plot.py's plot()) is now the
-    same, larger size ticks already used - max(5, min(8, label_size *
-    1.8)), not the plain 'Label font size' value directly. The gap
-    calculation here has to use that SAME transformed size, not the raw
-    one, or this suggestion would under-estimate how much room the
-    (now larger) chromosome name actually needs and silently reintroduce
-    the overlap this was originally calibrated to prevent."""
+    Returns (start, end, note) or (None, None, warning_text)."""
     _n_chrom = _circos_chromosome_count()
     if _n_chrom is None or _n_chrom < 1:
         return None, None, "set a valid 'Chromosome info file path' above"
+    chrom_lengths = _circos_chrom_lengths_dict()
     _label_size, _ = _circos_suggest_label_size()
     if _label_size is None:
         _label_size = 6.0
     _chrom_name_rendered_size = max(5.0, min(8.0, _label_size * 1.8))
-    _avg_sector_width = 360.0 / _n_chrom
-    _gap_from_count = _avg_sector_width * 0.6
-    _gap_from_label = _chrom_name_rendered_size * 2.6
-    _extra_buffer = 1.0 + max(0.0, (_n_chrom - 15) * 0.02)
-    _gap = round(max(8.0, min(60.0, max(_gap_from_count, _gap_from_label) * _extra_buffer)), 1)
+    _longest_chrom_name = max(chrom_lengths, key=len) if chrom_lengths else 'Chr01'
+    _seam_gap_max = _num_or_default('circos_seam_gap_max', 40.0)
+
+    _chrom_gap, _chrom_capped = circos_geometry.seam_gap_for_labels(
+        [_longest_chrom_name], _chrom_name_rendered_size, [108.0], cap_deg=_seam_gap_max,
+    )
+
+    _predicted_labels = _circos_predicted_ring_labels()
+    if _predicted_labels:
+        _ring_layout = st.session_state.get('circos_ring_layout') or 'legacy'
+        _ring_label_size = _num_or_default('circos_ring_label_size', 8.0)
+        _ring_radii = [g[2] for g in circos_geometry.ring_geometry(len(_predicted_labels), layout=_ring_layout)]
+        _ring_gap, _ring_capped = circos_geometry.seam_gap_for_labels(
+            _predicted_labels, _ring_label_size, _ring_radii, cap_deg=_seam_gap_max,
+        )
+    else:
+        _ring_gap, _ring_capped = 8.0, False
+
+    _gap = max(_chrom_gap, _ring_gap)
     _start = round(_gap / 2.0, 1)
     _end = round(360.0 - _gap / 2.0, 1)
-    return _start, _end, f"a {_gap:g} degree seam gap for {_n_chrom} chromosome(s) at {_chrom_name_rendered_size:g}pt labels"
+    _note = (
+        f"a {_gap:g} degree seam gap for {_n_chrom} chromosome(s) at {_chrom_name_rendered_size:g}pt "
+        f"chromosome-name labels and {len(_predicted_labels)} predicted ring label(s)"
+    )
+    if _chrom_capped or _ring_capped:
+        _note += (
+            f" - the true requirement exceeds the {_seam_gap_max:g} degree cap; the renderer will "
+            f"shrink, and if needed truncate, the widest ring label(s) instead (see 'Ring label "
+            f"sizing' in Advanced settings)"
+        )
+    return _start, _end, _note
 
 
 def _circos_suggest_link_alpha_min():
@@ -980,7 +1382,7 @@ def _circos_suggest_link_alpha_min():
     result_name = st.session_state.get('result_name', '').strip()
     if not result_name:
         return None
-    path = os.path.join('.', 'Result', result_name, 'Interaction.csv')
+    path = os.path.join(result_dir_path(result_name), 'Interaction.csv')
     if not os.path.isfile(path):
         return None
     try:
@@ -1091,94 +1493,590 @@ def _render_interaction_top_estimate_form():
         st.rerun()
 
 
-def _circos_suggest_label_size():
-    """Compute-only - fills 'Label font size' automatically once a valid
-    'Chromosome info file path' is set above (cheap: the same lightweight
-    file read _circos_max_chromosome_length()/other suggestions already
-    do). Returns (suggested_size, note) or (None, warning_text).
+def _circos_marker_positions_by_chrom():
+    """`{chromosome: [start positions, ...]}` from the 'Marker info file
+    path' currently set in the GUI - the per-chromosome basis
+    `circos_geometry.suggest_window()`'s own `marker_positions` argument
+    needs (inter-marker gaps are only meaningful WITHIN a chromosome).
+    Returns `None` if no valid marker info file is set - callers fall
+    back to a length-only window suggestion in that case, exactly as
+    before this file's marker-spacing suggestion existed."""
+    marker_path = st.session_state.get('marker_info_path', '').strip()
+    if not marker_path or not os.path.isfile(marker_path):
+        return None
+    try:
+        marker = pd.read_csv(marker_path)
+        marker = unify_columns_by_position(marker, ['chromosome', 'name', 'start', 'end'], 'marker info file')
+        positions = {}
+        for chrom, group in marker.groupby('chromosome'):
+            positions[str(chrom)] = group['start'].astype(float).tolist()
+        return positions
+    except Exception:
+        return None
 
-    Requirement 1 (SECOND correction): the previous recalibration (100,
-    floor 3.0pt) turned out to have over-corrected - a real user report
-    on an actual 26-chromosome render confirmed the chromosome NAME text
-    itself (not just ticks) was now too small to read comfortably, and
-    that a manually-tuned 18-degree seam gap (start=9, end=351) looked
-    right for that same 26-chromosome genome. That 18-degree figure is
-    used directly as a calibration target below (see
-    _circos_suggest_start_end_angle()) - working back from it, a label
-    size around 5.5-6pt at 26 chromosomes is what makes the two
-    formulas agree, which is also comfortably larger than the previous
-    (confirmed-too-small) 3.8pt this correction replaces. Floor raised
-    to 5.0pt (from 3.0pt) and constant to 150 (from 100)."""
+
+def _circos_suggest_label_size():
+    """Update ID ver4-6, R2 (blueprint §3.2 Defence 1, §3.4 S4): fills
+    'Label font size' (the chromosome NAME font size) automatically -
+    now a thin wrapper over `circos_geometry.suggest_chrom_label_size()`
+    (replaces the pre-ver4-6 `150 / n_chrom` heuristic, RC-5), which
+    fits the longest chromosome NAME against the NARROWEST sector's own
+    actual arc length at the current seam gap/inter-sector spacing,
+    rather than reading chromosome COUNT alone.
+
+    `start`/`end` are read from whatever is CURRENTLY set (an earlier
+    auto-fill, or a manual override), falling back to a full-circle
+    placeholder only on this session's very first render, before either
+    has a value yet - this label-size suggestion and
+    `_circos_suggest_start_end_angle()`'s own seam-gap suggestion are
+    mutually dependent (the gap needs a label size to size the
+    chromosome-name's own footprint; this needs a gap to know the
+    narrowest sector's own arc length) and converge to a stable pair
+    within one or two Streamlit reruns, same as any other auto-filling
+    field pair in this file.
+
+    Returns (suggested_size, note) or (None, warning_text)."""
     _n_chrom = _circos_chromosome_count()
     if _n_chrom is None or _n_chrom < 1:
         return None, "set a valid 'Chromosome info file path' above"
-    _suggested_size = round(max(5.0, min(9.0, 150.0 / _n_chrom)), 1)
-    return _suggested_size, f"for {_n_chrom} chromosome(s)"
+    chrom_lengths = _circos_chrom_lengths_dict()
+    if not chrom_lengths:
+        return None, "set a valid 'Chromosome info file path' above"
+    _start = _num_or_default('circos_start', 0.0)
+    _end = _num_or_default('circos_end', 360.0)
+    _space = _num_or_default('circos_space', 1.0)
+    _suggested_size = circos_geometry.suggest_chrom_label_size(
+        list(chrom_lengths.keys()), chrom_lengths, start=_start, end=_end, space=_space,
+    )
+    return _suggested_size, f"for {_n_chrom} chromosome(s), fit to the narrowest sector's own arc"
 
 
 def _circos_suggest_circos_scale():
-    """Compute-only - fills 'Scale' automatically (Requirement 3) once a
-    valid 'Chromosome info file path' is set above. Returns
-    (suggested_value, note) or (None, warning_text)."""
-    _max_len = _circos_max_chromosome_length()
-    if _max_len is None or _max_len <= 0:
+    """Update ID ver4-6, R2 (blueprint §3.2 Defence 1, §3.4 S4): fills
+    'Scale' automatically - now a thin wrapper over
+    `circos_geometry.suggest_scale()`, which checks tick-label fit
+    against EVERY chromosome's own sector arc (RC-2's own root cause:
+    the pre-ver4-6 formula, `max_len / 10`, read chromosome length alone
+    and never checked whether the resulting tick labels could actually
+    fit anywhere). Returns (suggested_value, note) or (None,
+    warning_text)."""
+    chrom_lengths = _circos_chrom_lengths_dict()
+    if not chrom_lengths:
         return None, "set a valid 'Chromosome info file path' above"
-    return _nice_round_number(_max_len / 10.0), f"longest chromosome: {_max_len:g}"
+    _max_len = max(chrom_lengths.values())
+    _label_size, _ = _circos_suggest_label_size()
+    if _label_size is None:
+        _label_size = 6.0
+    _tick_label_size = max(5.0, min(8.0, _label_size * 1.8))
+    _start = _num_or_default('circos_start', 0.0)
+    _end = _num_or_default('circos_end', 360.0)
+    _space = _num_or_default('circos_space', 1.0)
+    _suggested = circos_geometry.suggest_scale(
+        chrom_lengths, start=_start, end=_end, space=_space, tick_label_size_pt=_tick_label_size,
+    )
+    return _suggested, f"fit to every chromosome's own sector (longest: {_max_len:g})"
 
 
 def _circos_suggest_window_size():
-    """Compute-only - fills 'Averaging window size (WINDOW)' automatically
-    (Requirement 3) once a valid 'Chromosome info file path' (and,
-    ideally, 'Marker info file path') is set above.
-
-    Requirement 3 (finer now that borders exist): the earlier version of
-    this suggestion deliberately erred toward a COARSER window (~15
-    markers/bin) because a window fine enough to leave many empty bins
-    could make the WHOLE plot come out blank - quantile_conversion()
-    (circos_plot.py) drops any bin whose total effect is exactly 0. Now
-    that every marker/gene region gets a visible border regardless of its
-    size (_add_cytoband_tracks_with_border(), added since), a bin with
-    very few (even just one) markers in it is no longer at risk of
-    disappearing entirely - so this can safely target a FINER window
-    (more bins, more resolution) than before: ~5 markers/bin instead of
-    ~15, and a wider bin-count range (5-150 instead of 5-50).
+    """Update ID ver4-6, R2 (blueprint §3.2 Defence 1, §3.4 S4): fills
+    'Averaging window size (WINDOW)' automatically - now a thin wrapper
+    over `circos_geometry.suggest_window()`, which fixes RC-3 (the
+    pre-ver4-6 ceiling was anchored on the LONGEST chromosome, so a
+    chromosome a quarter that length received only ~1 bin at the
+    ceiling - the new ceiling is anchored on the SHORTEST chromosome
+    instead) and RC-4 (rounds DOWN, never above, its own ceiling - the
+    pre-ver4-6 nearest-rounding could round a clamped value up past the
+    very ceiling meant to bound it).
 
     Returns (suggested_value, note) or (None, warning_text)."""
-    _max_len = _circos_max_chromosome_length()
-    if _max_len is None or _max_len <= 0:
+    chrom_lengths = _circos_chrom_lengths_dict()
+    if not chrom_lengths:
         return None, "set a valid 'Chromosome info file path' above"
+    marker_positions = _circos_marker_positions_by_chrom()
+    _window, _note = circos_geometry.suggest_window(chrom_lengths, marker_positions)
+    if marker_positions is None:
+        _note += (" Set a 'Marker info file path' above too for a suggestion based on actual "
+                   "marker spacing instead.")
+    return _window, _note
 
-    MIN_BINS, MAX_BINS, TARGET_MARKERS_PER_BIN = 5, 150, 5
-    _window_floor = _max_len / MAX_BINS      # resolution ceiling guard
-    _window_ceiling = _max_len / MIN_BINS    # keep at least some resolution
 
-    marker_path = st.session_state.get('marker_info_path', '').strip()
-    if marker_path and os.path.isfile(marker_path):
-        try:
-            marker = pd.read_csv(marker_path)
-            marker = unify_columns_by_position(marker, ['chromosome', 'name', 'start', 'end'], 'marker info file')
-            gaps = []
-            for _, _group in marker.groupby('chromosome'):
-                _starts = sorted(_group['start'].astype(float).tolist())
-                if len(_starts) >= 2:
-                    gaps.extend(b - a for a, b in zip(_starts, _starts[1:]) if b > a)
-            if gaps:
-                gaps.sort()
-                _median_gap = gaps[len(gaps) // 2]
-                _window_from_density = _median_gap * TARGET_MARKERS_PER_BIN
-                _suggested = min(max(_window_from_density, _window_floor), _window_ceiling)
-                return _nice_round_number(_suggested), (
-                    f"~{TARGET_MARKERS_PER_BIN} marker(s)/bin based on typical marker spacing "
-                    f"(median gap {_median_gap:g}), kept to {MIN_BINS}-{MAX_BINS} bins across the "
-                    f"longest chromosome ({_max_len:g})"
-                )
-        except Exception:
-            pass
+def _circos_suggest_ring_label_size():
+    """Update ID ver4-6, R2 (blueprint §3.2 Defence 1, §5.1): fills
+    'Ring label font size' automatically - defaults to 8.0 (this
+    codebase's own pre-ver4-6 hard-coded ring-label size, so an untouched
+    field renders identically to before this option existed) unless the
+    predicted ring list, at the current seam-gap cap, would need a
+    smaller size to keep every predicted ring label's own required seam
+    gap within that cap - in which case this suggests the largest size
+    that still manages that, so the seam-gap suggestion above stays
+    modest by default instead of climbing toward (or past)
+    `seam_gap_max`.
 
-    return _nice_round_number(_window_floor), (
-        f"~{MAX_BINS} bins across the longest chromosome ({_max_len:g}) - set a 'Marker info "
-        f"file path' above too for a suggestion based on actual marker spacing instead"
+    Purely a cosmetic default: `circos_plot.py::plot()`'s own Defence 2
+    guarantees no ring-label overlap regardless of what this suggests,
+    or whether a person overrides it."""
+    predicted_labels = _circos_predicted_ring_labels()
+    if not predicted_labels:
+        return 8.0, "no models/gene sources selected yet - defaulting to 8pt"
+    _ring_layout = st.session_state.get('circos_ring_layout') or 'legacy'
+    _seam_gap_max = _num_or_default('circos_seam_gap_max', 40.0)
+    _radii = [g[2] for g in circos_geometry.ring_geometry(len(predicted_labels), layout=_ring_layout)]
+    _widest_label = max(predicted_labels, key=len)
+    _innermost_radius = _radii[-1]
+    _fitted = circos_geometry.fit_label_size(
+        _widest_label, _innermost_radius, _seam_gap_max, size_pt=8.0, min_size_pt=4.0,
     )
+    return round(_fitted, 1), f"fit to the widest predicted ring label ('{_widest_label}') at the innermost ring"
+
+
+# --------------------------------------------------------------------
+# Additional_requirements.md, Requirements 1/2: 'Suggest' buttons for LD
+# pruning's Window size/r^2 threshold, and for the LD decay plot's Max
+# distance shown/Distance bin width/Max marker pairs per chromosome.
+#
+# Deliberately kept as explicit-click BUTTONS (via the same on_click ->
+# pending-flag -> apply-before-widget-draw -> _show_suggest_message()
+# pattern already used for the colourblind-safe colour suggestion and
+# 'Top interaction percentage' above), NOT the auto-fill-on-every-rerun
+# pattern the circos tab's own suggestions moved to (_autofill_number_field) -
+# unlike those, a real LD-pruning/LD-decay suggestion should only ever be
+# computed and applied when the person actually asks for it, never
+# silently overwritten on every rerun (e.g. after they've already
+# deliberately tuned these against an LD decay plot they generated).
+# --------------------------------------------------------------------
+
+def _ld_read_snp_info_cheap():
+    """The SNP info file currently configured for LD pruning (Tab 2),
+    read via the exact same Preprocess.LD_decay_plot.resolve_snp_info_for_decay()
+    reader/column-unification LD pruning and the LD decay plot feature
+    themselves already use for this file - reused here rather than
+    re-implemented, so a suggestion can never disagree with what CHR/POS/
+    CM those two actually see for the same file. Returns None if no
+    valid path is currently set."""
+    snp_info_path = st.session_state.get('ld_snp_info_path', '').strip()
+    if not snp_info_path or not os.path.isfile(snp_info_path):
+        return None
+    try:
+        return resolve_snp_info_for_decay({'snp_info': snp_info_path})
+    except Exception:
+        return None
+
+
+def _ld_marker_positions_by_chrom(window_unit):
+    """chromosome -> sorted list of marker positions, in whichever unit
+    `window_unit` itself measures in ('POS' for 'kb', 'CM' for 'cm') -
+    built from the LD-pruning SNP info file (CSV genotype input) or the
+    .bim file (PLINK genotype input, via the same
+    Preprocess.plink_io.read_bim_marker_info() genomic_prediction.py
+    itself calls to get this - never touches the, potentially far
+    larger, .bed genotype matrix).
+
+    Returns None if no source is configured yet at all (caller falls
+    back to a fixed default with a note explaining what's missing), or
+    {} if a source WAS read but doesn't carry the column this
+    `window_unit` needs (a .bim file has no genetic-distance equivalent,
+    same requirement Preprocess.LD_pruning.ld_prune_snps() itself has for
+    'cm' - see its module docstring) - callers treat {} the same way as
+    None (fall back), just with a slightly different note."""
+    if window_unit not in ('kb', 'cm'):
+        # 'variants' windows are defined purely by column order/count, not
+        # by any physical/genetic position - there is nothing here to read
+        # a spacing-based suggestion FROM (see ld_prune_snps()'s own
+        # module docstring). Treated as "no map available" rather than an
+        # error, same as every other missing-input case in this function.
+        return {}
+
+    genotype_format = st.session_state.get('genotype_format', 'CSV file')
+    pos_col = 'CM' if window_unit == 'cm' else 'POS'
+
+    if genotype_format != 'CSV file' and window_unit != 'cm':
+        stem = st.session_state.get('genotype_plink_stem', '').strip()
+        bim_path = f"{stem}.bim" if stem else ''
+        if not stem or not os.path.isfile(bim_path):
+            return None
+        try:
+            bim = read_bim_marker_info(bim_path)  # chromosome, name, start, end
+        except Exception:
+            return None
+        chrom_series, pos_series = bim['chromosome'], bim['start']
+    else:
+        snp_info = _ld_read_snp_info_cheap()
+        if snp_info is None:
+            return None
+        if 'CHR' not in snp_info.columns or pos_col not in snp_info.columns:
+            return {}
+        chrom_series, pos_series = snp_info['CHR'], snp_info[pos_col]
+
+    # Vectorised (pandas-level, not a per-row Python loop) build of
+    # chromosome -> sorted position array - the same "group, coerce,
+    # sort" approach _circos_suggest_window_size() above already uses for
+    # its own marker-info file, kept consistent here rather than
+    # re-inventing a slower row-by-row version: pd.to_numeric(...,
+    # errors='coerce') converts the whole column in one C-level pass,
+    # non-numeric/missing positions become NaN and are dropped once,
+    # rather than caught one exception at a time.
+    frame = pd.DataFrame({
+        'chromosome': chrom_series.astype(str).values,
+        'position': pd.to_numeric(pos_series, errors='coerce').values,
+    }).dropna(subset=['position'])
+
+    by_chrom = {}
+    for chrom, group in frame.groupby('chromosome', sort=False):
+        by_chrom[chrom] = sorted(group['position'].tolist())
+    return by_chrom
+
+
+def _ld_sample_count():
+    """A cheap read of how many individuals are in the currently
+    configured dataset - used only to gauge how noisy r^2 estimates from
+    this dataset's (eventual) training split are likely to be, for the
+    r^2-threshold suggestion below. Never touches the genotype matrix
+    itself, and specifically avoids asking pandas to PARSE a wide
+    genotype CSV (a real genotype file can have thousands of marker
+    columns - even with usecols=[0], the C parser still has to tokenise
+    every field on every line to find the column boundaries, so that's
+    not actually cheap): the phenotype file (a handful of trait columns)
+    is read with pandas when available, since it's genuinely small; the
+    genotype CSV, if that's all that's configured, is instead just
+    line-counted (no per-field parsing at all) via a plain file
+    iteration; PLINK input reads the .fam file's row count the same way,
+    via read_fam_iids(). Returns None if nothing usable is configured
+    yet."""
+    try:
+        if st.session_state.get('genotype_format', 'CSV file') == 'CSV file':
+            pheno_path = st.session_state.get('phenotype_path', '').strip()
+            if pheno_path and os.path.isfile(pheno_path):
+                return int(pd.read_csv(pheno_path, usecols=[0]).shape[0])
+            geno_path = st.session_state.get('genotype_path', '').strip()
+            if not geno_path or not os.path.isfile(geno_path):
+                return None
+            with open(geno_path, 'r', encoding='utf-8-sig', errors='ignore') as f:
+                n_lines = sum(1 for _ in f)
+            return max(0, n_lines - 1)  # minus the header row
+        else:
+            stem = st.session_state.get('genotype_plink_stem', '').strip()
+            fam_path = f"{stem}.fam" if stem else ''
+            if not stem or not os.path.isfile(fam_path):
+                return None
+            return len(read_fam_iids(fam_path))
+    except Exception:
+        return None
+
+
+def _ld_suggest_window_and_r2():
+    """Requirement 1: suggest a Window size and r^2 threshold for LD
+    pruning (Tab 2).
+
+    Window size targets a classic ~50 markers per pruning window (the
+    long-standing PLINK tutorial default of `--indep-pairwise 50 5 0.2`),
+    based on THIS dataset's own median marker spacing - read from the
+    already-configured SNP info file ('kb'/'cm') or .bim file ('kb' only,
+    PLINK input; see _ld_marker_positions_by_chrom()) - falling back to a
+    fixed window (with a note explaining why) when no map is available
+    at all: 'variants' windows never need one, and a real map is
+    genuinely required for 'kb'/'cm' (same requirement
+    Preprocess.LD_pruning.ld_prune_snps() itself has).
+
+    r^2 threshold: unlike a GWAS QC pipeline (which typically prunes
+    aggressively, r^2~0.1-0.2, since it only needs a near-independent
+    marker set for e.g. population-structure/PCA correction), a genomic-
+    prediction marker pool benefits from staying denser - a small-effect
+    QTL can still be usefully tagged by a marker a GWAS pipeline would
+    happily discard. This suggestion instead scales mainly with how
+    RELIABLE an r^2 estimate from this dataset's sample size is likely
+    to be: with few training individuals, r^2 between two markers is
+    itself a noisy statistic, so pruning on a strict (low) threshold
+    risks discarding markers based on sampling noise rather than real
+    LD - a more lenient (higher) threshold is suggested instead as the
+    individual count drops. Sample size is read from the phenotype/
+    genotype CSV or .fam file (_ld_sample_count()) - never the genotype
+    matrix itself.
+
+    Returns (window_value, r2_value, note) - note explains what the
+    suggestion was based on (or what's missing for a more informed one).
+    Always returns real numbers, never None - a documented fallback
+    default is used whenever the ideal inputs aren't available yet."""
+    window_unit = st.session_state.get('ld_window_unit', 'kb')
+    TARGET_MARKERS_PER_WINDOW = 50  # the classic PLINK-tutorial default (50 5 0.2)
+    FALLBACK_WINDOW = {'kb': 500.0, 'cm': 5.0, 'variants': 50.0}
+
+    by_chrom = _ld_marker_positions_by_chrom(window_unit)
+    note_bits = []
+    window_value = None
+
+    if by_chrom:
+        gaps = []
+        for positions in by_chrom.values():
+            gaps.extend(b - a for a, b in zip(positions, positions[1:]) if b > a)
+        if gaps:
+            gaps.sort()
+            median_gap = gaps[len(gaps) // 2]
+            window_value = _nice_round_number(median_gap * TARGET_MARKERS_PER_WINDOW)
+            note_bits.append(
+                f"window \u2248{TARGET_MARKERS_PER_WINDOW} markers wide based on median marker "
+                f"spacing ({median_gap:g} {_UNIT_LABEL_FOR_GUI.get(window_unit, window_unit)}) "
+                f"across {len(by_chrom)} chromosome(s)"
+            )
+
+    if window_value is None:
+        window_value = FALLBACK_WINDOW.get(window_unit, 50.0)
+        if window_unit == 'variants':
+            note_bits.append(f"a fixed {int(window_value)}-variant window (this unit never needs a map)")
+        else:
+            note_bits.append(
+                f"window left at a fixed fallback ({window_value:g} "
+                f"{_UNIT_LABEL_FOR_GUI.get(window_unit, window_unit)}) - set a valid SNP info file "
+                f"path above for a suggestion based on this dataset's own marker spacing instead"
+            )
+
+    n_samples = _ld_sample_count()
+    N_NOISY, N_RELIABLE = 100, 1000
+    R2_LENIENT, R2_STRICT = 0.6, 0.2
+    if n_samples is None:
+        r2_value = 0.2
+        note_bits.append(
+            "r\u00b2 threshold left at the conventional 0.2 - set a genotype/phenotype file path "
+            "above for a sample-size-aware suggestion instead"
+        )
+    else:
+        n_clamped = max(N_NOISY, min(N_RELIABLE, n_samples))
+        frac = (n_clamped - N_NOISY) / (N_RELIABLE - N_NOISY)
+        r2_value = round(R2_LENIENT - frac * (R2_LENIENT - R2_STRICT), 2)
+        note_bits.append(
+            f"r\u00b2 threshold {r2_value:g} based on {n_samples} individual(s) in the dataset "
+            f"(fewer individuals \u2192 noisier r\u00b2 estimates \u2192 a more lenient threshold)"
+        )
+
+    return window_value, r2_value, "; ".join(note_bits)
+
+
+def _trigger_suggest_ld_window_r2_cb():
+    """on_click callback for the 'Suggest window size / r\u00b2 threshold'
+    button - see _autofill_number_field's docstring for why this can
+    only ever set a pending flag here, not the number_input values
+    directly (the widgets with those keys have already been instantiated
+    earlier in THIS script run by the time the button below them is
+    clicked; only a rerun, applying the flag before they're drawn again,
+    can update them)."""
+    st.session_state['_pending_suggest_ld_window_r2'] = True
+
+
+def _ld_decay_suggest_params():
+    """Requirement 2: suggest 'Max distance shown', 'Distance bin
+    width', and 'Max marker pairs per chromosome' for the LD decay plot
+    (Tab 2, nested under LD pruning).
+
+    Max distance shown: an LD decay plot's whole purpose is to show
+    where r^2 falls off enough to justify the LD-pruning Window size
+    above, so this is suggested as a generous multiple (10x) of the
+    CURRENTLY CONFIGURED LD-pruning window size - wide enough to see the
+    curve flatten out well past the pruning window, not just up to it -
+    falling back to Preprocess.LD_decay_plot.DEFAULT_MAX_DISTANCE[unit]
+    if no window size is set yet. Capped at this dataset's own longest
+    mapped chromosome span (from the same SNP info/.bim source
+    _ld_suggest_window_and_r2() reads), so the suggestion is never wider
+    than the data can actually support.
+
+    Distance bin width: targets ~60 points across that range - enough to
+    see the decay curve's shape without an excessively slow per-scenario
+    computation (more bins isn't free: see compute_ld_decay_data()'s own
+    max_pairs_per_chr guard).
+
+    Max marker pairs per chromosome: scaled down from the module's own
+    default (Preprocess.LD_decay_plot.DEFAULT_MAX_PAIRS_PER_CHR) when
+    many chromosomes are present, so the TOTAL pairs sampled across the
+    whole dataset (chromosomes x this cap) stays roughly constant rather
+    than growing linearly with chromosome count - keeping this
+    diagnostic step's total runtime comparable regardless of how many
+    chromosomes the dataset happens to have.
+
+    Returns (max_distance, bin_width, max_pairs, note). Always returns
+    real numbers, never None - falls back to
+    Preprocess.LD_decay_plot's own documented defaults, with the note
+    explaining the fallback."""
+    window_unit = st.session_state.get('ld_window_unit', 'kb')
+    unit_label = _UNIT_LABEL_FOR_GUI.get(window_unit, window_unit)
+    note_bits = []
+
+    by_chrom = _ld_marker_positions_by_chrom(window_unit)
+    max_extent, n_chrom = None, None
+    if by_chrom:
+        n_chrom = len(by_chrom)
+        extents = [positions[-1] - positions[0] for positions in by_chrom.values() if len(positions) >= 2]
+        if extents:
+            max_extent = max(extents)
+
+    configured_window = st.session_state.get('ld_window')
+    try:
+        configured_window = float(configured_window) if configured_window not in (None, '') else None
+    except (TypeError, ValueError):
+        configured_window = None
+
+    if configured_window:
+        max_distance = configured_window * 10.0
+        note_bits.append(f"10x the configured LD-pruning window size ({configured_window:g} {unit_label})")
+    else:
+        max_distance = LD_DECAY_DEFAULT_MAX_DISTANCE.get(window_unit, 1000.0)
+        note_bits.append(
+            f"the module default ({max_distance:g} {unit_label}) - set (or suggest) a Window size "
+            f"above for a suggestion scaled to it instead"
+        )
+
+    if max_extent and max_extent > 0 and max_distance > max_extent:
+        max_distance = max_extent
+        note_bits.append(f"capped to this dataset's longest mapped chromosome span ({max_extent:g} {unit_label})")
+    max_distance = _nice_round_number(max_distance)
+
+    TARGET_BINS = 60
+    _bin_floor = {'kb': 0.1, 'cm': 0.01, 'variants': 1.0}.get(window_unit, 0.01)
+    bin_width = max(_nice_round_number(max_distance / TARGET_BINS), _bin_floor)
+    note_bits.append(f"bin width for \u2248{TARGET_BINS} points across that range")
+
+    TARGET_TOTAL_PAIRS = 200000
+    if n_chrom:
+        max_pairs = int(max(2000, min(
+            LD_DECAY_DEFAULT_MAX_PAIRS_PER_CHR, round(TARGET_TOTAL_PAIRS / n_chrom, -2)
+        )))
+        note_bits.append(
+            f"max marker pairs/chromosome scaled for {n_chrom} chromosome(s) "
+            f"(targeting \u2248{TARGET_TOTAL_PAIRS:,} pairs total)"
+        )
+    else:
+        max_pairs = LD_DECAY_DEFAULT_MAX_PAIRS_PER_CHR
+        note_bits.append(
+            f"max marker pairs/chromosome left at the module default "
+            f"({LD_DECAY_DEFAULT_MAX_PAIRS_PER_CHR:,}) - set a SNP info/.bim source above for a "
+            f"chromosome-count-aware suggestion instead"
+        )
+
+    return max_distance, bin_width, max_pairs, "; ".join(note_bits)
+
+
+def _trigger_suggest_ld_decay_params_cb():
+    """on_click callback for the LD decay plot's 'Suggest' button - see
+    _trigger_suggest_ld_window_r2_cb() above for why this can only set a
+    pending flag, applied on the rerun it triggers, rather than writing
+    the number_input values directly."""
+    st.session_state['_pending_suggest_ld_decay_params'] = True
+
+
+def _qtl_suggest_window():
+    """ver4-4 R6: suggest a QTL_WINDOW size (Tab 5), preferring a
+    biologically-grounded, LD-decay-derived value over a purely
+    spacing-derived one - two tiers, best available first (ver4-4 Design
+    Blueprint S2.6.2).
+
+    Tier 1 (preferred). If this RESULT_NAME already has a
+    Result/<RESULT_NAME>/LD_decay_plots/LD_decay_average_all.csv (written
+    by Preprocess.LD_decay_plot.average_and_plot_ld_decay() - i.e. an LD
+    decay plot has already been generated for this exact dataset),
+    suggest the distance at which the averaged r^2 curve first drops
+    below 0.2 (the same classic PLINK-tutorial threshold
+    _ld_suggest_window_and_r2() above already anchors on). This is the
+    biologically correct answer: a marker within LD-decay distance of a
+    QTL is the marker that would actually tag it.
+
+    Only 'kb' (physical-distance) window_unit rows are used -
+    marker_info.csv's own start/end columns (what QTL_WINDOW is
+    ultimately widened against, via pipeline_utils.markers_in_windows())
+    are physical genome positions, so a genetic-distance ('cm') decay
+    curve isn't directly comparable and is skipped rather than silently
+    mixed in. Every population present is combined into ONE curve
+    (n_pairs-weighted - the same convention
+    Preprocess.LD_decay_plot.average_ld_decay_data() itself already uses
+    to combine separate scenarios), since QTL_WINDOW is a single,
+    dataset-wide setting here, not a per-population one.
+
+    Tier 2 (fallback). `k=25` (half the classic 50-marker LD-pruning
+    window default - QTL tagging needs a materially smaller neighbourhood
+    than a whole pruning window) times this dataset's own median marker
+    spacing, read from the SAME `_ld_marker_positions_by_chrom('kb')`
+    helper `_ld_suggest_window_and_r2()` already uses - physical/'kb'
+    positions only, matching the QTL/marker_info coordinate space.
+
+    A final fixed fallback (500, the same order of magnitude as
+    `_ld_suggest_window_and_r2()`'s own 'kb' fallback) is used only when
+    NEITHER tier has anything to work with yet (no LD decay data AND no
+    marker position map configured) - genuinely uncommon, since a marker
+    position source is normally already configured for LD pruning/circos
+    by the time someone reaches this tab.
+
+    Returns
+    -------
+    (window_value, note) : the suggested window and a note stating which
+    tier produced it (the same "value + explanatory note" shape every
+    other Suggest helper in this file returns). Always returns a real
+    number, never None.
+    """
+    result_name = st.session_state.get('result_name', '').strip()
+    R2_THRESHOLD = 0.2
+
+    if result_name:
+        decay_csv_path = os.path.join(
+            result_dir_path(result_name), 'LD_decay_plots', 'LD_decay_average_all.csv'
+        )
+        if os.path.isfile(decay_csv_path):
+            try:
+                decay = pd.read_csv(decay_csv_path)
+            except (OSError, pd.errors.ParserError, pd.errors.EmptyDataError):
+                decay = None
+            _required_cols = {'window_unit', 'population', 'bin_mid', 'mean_r2', 'n_pairs'}
+            if decay is not None and _required_cols.issubset(decay.columns):
+                physical = decay[decay['window_unit'] == 'kb']
+                physical = physical.dropna(subset=['bin_mid', 'mean_r2', 'n_pairs'])
+                physical = physical[physical['n_pairs'] > 0]
+                if physical.shape[0] > 0:
+                    physical = physical.copy()
+                    physical['_weighted_r2'] = physical['mean_r2'] * physical['n_pairs']
+                    grouped = physical.groupby('bin_mid', as_index=False).agg(
+                        _weighted_r2_sum=('_weighted_r2', 'sum'),
+                        n_pairs=('n_pairs', 'sum'),
+                    )
+                    grouped['mean_r2'] = grouped['_weighted_r2_sum'] / grouped['n_pairs']
+                    grouped = grouped.sort_values('bin_mid').reset_index(drop=True)
+                    _below_threshold = grouped[grouped['mean_r2'] < R2_THRESHOLD]
+                    if _below_threshold.shape[0] > 0:
+                        window_value = float(_below_threshold['bin_mid'].iloc[0])
+                        _n_pop = physical['population'].nunique()
+                        return window_value, (
+                            f"LD-decay-derived: averaged r\u00b2 (physical/'kb' distance, "
+                            f"combined across {_n_pop} population(s)) first drops below "
+                            f"{R2_THRESHOLD:g} at {window_value:g} - from this RESULT_NAME's own "
+                            f"LD_decay_average_all.csv (Tab 2)"
+                        )
+
+    # Tier 2 - spacing-derived fallback, same helper _ld_suggest_window_and_r2() uses.
+    K_MULTIPLIER = 25
+    by_chrom = _ld_marker_positions_by_chrom('kb')
+    if by_chrom:
+        gaps = []
+        for positions in by_chrom.values():
+            gaps.extend(b - a for a, b in zip(positions, positions[1:]) if b > a)
+        if gaps:
+            gaps.sort()
+            median_gap = gaps[len(gaps) // 2]
+            window_value = _nice_round_number(median_gap * K_MULTIPLIER)
+            return window_value, (
+                f"spacing-derived fallback: no usable LD-decay data found for this RESULT_NAME "
+                f"yet (run an LD decay plot - Tab 2 - first for the biologically-grounded "
+                f"suggestion instead) - {K_MULTIPLIER}x median marker spacing "
+                f"({median_gap:g}) across {len(by_chrom)} chromosome(s)"
+            )
+
+    FALLBACK_WINDOW = 500.0
+    return FALLBACK_WINDOW, (
+        f"fixed fallback ({FALLBACK_WINDOW:g}): neither LD-decay data nor a marker position map "
+        f"is available yet - configure a genotype/SNP-info source (Tab 2) or generate an LD "
+        f"decay plot first for a data-driven suggestion"
+    )
+
+
+def _trigger_suggest_qtl_window_cb():
+    """on_click callback for the 'Suggest QTL window' button - see
+    _trigger_suggest_ld_window_r2_cb() above for why this can only set a
+    pending flag, applied on the rerun it triggers, rather than writing
+    the 'qtl_window' number_input value directly."""
+    st.session_state['_pending_suggest_qtl_window'] = True
 
 
 def _show_suggest_message(state_key):
@@ -1286,6 +2184,12 @@ CIRCOS_HELP = {
         'readable - this sets what fraction to keep, e.g. 0.1 keeps only the '
         'top 0.1% strongest marker-pair interactions.'
     ),
+    'interaction_top_count': (
+        'Only the strongest interactions are drawn as links, to keep the plot '
+        'readable - this sets exactly how many of the strongest marker-pair '
+        'interactions to keep (fewer if fewer candidate pairs exist), instead of '
+        'a percentage.'
+    ),
     'label_size': 'Font size used for the interval ticks around the plot.',
     'scale': (
         'Adjust the intervals between ticks on a circos plot. '
@@ -1315,6 +2219,49 @@ CIRCOS_HELP = {
         'first is overwritten by the second. True = stronger marker effects are '
         'emphasised. False = weaker marker effects are emphasised. '
         'None = the original marker effect order in the generated tsv files is used.'
+    ),
+    # Update ID ver4-6, R2 (blueprint §5.1).
+    'ring_label_size': (
+        "Font size for the labels drawn on each marker-effect/gene-source ring itself "
+        "(e.g. 'RF', 'ensemble', 'GAT_biological_prior_knowledge') - separate from the "
+        "chromosome NAME font size above. Auto-filled once at least one model is "
+        "selected; 8pt is this tool's traditional default."
+    ),
+    'ring_label_fit': (
+        "What to do when a ring label doesn't fit within the seam gap at its own "
+        "ring's radius (inner rings need more angular room per character than outer "
+        "ones for the same text): 'off' never resizes or shortens a label (matches "
+        "every version of this tool before this option existed); 'shrink' reduces "
+        "just that label's own font size, down to a 4pt floor; 'shrink_then_truncate' "
+        "additionally shortens the label with '...' if even the 4pt floor still "
+        "doesn't fit - the full name always still appears in the plot's legend."
+    ),
+    'ring_layout': (
+        "'legacy' stacks rings inward at a fixed width (this tool's traditional "
+        "behaviour) - beyond about 33 rings this runs out of room and the plot "
+        "becomes invalid. 'fit' instead thins the ring width just enough that every "
+        "ring, however many are selected, always fits - recommended for a "
+        "many-model/many-gene-source comparison."
+    ),
+    'figsize': (
+        "Overall figure size (inches, square) of each saved circos plot PNG. Leave "
+        "blank/8.0 for this tool's traditional size; a larger figure gives ring/tick "
+        "labels more physical room to be readable, which matters most for a "
+        "many-ring plot."
+    ),
+    'seam_gap_max': (
+        "Upper limit (degrees) on the automatically suggested seam gap above, however "
+        "wide the widest ring/chromosome label would otherwise need it to be. A wider "
+        "gap always fits more comfortably, but also spends more of the circle on "
+        "empty space rather than data - a label that still doesn't fit within this "
+        "cap is shrunk (and, if enabled, truncated) at render time instead, per "
+        "'Ring label sizing' above."
+    ),
+    'ring_label_max_chars': (
+        "Hard cap on ring-label length (characters), applied before any shrink/"
+        "truncate-to-fit logic above - 0 (the default) applies no such cap. Rarely "
+        "needed; the shrink/truncate setting above already keeps labels from "
+        "overlapping."
     ),
 }
 
@@ -1352,6 +2299,107 @@ def plink_fileset_status(stem):
         )
 
 
+# ---------------------------------------------------------------------------
+# Phase 2, Requirement 3 - phenotype name auto-suggestion.
+# ---------------------------------------------------------------------------
+
+@st.cache_data(show_spinner=False)
+def _cached_list_phenotype_columns(phenotype_path, _mtime):
+    """`_mtime` is part of the cache key only (see
+    pipeline_utils.phenotype_file_mtime_key()) - unused inside the
+    function body itself - so a repeated Streamlit rerun re-reads the
+    phenotype file's header only when it has actually changed on disk,
+    not on every single rerun this widget participates in."""
+    return list_phenotype_columns(phenotype_path)
+
+
+def _on_phenotype_multiselect_change():
+    """Mutual-exclusivity callback (Requirement 3): if 'all' was just
+    added to the selection, it replaces everything else; if any named
+    trait was just added while 'all' was already present, 'all' is
+    dropped instead. Detected by diffing the new selection against the
+    last-known one (stored under a separate, non-widget tracking key),
+    since Streamlit's multiselect only ever exposes the full new list,
+    not which single option changed."""
+    key = 'phenotype_targets_multiselect'
+    prev_key = f'_{key}_prev'
+    new_selection = list(st.session_state.get(key, []))
+    prev_selection = list(st.session_state.get(prev_key, []))
+
+    newly_added = [v for v in new_selection if v not in prev_selection]
+    resolved = new_selection
+    if 'all' in newly_added:
+        resolved = ['all']
+    elif 'all' in new_selection and any(v != 'all' for v in newly_added):
+        resolved = [v for v in new_selection if v != 'all']
+
+    st.session_state[key] = resolved
+    st.session_state[prev_key] = resolved
+    # Keep the underlying 'phenotype_targets' STRING key (comma-separated,
+    # or 'all') in sync automatically, so gather_config() - and every
+    # other reader of 'phenotype_targets' elsewhere in this file - needs
+    # NO changes at all; this widget is purely an alternate, structured
+    # way of writing the exact same config value (Requirement 3: "No
+    # change to the JSON config contract").
+    st.session_state['phenotype_targets'] = 'all' if resolved == ['all'] else ','.join(resolved)
+
+
+def _render_phenotype_target_selector(phenotype_path):
+    """Requirement 3: replace the free-text 'Target phenotype(s)' input
+    with a typo-proof `st.multiselect` of the phenotype file's own
+    detected trait columns (header-only read, cheap - see
+    pipeline_utils.list_phenotype_columns()) whenever that file can
+    actually be read; falls back to the original free-text input,
+    completely unchanged, whenever it can't (not yet uploaded, wrong
+    path, etc.) - never blocks config building on this feature."""
+    detected_traits = []
+    if phenotype_path and os.path.isfile(phenotype_path):
+        try:
+            _mtime = os.path.getmtime(phenotype_path)
+        except OSError:
+            _mtime = -1.0
+        detected_traits = _cached_list_phenotype_columns(phenotype_path, _mtime)
+
+    if not detected_traits:
+        st.text_input(
+            "Target phenotype(s) - comma separated, or 'all'", value='days2anthesis', key='phenotype_targets',
+            help=("Which trait(s) from the phenotype file to predict. Name one or more columns "
+                  "(comma separated) exactly as they appear in that file, or type 'all' to "
+                  "predict every trait column found there.")
+        )
+        st.caption(
+            "\u26a0\ufe0f Could not detect trait columns from the phenotype file path above (not "
+            "found yet, or unreadable) - using free text for now. A typo-proof selector will "
+            "appear here automatically once a valid phenotype file path is set."
+        )
+        return
+
+    options = detected_traits + ['all']
+    key = 'phenotype_targets_multiselect'
+    if key not in st.session_state:
+        # First render this session: seed from whatever 'phenotype_targets'
+        # (the plain string) already holds - e.g. restored from a previous
+        # launch's saved GUI state (main_app.py's load_gui_state()) - so
+        # switching from the free-text fallback to this selector (once a
+        # valid file path is set) doesn't silently reset an already-
+        # configured target.
+        _raw = st.session_state.get('phenotype_targets', '').strip()
+        if _raw.lower() == 'all':
+            _seed = ['all']
+        else:
+            _seed = [p.strip() for p in _raw.split(',') if p.strip() and p.strip() in detected_traits]
+        st.session_state[key] = _seed
+        st.session_state[f'_{key}_prev'] = _seed
+        st.session_state['phenotype_targets'] = 'all' if _seed == ['all'] else ','.join(_seed)
+
+    st.multiselect(
+        "Target phenotype(s)", options=options, key=key, on_change=_on_phenotype_multiselect_change,
+        help=("Select one or more traits detected in the phenotype file above, or 'all' to "
+              "predict every trait column found there. Selecting 'all' clears any individual "
+              "selections (and vice versa) - typos are no longer possible when using this list.")
+    )
+
+
 def render_field(key, field, disabled=False):
     """Render the widget(s) for a single hyperparameter field. Nothing is
     returned - Streamlit keeps the live value in st.session_state[key]
@@ -1373,6 +2421,20 @@ def render_field(key, field, disabled=False):
     elif ftype == 'str' and 'choices' in field:
         choices = field['choices']
         idx = choices.index(default) if default in choices else 0
+        # Defensive self-heal: a value already sitting in session_state for
+        # this exact key - restored from an OLDER saved GUI state file, or
+        # imported from an older *_config.json - can hold a choice that
+        # used to be valid but has since been removed from this field's
+        # 'choices' (e.g. the 'surrogate_shap' pre-screen mode, removed
+        # from RKHS/RF/SVR/KNN's 'Interaction pre-screen' field). Streamlit
+        # raises when a selectbox's key-bound session_state value isn't
+        # among its current options, which would otherwise crash the whole
+        # GUI on load rather than just this one stale field. Falling back
+        # to this field's own current default mirrors exactly what a fresh
+        # session would show, and only ever fires for a value that no
+        # longer exists to select anyway.
+        if key in st.session_state and st.session_state[key] not in choices:
+            st.session_state[key] = default if default in choices else choices[0]
         st.selectbox(label, options=choices, index=idx, key=key, disabled=disabled, help=help_text)
 
     elif ftype == 'str':
@@ -1761,12 +2823,74 @@ def build_bio_prior_params_for(network_json_path, gene_location_csv_path, merge_
 # rather than removed from HPARAM_SPECS, since resolve_hparams() still
 # needs a value (any value - it's always overwritten) at these exact
 # positions to keep the params list the right length/shape.
+# rrBLUP/BayesB/GBLUP's own "Return marker-pair interactions?
+# (approximate)" toggle and its three dependent settings, hidden for these
+# three R models. rrBLUP and GBLUP are purely additive models and BayesB is
+# an additive variable-selection model, so a surrogate search for NONLINEAR
+# marker-pair interactions on top of them was never a meaningful
+# diagnostic. Hidden rather than removed from HPARAM_SPECS for the same
+# reason as the bio-prior fields above - the field must still exist at its
+# correct position for _r_model_interaction_fields()'s positional read in
+# genomic_prediction.py, and resolve_hparams() falls back to each field's
+# own spec default (False for the toggle) when its widget is never
+# rendered, so runs launched from the GUI simply never turn this on for
+# any of these three models.
+#
+# Update (RKHS unhidden again): RKHS was initially left visible (its kernel
+# already captures non-additive structure, unlike the three models above),
+# then hidden alongside them because the only available route was a
+# surrogate fitted to RKHS's OWN predictions, explained via TreeSHAP - a
+# diagnostic about the surrogate's structure, once removed from what makes
+# RKHS's own kernel actually interesting. RKHS's own interaction route now
+# uses Friedman's H-statistic instead (genomic_prediction.py::
+# _r_model_surrogate_interaction(), models.interaction_extraction.
+# surrogate_h_statistic_interactions()) - still an approximate surrogate
+# (RKHS's own kernel machinery still can't be explained pairwise directly
+# at any tolerable cost), but this was judged worth surfacing again, so
+# RKHS is deliberately excluded from HIDDEN_HPARAM_FIELDS below while
+# rrBLUP/BayesB/GBLUP remain hidden, unchanged.
+_R_MODEL_INTERACTION_FIELDS = {
+    'Return marker-pair interactions?',
+    'Max markers considered for interaction search ("all" for every marker)',
+    'Number of individuals used to explain the model',
+    'Output only the top N% of interactions ("all" for everything)',
+}
+
+# GBLUP and RKHS's own "Shapley row offset" / "Shapley row count" fields are
+# a purely internal knob EasiGP itself uses to fan a single task's Shapley
+# computation out across several worker processes (see
+# genomic_prediction.py's Shapley row-range fan-out worker). There is no
+# scenario where a user launching a run from the GUI needs to touch these -
+# leave-at-defaults (offset 0 / count -1) always reproduces an ordinary,
+# non-fanned-out run. Hidden rather than removed from HPARAM_SPECS for the
+# same reason as the fields above: GBLUP.R / RKHS.R still unpack their
+# params list positionally, so the fields must stay at their exact
+# positions, and resolve_hparams() falls back to each field's own spec
+# default when its widget is never rendered, so GUI-launched runs simply
+# never set these to anything other than 0 / -1.
+_SHAPLEY_ROW_FANOUT_FIELDS = {
+    'Shapley row offset (advanced - internal parallel fan-out)',
+    'Shapley row count (advanced - internal parallel fan-out; -1 = every row)',
+}
+
 HIDDEN_HPARAM_FIELDS = {
     'GAT_biological_prior_knowledge': {
         'Network JSON path', 'Gene location CSV path',
         'Coordinate unit', 'Include mediated edges', 'Max hops for mediated edges',
         'Data-driven prior network (merge) config',
     },
+    'rrBLUP': set(_R_MODEL_INTERACTION_FIELDS),
+    'BayesB': set(_R_MODEL_INTERACTION_FIELDS),
+    'GBLUP': set(_R_MODEL_INTERACTION_FIELDS) | set(_SHAPLEY_ROW_FANOUT_FIELDS),
+    # RKHS deliberately has NO entry for _R_MODEL_INTERACTION_FIELDS (see
+    # the comment above this dict's own definition) - render_hparam_panel()'s
+    # `HIDDEN_HPARAM_FIELDS.get(model, set())` falls back to an empty set
+    # for any model with no key, so RKHS's own "Return marker-pair
+    # interactions? (approximate)" toggle and its three dependent fields
+    # render normally, exactly like every other model that was never
+    # hidden. Its Shapley row offset/count fields ARE hidden though, for
+    # the same internal-fan-out reason as GBLUP above.
+    'RKHS': set(_SHAPLEY_ROW_FANOUT_FIELDS),
 }
 
 
@@ -1792,15 +2916,36 @@ def render_hparam_panel(model):
             st.checkbox(
                 f'Automatically tune {model} hyperparameters', value=False, key=f'{_tune_prefix}_enabled',
                 help=("Searches for the hyperparameters (among the tunable fields below) that "
-                      "maximise Pearson r / MSE on the validation set, per task, instead of always "
+                      "maximise Pearson r - (MSE / phenotype variance) on the validation set, per task, instead of always "
                       "using the fixed values below. Only takes effect when a validation set exists "
                       "for that task (a train/valid/test split, or the 'between' scenario) - "
                       "otherwise the fixed values below are used unchanged.")
             )
+            # Update ID 3, R5: the tuning settings now render immediately
+            # after their own checkbox (and before every ordinary
+            # hyperparameter field below), rather than in a separate
+            # expander called later from Tab 3 - see render_hp_tune_panel()'s
+            # own docstring. Calling forward is legal (Python resolves the
+            # name at call time), so render_hp_tune_panel's definition stays
+            # below this function's, unmoved.
+            render_hp_tune_panel(model)
             st.divider()
         for idx, field in enumerate(spec):
             if any(sub in field['label'] for sub in hidden_substrings):
                 continue
+            # 'visible_when' is checked before anything else and, unlike
+            # 'depends_on' below, skips rendering the field entirely (no
+            # widget at all this run) rather than greying it out - see the
+            # key's own description in the schema comment above this
+            # function's block. get_controller_value() already falls back
+            # to the controller field's own spec default when that widget
+            # hasn't been rendered yet this session, so this is safe to
+            # evaluate unconditionally, even on the very first render.
+            vis = field.get('visible_when')
+            if vis:
+                controller_idx, required = vis
+                if get_controller_value(prefix, controller_idx, spec) != required:
+                    continue
             key = f'{prefix}_{idx}'
             dep = field.get('depends_on')
             disabled = False
@@ -1821,7 +2966,7 @@ def render_hparam_panel(model):
                 with st.container(border=True):
                     st.markdown(
                         "⚠️ **This setting significantly changes both how the interactions can be "
-                        "interpreted and how long each RF process takes:**"
+                        "interpreted and how long the process of this model takes:**"
                     )
                     render_field(key, field, disabled=disabled)
             else:
@@ -1859,11 +3004,32 @@ def resolve_wopt(method):
 # the base model) - genomic_prediction.py's _call_model() resolves its own
 # marker pool from the same task-level gene-network extraction the main
 # dispatch uses, exactly mirroring that branch.
-from models.hyperparameter_tuning import ALGORITHMS, build_param_specs
+from models.hyperparameter_tuning import ALGORITHMS, build_param_specs, expand_model_list
 
 
 def hp_tune_supported(model):
     return len(build_param_specs(model, HPARAM_SPECS)) > 0
+
+
+def _active_tuning_algorithms():
+    """Union of every model's own 'Search algorithm(s)' currently selected
+    in this session, across every model whose 'Automatically tune ...
+    hyperparameters' checkbox is currently checked. Used solely to decide
+    which of the GLOBAL, algorithm-specific hyperparameter-tuning settings
+    (HP_TUNE_PARALLEL_TRIALS / HP_TUNE_BAYES_* / HP_TUNE_PARALLEL_RESTARTS,
+    rendered once at the bottom of the Models tab) are even relevant to
+    show right now - a model with tuning enabled but no algorithm chosen
+    yet contributes nothing (resolve_hp_tune() already treats that config
+    the same as tuning fully off), and hp_tune_supported() already excludes
+    models with no tunable fields at all."""
+    algos = set()
+    for model in AVAILABLE_MODELS:
+        if model == 'ensemble' or not hp_tune_supported(model):
+            continue
+        if not st.session_state.get(f'hp_tune_{model}_enabled', False):
+            continue
+        algos.update(st.session_state.get(f'hp_tune_{model}_algorithms', []))
+    return algos
 
 
 def render_hp_tune_panel(model):
@@ -1881,7 +3047,8 @@ def render_hp_tune_panel(model):
     prefix = f'hp_tune_{model}'
     if not st.session_state.get(f'{prefix}_enabled', False):
         return
-    with st.expander(f'{model} hyperparameter tuning settings', expanded=True):
+    with st.container(border=True):
+        st.markdown(f'**{model} hyperparameter tuning settings**')
         st.multiselect(
             'Search algorithm(s)', options=ALGORITHMS, key=f'{prefix}_algorithms',
             help=("Selecting more than one produces separate tuned variants of this model, "
@@ -1947,6 +3114,861 @@ def resolve_hp_tune(model):
     }
 
 
+# NCI Gadi's current documented cap on the number of subjobs inside a
+# single PBS job array. Kept as a single named constant (rather than
+# scattered magic numbers) so it's easy to find and update - VERIFY this
+# against NCI's current documentation / `qsub`'s own limits at
+# implementation/deployment time; it is deliberately NOT treated as an
+# authoritative, permanently-correct value by this codebase.
+GADI_MAX_ARRAY_SUBJOBS = 500
+
+
+def _render_resource_advisor_panel(kp, export_mode, export_step):
+    """Phase 2, Requirement 8 - 'Suggested compute resources' panel, shown
+    directly above the HPC job resource-request expander it feeds into
+    (Requirement 1's per-batch 'CPUs per task'/'Memory' fields, and - for
+    a Gadi native job-array export - 'Chunk size'). Entirely best-effort:
+    if the pipeline isn't configured enough yet for gather_config() to
+    succeed, this silently shows nothing rather than erroring, since this
+    panel is a convenience, not a requirement to proceed.
+
+    Recomputed fresh on every render (the underlying cheap-read helpers -
+    pipeline_utils.cheap_marker_and_sample_counts() et al. - are each,
+    individually, fast enough not to need their own st.cache_data wrapper
+    the way the phenotype-column suggester does; this whole panel still
+    completes in well under a second for any realistic config, per
+    Requirement 8's own acceptance criterion).
+
+    Patch 3 v3, Requirement 1: the job-array-size ("batch size"/
+    n_batches) suggestion that used to live inside this panel has been
+    extracted to its own function, _render_suggested_job_array_size(),
+    now shown separately UNDER 'Parallel batch configuration (PARALLEL)'
+    (right after 'Run pipeline', before 'Batch ID source') rather than
+    buried inside this CPU/memory/GPU panel - "clearly separate the
+    array-related configuration and other resource-related
+    configuration." This panel therefore no longer shows array-size
+    numbers at all; see that function instead.
+
+    Patch 3 v3, Requirement 3: this panel now reads an 'HPC cluster
+    profile' selection and forwards it into estimate_resources() so the
+    GPU/CPU-ratio floor and the array-cap referenced in this panel's own
+    captions are calibrated for the SELECTED cluster, not always Gadi.
+    Patch 3 v4, Requirement 1: that selectbox itself moved even further
+    up the page (right under 'Run pipeline', immediately after choosing
+    'Option A' - see _render_hpc_cluster_profile_selector()) - this panel
+    still only READS it, never draws its own copy.
+
+    ver4-4, R2 (blueprint §2.2) - this panel accreted four independent
+    recommendation systems across Update ID 2, Patch 3 v2/v3/v4 and
+    Additional Requirements 9 (an opt-in checkbox that additionally
+    considered model-level parallelism, plus the per-batch CPU/GPU/
+    memory budget fields it revealed; an always-on block giving a
+    second, jointly-sized ncpus/worker-count/memory recommendation; and
+    a third, opt-in block detailing the resulting task-level/model-level
+    split), each layered on rather than replacing the last - and TWO
+    separate apply buttons both silently wrote worker-
+    count session state, so worker fan-out ended up enabled just by
+    pressing a button labelled "Use these values for CPUs per task /
+    Memory / GPU". R2 removes all three of those blocks (and the second
+    apply button) outright: this panel is now a single, ALWAYS-COMPUTED
+    three-metric headline (ncpus / mem / GPU count) plus ONE apply
+    button that writes only 'CPUs per task' / 'Memory' / 'GPU' - never
+    worker counts. `estimate_resources()` keeps every one of its
+    existing parameters and returned keys (nothing downstream breaks);
+    this panel simply stops reading the joint-allocation keys
+    (`coordinated_*`, `n_cpu_workers_task`, `n_model_workers`, ...),
+    which are still computed internally but no longer displayed here.
+    `N_CPU_WORKERS`/`N_MODEL_WORKERS` now live in their own 'Advanced
+    setting components' expander (see `_render_advanced_setting_
+    components()`, rendered inside `render_hpc_export_section()`), both
+    defaulting to 1 and never auto-filled by any suggestion - a person
+    who wants worker fan-out sets it there, deliberately, rather than as
+    a side effect of an unrelated CPU/memory button.
+    """
+    try:
+        cfg = gather_config(export_mode, export_step)
+    except ValueError as exc:
+        # Update ID 3, R4: the panel must never vanish silently - this is
+        # the fix for "estimates are not available": ticking LD pruning
+        # leaves ld_window_unit='kb' and ld_snp_info_path='' at their
+        # defaults, build_ld_prune_config() raises on exactly that default
+        # state, and the bare `return` this replaces made the ENTIRE panel
+        # disappear with no message at all. Do NOT relax that validation -
+        # this fixes the panel, not the validator - and this now resolves
+        # the same "vanishes with no message" failure for every OTHER
+        # gather_config() validator too, not just LD pruning's.
+        # Requirements.md item 7: no longer collapsed by default (was
+        # expanded=False) - and now titled 'Suggested job-array size' to
+        # match the requested display text.
+        with st.expander('Suggested job-array size', expanded=True):
+            st.info(f"No estimate yet - finish configuring the pipeline first: {exc}")
+        return
+
+    if 'MODEL' not in cfg:
+        return  # Step 2 export - no model selection to size resources from
+
+    # Requirements.md item 7: no longer collapsed by default (was
+    # expanded=False) - and now titled 'Suggested job-array size' to match
+    # the requested display text (this panel's own content - the
+    # ncpus/mem_gb/ngpus heuristic headline - is unchanged; see the
+    # docstring above for the SEPARATE, differently-scoped
+    # _render_suggested_job_array_size() panel further down the page).
+    with st.expander('Suggested compute resources', expanded=True):
+        st.caption(
+            "\u26a0\ufe0f Heuristic estimate only, computed from cheap config-only inputs plus a "
+            "quick header/line-count read of your genotype/phenotype files (never a full data "
+            "load) - not a guarantee. Recommend piloting a small batch before committing a "
+            "large array submission."
+        )
+
+        # Patch 3 v4, Requirement 1/3: 'HPC cluster profile' is now drawn
+        # right under 'Run pipeline', immediately after choosing 'Option
+        # A' - see _render_hpc_cluster_profile_selector(), called well
+        # before this panel is even reached - so its session_state value
+        # already exists by the time we get here (same "read an
+        # already-drawn widget's session_state" pattern used throughout
+        # this section, e.g. 'use_gpu' below).
+        _hpc_profile = st.session_state.get(f'{kp}_hpc_profile', DEFAULT_HPC_PROFILE)
+        _max_array_override = st.session_state.get(f'{kp}_hpc_max_array_override')
+        _ncpus_per_gpu_override = st.session_state.get(f'{kp}_hpc_ncpus_per_gpu_override')
+
+        # Additional Requirements 9, Requirement 4 - "when those pruning
+        # approaches are selected, we should ask for their estimated
+        # marker numbers after that pruning if they ask for a
+        # suggestion." RF filtering's own reduction is derivable EXACTLY
+        # from its config (mode='count'/'percent') - no input needed, just
+        # shown once the estimate itself is computed below
+        # (`n_markers_effective`). LD pruning's reduction genuinely
+        # depends on the real linkage-disequilibrium structure of the
+        # data (never read in full by this advisor - see
+        # resource_profiles.py's own module docstring), so it is
+        # offered here as an OPTIONAL figure the person can supply.
+        rf_filter_cfg_for_estimate = cfg.get('RF_FILTER')
+        ld_prune_estimated_n_markers = None
+        if cfg.get('LD_PRUNE') is not None:
+            _ld_estimate_input = st.number_input(
+                'Estimated markers remaining after LD pruning (optional - improves accuracy)',
+                min_value=0, value=0, step=100, key=f'_{kp}_advisor_ld_estimated_markers',
+                help="LD pruning is enabled, but how many markers actually survive PLINK's "
+                     "--indep-pairwise depends on your data's real linkage-disequilibrium "
+                     "structure, which this advisor deliberately never reads in full. Leave at "
+                     "0 to use a conservative (likely over-estimating) fallback that assumes LD "
+                     "pruning removes nothing; supply your own estimate (e.g. from a previous "
+                     "run's Marker_effect.csv column count, or the LD decay plot) for a tighter "
+                     "ncpus/memory figure - this affects GAT_fully_connected's memory estimate "
+                     "the most, since it scales with the SQUARE of the marker count."
+            )
+            ld_prune_estimated_n_markers = int(_ld_estimate_input) if _ld_estimate_input else None
+
+        try:
+            n_population = count_unique_populations(cfg.get('PHENOTYPE_FILE_NAME')) or 1
+            n_phenotype = len(cfg['PHENOTYPE']) if cfg['PHENOTYPE'] != 'all' else max(
+                1, len(list_phenotype_columns(cfg.get('PHENOTYPE_FILE_NAME', '')))
+            )
+            n_ratio = len(cfg.get('RATIO', [1]))
+            parallel_cfg = cfg.get('PARALLEL')
+            # Additional Requirements 9, Requirement 2 - "no coordination
+            # between the suggested job-array size and the suggested
+            # compute resources": when the person hasn't explicitly
+            # configured a PARALLEL batch size yet, sizing this estimate's
+            # per-batch costing off n_batches=1 (i.e. "one batch = the
+            # WHOLE run") gives wildly larger ncpus/mem_gb than what the
+            # SUGGESTED job-array layout (shown separately, in
+            # _render_suggested_job_array_size()) would actually produce
+            # per batch - the two panels would visibly disagree before
+            # the person has even touched 'Batch size'. Resolved with the
+            # SAME two-call pattern estimate_resources() already uses
+            # internally for OTHER_MODELS_MARKER_SOURCE-style short-
+            # circuits: compute once (n_batches=1) purely to read this
+            # SAME call's own `suggested_n_batches` back out, then
+            # recompute the REAL per-batch costing against that - a
+            # no-op (single call) once a batch size IS configured, since
+            # `_batch_size_configured` is then True.
+            _batch_size_configured = bool(parallel_cfg and parallel_cfg.get('batch_size'))
+            n_batches = 1
+            if _batch_size_configured:
+                total_within = n_population * n_phenotype * n_ratio * cfg.get('ITER_NUM', 1)
+                n_batches = max(1, math.ceil(max(1, total_within) / int(parallel_cfg['batch_size'])))
+
+            _estimate_kwargs = dict(
+                scenario=cfg['SCENARIO'], n_population=n_population, n_phenotype=n_phenotype,
+                n_ratio=n_ratio, sample_num=cfg.get('ITER_NUM', 1), model_run=cfg['MODEL'],
+                ld_prune_enabled=cfg.get('LD_PRUNE') is not None, rf_filter_enabled=cfg.get('RF_FILTER') is not None,
+                genotype_format=cfg.get('GENOTYPE_FORMAT', 'csv'), genotype_file_name=cfg.get('GENOTYPE_FILE_NAME', ''),
+                phenotype_file_name=cfg.get('PHENOTYPE_FILE_NAME'), w_opt_enabled=cfg.get('W_OPT') is not None,
+                # ver4-4, R2: the joint task-level/model-level allocator
+                # and its CPU/GPU/memory "budget" concept are no longer
+                # exposed in this panel at all (see docstring above) -
+                # estimate_resources() is called exactly the way Phase 2
+                # always called it, so the three headline metrics below
+                # are byte-identical to Phase 2's own output (A2.2).
+                model_parallel_enabled=False,
+                budget_ncpus=None,
+                budget_ngpus=None,
+                budget_mem_gb=None,
+                hparameters=cfg.get('HPARAMETERS'), hp_tune=cfg.get('HP_TUNE'),
+                # Update ID 3, R4: forward the run's actual marker-source
+                # short-circuit (arch §8) and the new headline rollback
+                # flag - both default to the pre-Update-3 behaviour when
+                # absent from an older cfg (I11).
+                other_models_marker_source=cfg.get('OTHER_MODELS_MARKER_SOURCE', 'full_or_filtered'),
+                pool_cost_in_headline=cfg.get('POOL_COST_IN_HEADLINE', True),
+                # Patch 3, R4: GPU-aware ncpus floor/headroom - see
+                # resource_profiles.estimate_resources()'s own docstring.
+                gpu_cpu_calibration_in_headline=cfg.get('GPU_CPU_CALIBRATION_IN_HEADLINE', True),
+                # Patch 3 v3, R3: calibrate against the SELECTED cluster,
+                # not always Gadi - see _render_hpc_cluster_profile_selector()
+                # (Patch 3 v4: now drawn right under 'Run pipeline').
+                hpc_profile=_hpc_profile,
+                max_array_subjobs_override=_max_array_override,
+                ncpus_per_gpu_override=_ncpus_per_gpu_override,
+                # Additional Requirements 9, Requirement 4.
+                rf_filter_cfg=rf_filter_cfg_for_estimate,
+                ld_prune_estimated_n_markers=ld_prune_estimated_n_markers,
+            )
+            estimate = estimate_resources(n_batches=n_batches, **_estimate_kwargs)
+            if not _batch_size_configured and estimate.get('suggested_n_batches'):
+                n_batches = max(1, int(estimate['suggested_n_batches']))
+                estimate = estimate_resources(n_batches=n_batches, **_estimate_kwargs)
+        except Exception as exc:
+            st.caption(f"Could not compute an estimate yet ({exc}).")
+            return
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric('Suggested ncpus (per batch)', estimate['ncpus'])
+        c2.metric('Suggested mem (per batch, GB)', estimate['mem_gb'])
+        # Patch 3 v2, Requirement 2: numeric, not a Yes/No flag.
+        # resource_profiles.estimate_resources() already returns 'ngpus' as
+        # a plain int (0 when no selected model is GPU-capable, otherwise
+        # the recommended GPU count) - only the DISPLAY collapsed it into a
+        # Yes/No string before this; the underlying recommendation itself
+        # is unchanged.
+        c3.metric('Suggested GPU(s)', int(estimate['ngpus']))
+        st.caption(
+            f"Based on ~{estimate['n_markers']:,} marker(s), ~{estimate['n_samples']:,} sample(s), "
+            f"~{estimate['total_tasks_per_batch']:,} task(s)/batch across {n_batches} batch(es) "
+            f"({estimate['total_tasks_all_batches']:,} task(s) total) - already accounting for "
+            f"every target phenotype, selected prediction model, and split ratio configured above."
+        )
+        # Update ID 3, R4: makes the headline's now-filtering-aware ncpus/
+        # mem_gb legible - without this, a person ticking LD pruning/RF
+        # filtering and seeing the numbers move has no explanation for why.
+        if (cfg.get('LD_PRUNE') is not None or cfg.get('RF_FILTER') is not None) and estimate.get('pool_cost_headline_applied'):
+            st.caption(
+                f"Includes the cost of LD pruning and RF marker filtering "
+                f"(+{estimate.get('pool_cost_increment', 0.0):.1f} cost units/task)."
+            )
+        # Additional Requirements 9, Requirement 4 - makes the post LD/RF-
+        # filter marker estimate actually used for mem_gb legible (see
+        # 'Estimated markers remaining after LD pruning' above, and RF
+        # filtering's own exact, config-derived reduction).
+        #
+        # GUI defect fix - "the suggested memory value does not change even
+        # after users type an estimated marker value": this used to say
+        # "Memory sized for ~X marker(s)..." purely off
+        # marker_filter_calibration_applied (i.e. whenever the marker COUNT
+        # changed), even on the many small/pilot-scale runs where the
+        # recomputed mem_gb comes out identical to the raw figure because
+        # both price out at or below the memory floor - the person types a
+        # smaller number, watches 'Suggested mem' not move an inch, and
+        # (reasonably) concludes the field is broken. It isn't: there is
+        # nothing left to shrink once a run is already at the practical
+        # minimum. Branching on marker_filter_changed_mem_gb (resource_
+        # profiles.estimate_resources()'s own record of whether mem_gb
+        # actually moved) says so explicitly instead of silently implying a
+        # change that didn't happen.
+        if estimate.get('marker_filter_calibration_applied'):
+            if estimate.get('marker_filter_changed_mem_gb'):
+                st.caption(
+                    f"Memory sized for \u2248{estimate['n_markers_effective']:,} marker(s) after LD/RF "
+                    f"filtering (from {estimate['n_markers']:,} raw) - "
+                    + ("an estimate you supplied above." if not estimate.get('ld_estimate_uncertain')
+                       else "RF filtering's own exact reduction only; LD pruning's is not yet estimated "
+                            "(see the note below).")
+                )
+            else:
+                st.caption(
+                    f"\u2139\ufe0f Marker count for memory sizing: \u2248{estimate['n_markers_effective']:,} "
+                    f"after LD/RF filtering (from {estimate['n_markers']:,} raw) - 'Suggested mem' isn't "
+                    f"moving because this run is already at the practical memory floor "
+                    f"({estimate['mem_gb']:g} GB) at EITHER marker count; only ncpus/GPU-heavy or very "
+                    f"large-marker-set runs (GAT_fully_connected especially) see this figure move."
+                )
+        # Patch 3, R4: makes the GPU-aware ncpus floor/headroom legible -
+        # without this, a person selecting a GPU-capable model has no
+        # explanation for why ncpus jumped well above what the model-
+        # fitting workload alone would suggest. Patch 3 v3, R3: the
+        # message itself is now inside estimate['notes'] (profile-aware,
+        # see resource_profiles.estimate_resources()), so this just
+        # displays that note rather than re-deriving Gadi-specific text
+        # here.
+        if estimate.get('gpu_cpu_calibration_applied') and estimate.get('gpu_ncpus_increment', 0) > 0:
+            st.caption(f"\u2139\ufe0f ncpus adjusted for GPU use - see the notes below for details.")
+
+        for note in estimate['notes']:
+            st.caption(f"\u2139\ufe0f {note}")
+
+        # ver4-4, R2: ONE apply button, writing ONLY the plain resource-
+        # request fields it is labelled for - 'CPUs per task' / 'Memory' /
+        # 'GPU'. It deliberately does NOT touch N_CPU_WORKERS/
+        # N_MODEL_WORKERS any more (see docstring above) - those live in
+        # their own 'Advanced setting components' expander, both
+        # defaulting to 1, and are never auto-filled by this or any other
+        # suggestion.
+        if st.button('Use these values for CPUs per task / Memory / GPU above', key=f'_btn_{kp}_apply_resource_advisor'):
+            st.session_state[f'{kp}_hpc_cpus_per_task'] = int(estimate['ncpus'])
+            st.session_state[f'{kp}_hpc_mem'] = f"{max(1, math.ceil(float(estimate['mem_gb'])))}G"
+            # Also apply the GPU recommendation, if any - 'ngpus' may be a
+            # plain truthy flag or an actual count depending on
+            # resource_profiles.estimate_resources()'s current
+            # implementation; either way, request at least 1 GPU when it
+            # recommends any.
+            if estimate.get('ngpus'):
+                st.session_state[f'{kp}_hpc_use_gpu'] = True
+                try:
+                    st.session_state[f'{kp}_hpc_gpus_per_task'] = max(1, int(estimate['ngpus']))
+                except (TypeError, ValueError):
+                    st.session_state[f'{kp}_hpc_gpus_per_task'] = 1
+            st.success(
+                "Applied - see 'CPUs per task' / 'Memory' / 'GPU' in the resource-request "
+                "section below. Worker counts (N_CPU_WORKERS / N_MODEL_WORKERS) are configured "
+                "separately, under 'Advanced setting components' further down - they default to "
+                "1 and are left untouched by this button."
+            )
+
+
+def _render_suggested_job_array_size():
+    """Patch 3 v3, Requirement 1 - the array/batch-size suggestion,
+    extracted out of the (now-generic) 'Suggested compute resources'
+    panel and shown separately, under 'Parallel batch configuration
+    (PARALLEL)' (right after 'Run pipeline'), BEFORE 'Batch ID source' -
+    "clearly separate the array-related configuration and other
+    resource-related configuration" rather than leaving both mixed into
+    one combined panel inside 'HPC job resource requests' further down.
+
+    Only meaningful for a Parallel/Step 1 export (the only mode with a
+    PARALLEL batch_size / job array to size at all) - the caller only
+    invokes this when `mode == 'Parallel' and step == 'Step 1'`.
+
+    Entirely best-effort, exactly like _render_resource_advisor_panel():
+    if the pipeline isn't configured enough yet for gather_config() to
+    succeed, this shows an info message rather than erroring.
+
+    ver4-4, R1 (blueprint §2.1) - this used to show ONE, already-
+    collapsed batch-size/n-batches answer (`resource_profiles.
+    suggest_array_layout()`'s own single pick). It now shows this run's
+    TOTAL task count as its own headline metric first, then - via
+    `resource_profiles.enumerate_array_layouts()` - every (batch_size,
+    n_batches) pair that divides that total EXACTLY (so every batch in
+    the resulting array processes an identical task count, no smaller
+    trailing batch at all), for the person to choose between, with the
+    workload-sized pick pre-selected but never forced. The 'Update these
+    values' button below applies whichever pair is CURRENTLY SELECTED in
+    that list, not always the pre-selected one.
+
+    When the total doesn't have more than one workable exact-dividing
+    pair under the array-subjob cap (a prime total, or a cap too narrow
+    to contain a second option), this falls back to
+    `suggest_array_layout()`'s own closest-achievable-balance answer and
+    says so explicitly - the same documented degradation the blueprint
+    describes, not an error.
+
+    The 'Update these values' button below writes directly into
+    st.session_state['batch_size'] (Tab 1's widget) and
+    st.session_state['step1_hpc_array_start']/['step1_hpc_array_end']
+    (widgets inside render_hpc_export_section()'s 'HPC job resource
+    requests' expander, under 'Option A' further down 'Run pipeline').
+    This is legal ONLY because this function is called BEFORE any of
+    those three widgets are drawn in the same script run (Tab 1's
+    'Batch size' widget lives further down THIS SAME relocated block,
+    and the array-index widgets live inside 'Option A', called even
+    later) - Streamlit raises StreamlitAPIException if a widget's
+    session_state is written AFTER that widget has already been
+    instantiated in the same rerun. This is exactly why Requirement 1
+    asks for this suggestion, and this button, to sit ABOVE 'Batch ID
+    source'/'Batch size' in the first place. **Phase 2: do not move this
+    function's call site.**
+
+    Reads (does not draw) the 'HPC cluster profile' selection. Patch 3
+    v4, Requirement 1: that selector now renders even further UP the
+    page than this function - right under 'Run pipeline', immediately
+    after choosing 'Option A' (see _render_hpc_cluster_profile_selector(),
+    called by the top-level script before this function) - so by the
+    time this runs, its session_state value already reflects the
+    person's choice. On the very first render this session (before that
+    widget has ever been drawn at all) this simply falls back to
+    DEFAULT_HPC_PROFILE ('NCI Gadi')."""
+    try:
+        cfg = gather_config('Parallel', 'Step 1')
+    except ValueError as exc:
+        st.info(f"No job-array suggestion yet - finish configuring the pipeline first: {exc}")
+        return
+    if 'MODEL' not in cfg:
+        return
+
+    _hpc_profile = st.session_state.get('step1_hpc_profile', DEFAULT_HPC_PROFILE)
+    _max_array_override = st.session_state.get('step1_hpc_max_array_override')
+    _ncpus_per_gpu_override = st.session_state.get('step1_hpc_ncpus_per_gpu_override')
+
+    try:
+        n_population = count_unique_populations(cfg.get('PHENOTYPE_FILE_NAME')) or 1
+        n_phenotype = len(cfg['PHENOTYPE']) if cfg['PHENOTYPE'] != 'all' else max(
+            1, len(list_phenotype_columns(cfg.get('PHENOTYPE_FILE_NAME', '')))
+        )
+        n_ratio = len(cfg.get('RATIO', [1]))
+        estimate = estimate_resources(
+            scenario=cfg['SCENARIO'], n_population=n_population, n_phenotype=n_phenotype,
+            n_ratio=n_ratio, sample_num=cfg.get('ITER_NUM', 1), model_run=cfg['MODEL'],
+            ld_prune_enabled=cfg.get('LD_PRUNE') is not None, rf_filter_enabled=cfg.get('RF_FILTER') is not None,
+            genotype_format=cfg.get('GENOTYPE_FORMAT', 'csv'), genotype_file_name=cfg.get('GENOTYPE_FILE_NAME', ''),
+            phenotype_file_name=cfg.get('PHENOTYPE_FILE_NAME'), w_opt_enabled=cfg.get('W_OPT') is not None,
+            # n_batches=1 here is fine regardless of what's actually
+            # configured - suggested_batch_size/suggested_n_batches
+            # describe the run's FULL task count, independent of the
+            # n_batches argument (see suggest_array_layout()'s own
+            # docstring in resource_profiles.py).
+            n_batches=1, model_parallel_enabled=False,
+            hparameters=cfg.get('HPARAMETERS'), hp_tune=cfg.get('HP_TUNE'),
+            other_models_marker_source=cfg.get('OTHER_MODELS_MARKER_SOURCE', 'full_or_filtered'),
+            pool_cost_in_headline=cfg.get('POOL_COST_IN_HEADLINE', True),
+            gpu_cpu_calibration_in_headline=cfg.get('GPU_CPU_CALIBRATION_IN_HEADLINE', True),
+            hpc_profile=_hpc_profile,
+            max_array_subjobs_override=_max_array_override,
+            ncpus_per_gpu_override=_ncpus_per_gpu_override,
+        )
+    except Exception as exc:
+        st.caption(f"Could not compute a job-array suggestion yet ({exc}).")
+        return
+
+    total_tasks_all = int(estimate['total_tasks_all_batches'])
+    max_array_subjobs = int(estimate['max_array_subjobs'])
+
+    st.markdown("**Suggested job-array size**")
+    st.metric('Total tasks (this run)', f"{total_tasks_all:,}")
+    # ver4-4, R1: 'between' counts population pairs/triples, not
+    # ratio x iteration - compute_total_tasks() (resource_profiles.py)
+    # already branches on this; only the CAPTION text needs to say so.
+    _formula = (
+        "every population pair/triple (W_OPT-dependent) \u00d7 target phenotype"
+        if cfg.get('SCENARIO') == 'between' else
+        "every population \u00d7 phenotype \u00d7 ratio \u00d7 replicate combination"
+    )
+    st.caption(
+        f"{_formula} configured above, never exceeding the **{estimate['hpc_profile']}** "
+        f"profile's {max_array_subjobs}-subjob array cap (change this under 'HPC cluster "
+        f"profile' above)."
+    )
+
+    layouts = enumerate_array_layouts(
+        total_tasks_all, max_array_subjobs=max_array_subjobs,
+        preferred_batch_size=int(estimate['suggested_batch_size']),
+    )
+
+    if len(layouts) < 2:
+        # R1 §2.1.3's documented degradation: total_tasks_all is prime
+        # (or too few in-range divisors exist under the array cap) to
+        # offer a genuine choice - fall back to suggest_array_layout()'s
+        # own closest-achievable-balance single answer, exactly as
+        # before R1, and say so explicitly rather than silently.
+        st.caption(
+            f"\u2139\ufe0f {total_tasks_all:,} total task(s) has no second workable exact-dividing "
+            f"batch/array pair under the {max_array_subjobs}-subjob cap - showing the closest "
+            f"achievable balance instead."
+        )
+        chosen_batch_size = int(estimate['suggested_batch_size'])
+        chosen_n_batches = int(estimate['suggested_n_batches'])
+        ac1, ac2 = st.columns(2)
+        ac1.metric('Batch size (tasks/batch)', chosen_batch_size)
+        ac2.metric('Resulting job-array size (batches)', chosen_n_batches)
+        for note in estimate['notes']:
+            st.caption(f"\u2139\ufe0f {note}")
+    else:
+        _labels = [
+            f"{p['batch_size']:,} task(s)/batch \u00d7 {p['n_batches']:,} batch(es)"
+            + (" (recommended)" if p['is_recommended'] else "")
+            for p in layouts
+        ]
+        _default_idx = next((i for i, p in enumerate(layouts) if p['is_recommended']), 0)
+        _choice_idx = st.radio(
+            'Batch size / array size (every option divides the total EXACTLY - no smaller '
+            'trailing batch, whichever you pick)',
+            options=list(range(len(layouts))), format_func=lambda i: _labels[i],
+            index=_default_idx, key='_step1_array_layout_choice',
+        )
+        chosen_batch_size = int(layouts[_choice_idx]['batch_size'])
+        chosen_n_batches = int(layouts[_choice_idx]['n_batches'])
+        ac1, ac2 = st.columns(2)
+        ac1.metric('Batch size (tasks/batch)', chosen_batch_size)
+        ac2.metric('Resulting job-array size (batches)', chosen_n_batches)
+
+    if st.button('Update these values (Batch size / Array end index)', key='_btn_step1_apply_array_layout'):
+        st.session_state['batch_size'] = max(1, chosen_batch_size)
+        st.session_state['step1_hpc_array_start'] = 0
+        st.session_state['step1_hpc_array_end'] = max(0, chosen_n_batches - 1)
+        st.success(
+            "Applied - see 'Batch size' below, and 'Array start index' / 'Array end index' "
+            "further down under 'Run pipeline' > 'Option A' > 'HPC job resource requests'."
+        )
+
+
+# Patch 3 v4, Requirement 2 - the mapping this section uses in BOTH
+# directions to keep 'Batch ID source', 'Job scheduler', and 'HPC
+# cluster profile' calibrated against each other. 'Manual integer' (a
+# Batch ID source value) and 'Custom'/'Generic / other HPC' (an HPC
+# cluster profile value) deliberately have NO entry here - they are
+# legitimate, independent choices that this synchronisation leaves
+# alone ("leave it as it is for other choices").
+_SCHEDULER_TO_BATCH_ID_SOURCE = {
+    'Slurm': 'Slurm (SLURM_ARRAY_TASK_ID)',
+    'PBS': 'PBS (PBS_ARRAY_INDEX / PBS_ARRAYID)',
+    # 'NCI' is a PBS-family scheduler (its array subjobs also read
+    # PBS_ARRAY_INDEX - see render_hpc_export_section()'s own docstring)
+    # so it maps to the SAME batch-ID-source label as plain 'PBS'.
+    'NCI': 'PBS (PBS_ARRAY_INDEX / PBS_ARRAYID)',
+}
+_BATCH_ID_SOURCE_TO_SCHEDULER = {
+    'Slurm (SLURM_ARRAY_TASK_ID)': 'Slurm',
+    'PBS (PBS_ARRAY_INDEX / PBS_ARRAYID)': 'PBS',
+}
+_HPC_PROFILE_FORCED_SCHEDULER = {
+    # Bunya is a Slurm-only cluster - there is no legitimate reason to
+    # pick PBS/NCI directives for it.
+    'UQ Bunya': 'Slurm',
+    # Gadi runs PBS Pro. 'PBS' (rather than the more Gadi-specific 'NCI'
+    # native-job-array generator) is what Requirement 2 asks for as the
+    # SUGGESTED default here; a person who specifically wants Gadi's
+    # native per-batch job-array submission (run_batch_array.pbs +
+    # submit_arrays.sh - see render_hpc_export_section()'s own
+    # docstring) can still switch 'Job scheduler' to 'NCI' by hand
+    # afterwards - this only supplies the starting suggestion, exactly
+    # like every other auto-fill in this section, it does not remove
+    # 'NCI' as an option.
+    'NCI Gadi': 'PBS',
+}
+
+
+def _apply_autofill_unless_overridden(key, suggested_value, autofill_key=None):
+    """Shared helper for the "suggest a value, but never clobber an
+    explicit manual choice" bookkeeping pattern already used throughout
+    this section (e.g. 'CPUs per task', 'Intra-batch worker processes').
+
+    Writes `suggested_value` into st.session_state[key] ONLY if the
+    current value is unset, or exactly equals the last value THIS
+    helper itself wrote there (i.e. it has never been knowingly
+    overridden by the person since). Safe to call before OR after the
+    widget with this key has been drawn in the current script run, in
+    either order relative to other calls - it never raises, it just may
+    be a no-op if the widget was already drawn with a DIFFERENT value in
+    THIS SAME rerun (the one genuine Streamlit restriction, unrelated to
+    this bookkeeping).
+    """
+    autofill_key = autofill_key or f'_{key}_last_autofill'
+    current = st.session_state.get(key)
+    last_autofill = st.session_state.get(autofill_key)
+    if current is None or current == last_autofill:
+        if current != suggested_value:
+            st.session_state[key] = suggested_value
+        st.session_state[autofill_key] = suggested_value
+
+
+def _render_hpc_cluster_profile_selector(kp):
+    """Patch 3 v4, Requirement 1 - the 'HPC cluster profile' selectbox,
+    now drawn right after the Option A / Option B choice under 'Run
+    pipeline' - "the second thing that will be asked" once 'Option A' is
+    chosen - rather than buried inside render_hpc_export_section()'s own
+    body further down. Every other Option-A widget that used to draw
+    this selectbox itself (render_hpc_export_section()) or read it
+    (_render_resource_advisor_panel(), _render_suggested_job_array_size(),
+    _render_batch_id_source_selector() below) now simply reads this
+    selectbox's session_state value instead.
+
+    Patch 3 v4, Requirement 2 - also keeps 'Job scheduler' (drawn much
+    further down, inside render_hpc_export_section()'s 'HPC job resource
+    requests' expander) calibrated to the selected cluster, via
+    _HPC_PROFILE_FORCED_SCHEDULER above: 'UQ Bunya' -> 'Slurm', 'NCI
+    Gadi' -> 'PBS'. 'Generic / other HPC' and 'Custom' are left alone
+    ("leave it as it is for other choices"). Uses
+    _apply_autofill_unless_overridden() (the SAME auto-suggest-unless-
+    manually-overridden bookkeeping used everywhere else in this
+    section), so a person who deliberately picks something else
+    afterwards (e.g. 'NCI', for Gadi's native per-batch job-array
+    generator) keeps it - this only sets the starting suggestion, not a
+    lock.
+    """
+    st.selectbox(
+        'HPC cluster profile', options=list(HPC_RESOURCE_PROFILES.keys()) + ['Custom'],
+        key=f'{kp}_hpc_profile',
+        help="Which cluster's known limits the 'Suggested compute resources' estimate below "
+             "(and the job-array-size suggestion under 'Parallel batch configuration', for "
+             "Step 1) should calibrate against - specifically, the job-array subjob cap and "
+             "whether/how many CPUs are required per GPU requested. 'NCI Gadi' matches this "
+             "app's original, Gadi-only behaviour. 'UQ Bunya' has no single fixed "
+             "CPUs-per-GPU ratio (its GPU nodes vary), so no CPU floor is applied for that "
+             "profile. 'Generic / other HPC' is a conservative, no-assumptions fallback. "
+             "'Custom' lets you type in your own two numbers directly. Choosing 'UQ Bunya' or "
+             "'NCI Gadi' also suggests the matching 'Job scheduler' and 'Batch ID source' "
+             "further down - you can still change either afterwards."
+    )
+    _selected_hpc_profile = st.session_state.get(f'{kp}_hpc_profile', DEFAULT_HPC_PROFILE)
+    if _selected_hpc_profile == 'Custom':
+        cp1, cp2 = st.columns(2)
+        with cp1:
+            st.number_input(
+                'Custom job-array subjob cap', min_value=1, value=500, step=1,
+                key=f'{kp}_hpc_max_array_override',
+                help="The maximum number of subjobs your scheduler allows in one job array."
+            )
+        with cp2:
+            st.number_input(
+                'Custom CPUs required per GPU (0 = no fixed ratio)', min_value=0, value=0, step=1,
+                key=f'{kp}_hpc_ncpus_per_gpu_override',
+                help="0 = this cluster has no fixed CPUs-per-GPU rule (no automatic ncpus "
+                     "floor is applied for GPU jobs, same as 'UQ Bunya')."
+            )
+    else:
+        # Not 'Custom' - make sure a stale override from a PREVIOUS
+        # 'Custom' selection this session can never silently leak into a
+        # later named-profile estimate (resolve_hpc_profile() only reads
+        # these two keys, so simply not setting/clearing them here is
+        # sufficient - but an explicit clear is more robust against a
+        # widget that was drawn earlier this session and left a value
+        # behind in session_state before 'Custom' was un-selected).
+        st.session_state.pop(f'{kp}_hpc_max_array_override', None)
+        st.session_state.pop(f'{kp}_hpc_ncpus_per_gpu_override', None)
+
+    # Requirement 2: profile -> scheduler suggestion. Writes into
+    # f'{kp}_hpc_scheduler' BEFORE that widget is drawn later inside
+    # render_hpc_export_section() - legal, and the same "write into a
+    # not-yet-drawn widget's session_state" pattern used throughout this
+    # section (e.g. the N_CPU_WORKERS auto-fill below).
+    _suggested_scheduler = _HPC_PROFILE_FORCED_SCHEDULER.get(_selected_hpc_profile)
+    if _suggested_scheduler:
+        _apply_autofill_unless_overridden(f'{kp}_hpc_scheduler', _suggested_scheduler)
+
+
+def _render_batch_id_source_selector(kp):
+    """Patch 3 v4, Requirement 2 - 'Batch ID source', kept calibrated
+    against 'Job scheduler' (drawn later, inside
+    render_hpc_export_section()'s 'HPC job resource requests' expander)
+    in BOTH directions, via _apply_autofill_unless_overridden():
+      - on entry, suggests a value matching the CURRENT 'Job scheduler'
+        (which, by this point, already reflects either the person's own
+        last explicit choice there, or 'HPC cluster profile''s own
+        suggestion from _render_hpc_cluster_profile_selector(), called
+        earlier in this same script run);
+      - after the widget below is drawn, if the person picked something
+        that implies a DIFFERENT scheduler family (Slurm vs PBS/NCI),
+        suggests that back onto 'Job scheduler' - legal because 'Job
+        scheduler' is drawn LATER in the script than this function.
+    'Manual integer' has no scheduler equivalent and is left alone in
+    both directions - a legitimate, independent choice (e.g. a local
+    single-batch test even while otherwise exporting for a real
+    scheduler).
+
+    Only meaningful for Parallel/Step 1 with 'Option A' selected - the
+    caller only invokes this in that case. 'Option B' forces 'Manual
+    integer' unconditionally instead, without drawing this selectbox at
+    all - see the caller, under 'Run pipeline'.
+    """
+    _current_scheduler = st.session_state.get(f'{kp}_hpc_scheduler', 'Slurm')
+    _suggested_batch_source = _SCHEDULER_TO_BATCH_ID_SOURCE.get(
+        _current_scheduler, 'Slurm (SLURM_ARRAY_TASK_ID)'
+    )
+    _apply_autofill_unless_overridden(
+        'batch_id_source', _suggested_batch_source, autofill_key='_batch_id_source_last_autofill'
+    )
+
+    st.selectbox(
+        'Batch ID source', options=BATCH_ID_SOURCES, key='batch_id_source',
+        help=(
+            "'Manual integer' lets you type the batch ID directly - only used "
+            "for a local single-batch test run below. "
+            "'Slurm' and 'PBS' need no input here: the actual batch ID is "
+            "assigned automatically at run time (SLURM_ARRAY_TASK_ID / "
+            "PBS_ARRAY_INDEX, set per-task by the scheduler itself). Kept in "
+            "sync with 'Job scheduler' below - picking one "
+            "here (other than 'Manual integer') suggests the matching value "
+            "there, and vice versa; you can still override either by hand."
+        ),
+    )
+    batch_id_source = st.session_state.get('batch_id_source', BATCH_ID_SOURCES[0])
+
+    # Requirement 2, other direction: an explicit Slurm/PBS pick here
+    # suggests the matching 'Job scheduler' - legal because that
+    # selectbox is drawn LATER in the script (inside
+    # render_hpc_export_section()).
+    _suggested_scheduler = _BATCH_ID_SOURCE_TO_SCHEDULER.get(batch_id_source)
+    if _suggested_scheduler:
+        _apply_autofill_unless_overridden(f'{kp}_hpc_scheduler', _suggested_scheduler)
+
+    if batch_id_source == 'Manual integer':
+        st.number_input('Batch ID', min_value=0, value=0, step=1, key='batch_id_manual',
+                         help="Which batch (0-indexed) this particular run should process.")
+    elif batch_id_source.startswith('Slurm'):
+        st.caption(
+            "No input needed - `run_step1_batch.py` will read `SLURM_ARRAY_TASK_ID` "
+            "automatically on each array task."
+        )
+        env_val = os.environ.get('SLURM_ARRAY_TASK_ID')
+        if env_val is not None:
+            st.caption(f'\u2705 Detected in this environment right now: SLURM_ARRAY_TASK_ID = {env_val}')
+    else:
+        st.caption(
+            "No input needed - `run_step1_batch.py` will read `PBS_ARRAY_INDEX` "
+            "(or `PBS_ARRAYID`) automatically on each array task."
+        )
+        env_val = os.environ.get('PBS_ARRAY_INDEX', os.environ.get('PBS_ARRAYID'))
+        if env_val is not None:
+            st.caption(f'\u2705 Detected in this environment right now: PBS array index = {env_val}')
+
+
+def _render_advanced_setting_components(kp: str) -> None:
+    """ver4-4, R2 (blueprint §2.2.2) - the 'Advanced setting components'
+    expander, rendered immediately after 'Additional setup lines
+    (optional)' inside 'HPC job resource requests'. Hosts 'Intra-batch
+    worker processes (N_CPU_WORKERS)' and 'Model-level workers
+    (N_MODEL_WORKERS)', the two worker-fan-out widgets relocated out of
+    the old 'Pipeline compute settings' block (which used to sit
+    directly inside the expander body, always visible, with N_CPU_WORKERS
+    silently auto-filled to match 'CPUs per task' the moment that field
+    changed - see the R2 root-cause note on `_render_resource_advisor_
+    panel()`). Both widgets here default to plain `value=1` and are
+    NEVER auto-filled by any suggestion, anywhere - a person who wants
+    worker fan-out sets it here, deliberately, rather than as a side
+    effect of pressing an unrelated 'Use these values for CPUs per
+    task / Memory / GPU' button.
+
+    ver4-4, R3.b/c (Stage 3): also hosts four GLOBAL (not `kp`-scoped)
+    widgets for `R_BLAS_THREADS`, `R_BLAS_FOLLOWS_N_JOBS`,
+    `TORCH_NUM_THREADS` and `TORCH_DATALOADER_WORKERS`. These are GLOBAL
+    session-state keys, not `{kp}_`-prefixed, deliberately mirroring the
+    pre-existing `USE_GPU_SKLEARN` pattern (a single hardware setting for
+    the whole run, not one that differs by export purpose) - and matching
+    the SAME global key names `gather_config()` already reads
+    (`r_blas_threads`, `r_blas_follows_n_jobs`, `torch_num_threads`,
+    `torch_dataloader_workers`), written there since Stage 2, before any
+    widget existed for them. Safe to render as GLOBAL keys from inside a
+    function called once per `kp` - `render_hpc_export_section()` (and
+    therefore this function) is itself called exactly once per Streamlit
+    script run (a single `if is_step1: ... elif is_step2: ... else: ...`
+    chain picks exactly one `kp` per run), so there is never more than
+    one of these global-keyed widgets on screen at once.
+
+    Streamlit does not allow an st.expander nested inside another
+    st.expander (this is called from inside 'HPC job resource
+    requests', itself an expander) - uses the same bordered
+    st.container fix already established elsewhere in this section
+    (e.g. the old 'Advanced settings' sub-section this replaces).
+
+    Draws nothing else beyond the six widgets above - no auto-fill
+    bookkeeping, no N_JOBS preview caption, no model-grouping-strategy
+    sub-widgets (MODEL_GROUPING / BIO_PRIOR_GROUPING /
+    MIN_MODELS_FOR_PARALLEL, previously only ever reachable behind the
+    now-deleted 'Also consider model-level parallelism' checkbox, are
+    still exported with their existing sensible defaults - see
+    render_hpc_export_section()'s export block - just no longer exposed
+    as GUI widgets; a config file can still set them by hand if the
+    default grouping strategy isn't wanted).
+
+    ver4-4, R3.g (Stage 6): also hosts one further GLOBAL checkbox,
+    `sequential_intra_batch` (`SEQUENTIAL_INTRA_BATCH` - see
+    run_sequential.py's own SEQUENTIAL_INTRA_BATCH branch), the
+    blueprint's own one deliberate "default off" exception (§4a) among
+    every ver4-4 config key - a control-flow change, not a numerics one,
+    with its own disclosed scope/limitations (see the Change Summary).
+    Rendered regardless of `kp` for the same reason the four torch/BLAS
+    widgets above are (a single, global setting) - inert for Parallel
+    Step 1/Step 2 exports, which never read this key.
+
+    `kp` is the same purpose-scoped key prefix ('sequential' / 'step1' /
+    'step2') every other widget in `render_hpc_export_section()` uses,
+    so N_CPU_WORKERS/N_MODEL_WORKERS remain independently configurable
+    per export context, exactly as before this restructuring. The four
+    torch/BLAS widgets below (and the SEQUENTIAL_INTRA_BATCH checkbox at
+    the very end) do NOT take a `kp` prefix, by design (see above).
+    """
+    with st.container(border=True):
+        st.markdown(
+            "**Advanced setting components** (worker fan-out - most runs never need this; "
+            "see 'Suggested compute resources' above for the plain CPU/memory/GPU headline)"
+        )
+        st.number_input(
+            'Intra-batch worker processes (N_CPU_WORKERS)', min_value=1, value=1, step=1,
+            key=f'{kp}_n_cpu_workers',
+            help="How many of this batch's own tasks run CONCURRENTLY, each in its own worker "
+                 "process (see intra_batch_parallel.py). Leave at 1 to keep this batch's tasks "
+                 "fully serial (still uses however many CPUs 'CPUs per task' reserves, but only "
+                 "for a single task's own model fitting/tuning at a time)."
+        )
+        st.number_input(
+            'Model-level workers (N_MODEL_WORKERS)', min_value=1, value=1, step=1,
+            key=f'{kp}_n_model_workers',
+            help="How many of ONE task's own models are fit CONCURRENTLY, each in its own "
+                 "worker process (see intra_task_parallel.py) - composes with 'Intra-batch "
+                 "worker processes' above on a single shared pool sized N_CPU_WORKERS_TASK x "
+                 "N_MODEL_WORKERS. Leave at 1 to keep every task's models fit one at a time "
+                 "(the default for every config, including every config saved before this "
+                 "feature existed)."
+        )
+
+        st.divider()
+        st.markdown(
+            "**CPU threading (torch / R BLAS)** - applies to this whole run, regardless of "
+            "which export purpose is being configured above."
+        )
+        st.number_input(
+            'R BLAS threads (R_BLAS_THREADS)', value=None, min_value=1, step=1,
+            key='r_blas_threads', placeholder='auto',
+            help="Thread count exported as OPENBLAS_NUM_THREADS/OMP_NUM_THREADS/MKL_NUM_THREADS "
+                 "before R/BGLR runs (rrBLUP/GBLUP/BayesB/RKHS's own MCMC linear algebra) - only "
+                 "takes effect if the R build in use is linked against a multi-threaded BLAS; "
+                 "EasiGP cannot force a different BLAS to be linked at runtime, this only forwards "
+                 "a thread-count hint to whichever one is already present. Leave blank to use "
+                 "N_JOBS instead (see 'Follow N_JOBS' below) or, if that is also off, today's "
+                 "single-threaded default."
+        )
+        st.checkbox(
+            'R BLAS threads follow N_JOBS (R_BLAS_FOLLOWS_N_JOBS)', value=True,
+            key='r_blas_follows_n_jobs',
+            help="When R BLAS threads (above) is left blank, use this run's own N_JOBS as the "
+                 "R BLAS thread count instead of leaving BLAS single-threaded. On by default; "
+                 "uncheck to keep R's BLAS threading independent of N_JOBS."
+        )
+        st.number_input(
+            'Torch CPU threads (TORCH_NUM_THREADS)', value=None, min_value=1, step=1,
+            key='torch_num_threads', placeholder='auto',
+            help="torch.set_num_threads() for MLP/GAT model fitting on CPU (never used on a GPU "
+                 "device). Leave blank to derive this automatically from N_JOBS/this run's own "
+                 "worker-process layout."
+        )
+        st.number_input(
+            'Torch DataLoader workers (TORCH_DATALOADER_WORKERS)', min_value=0, value=0, step=1,
+            key='torch_dataloader_workers',
+            help="Background worker processes for PyTorch's own DataLoader, used by the GAT/MLP "
+                 "models. 0 (the default, and every config saved before this feature existed) "
+                 "means data loading happens on the main process/thread, exactly as today."
+        )
+
+        st.divider()
+        st.markdown(
+            "**Sequential intra-batch parallelism** - applies only to Sequential-mode runs "
+            "(`run_sequential.py`); inert (harmlessly ignored) for Parallel Step 1/Step 2 "
+            "exports."
+        )
+        st.checkbox(
+            'Fan Sequential mode\'s own tasks out across worker processes (SEQUENTIAL_INTRA_BATCH)',
+            value=False, key='sequential_intra_batch',
+            help="When on, and 'Intra-batch worker processes (N_CPU_WORKERS)' above is set above 1, "
+                 "a Sequential run fans its own tasks out across that many worker processes "
+                 "instead of GP()'s own fully serial per-task loop - the same mechanism a "
+                 "Parallel-mode array-job batch already uses (intra_batch_parallel.py), applied "
+                 "here to the WHOLE run as one synthetic batch. Off (the default, and every "
+                 "config saved before this feature existed) reproduces today's exact, fully "
+                 "serial Sequential behaviour. Leave off unless you have verified this route "
+                 "for your own environment first."
+        )
+
+
 def render_hpc_export_section(export_mode, export_step, purpose, headless_script, config_filename, include_array):
     """Render the 'HPC job resource requests' expander and a single
     'Generate and save job files' button that writes the config JSON and
@@ -1979,38 +4001,172 @@ def render_hpc_export_section(export_mode, export_step, purpose, headless_script
       use but this one doesn't.
     - NCI: for a single (non-array) job, identical to 'PBS' above - NCI's
       Gadi cluster runs plain PBS Pro for ordinary jobs too. For an ARRAY
-      job (Step 1) specifically, NCI's own guidance
-      (https://opus.nci.org.au/spaces/Help/pages/90308851/nci-parallel)
-      recommends AGAINST a large PBS array job in favour of a single PBS
-      job that internally farms every batch out via the `nci-parallel`
-      MPI tool - so 'NCI' generates that instead: one .sh script (no
-      `#PBS -J` at all) plus a matching cmds.txt task-list file (one
-      `python3 run_step1_batch.py --config ... --batch-id N` line per
-      batch - the exact same headless script every other scheduler
-      choice already uses, since it already accepts --batch-id
-      explicitly - see run_step1_batch.py's own docstring).
+      job (Step 1) specifically, `nci-parallel` task-farming (this
+      section's previous approach) forces every co-packed batch to share
+      ONE job's ncpus/mem, which does not scale once batch count is large
+      or any individual batch (e.g. a GAT-heavy scenario) needs its own
+      substantial memory. Instead, 'NCI' now generates TWO files
+      implementing a **native PBS job array**, submitted as several small
+      automated arrays rather than one call to `nci-parallel` and rather
+      than one manual `qsub` per batch:
+
+        * `run_batch_array.pbs` - a per-array PBS template using a real
+          `#PBS -J` range, with `ncpus`/`mem` sized for exactly ONE batch
+          (the same 'CPUs per task'/'Memory' fields used everywhere else
+          in this section - for a native array, those already ARE the
+          per-subjob request, so no separate 'per-batch' fields are
+          needed). Each subjob computes its own EasiGP batch ID as
+          `PBS_ARRAY_INDEX + OFFSET`, with `OFFSET` supplied via `-v`.
+        * `submit_arrays.sh` - the submission driver: loops over the full
+          batch-ID range in steps of 'Chunk size' (`CHUNK_SIZE`, capped at
+          Gadi's current max-subjobs-per-array limit), `qsub`-ing
+          `run_batch_array.pbs` once per chunk with a different `OFFSET`,
+          and appending each submission's `{offset, array_job_id}` to
+          `Result/<RESULT_NAME>/hpc_submission_manifest.json` for
+          traceability (job IDs only exist once actually submitted, so
+          this manifest is written by the submission script at qsub time,
+          not by the GUI at export time).
+
+      A config with N batches and a chosen chunk size C therefore results
+      in `ceil(N/C)` array submissions when `submit_arrays.sh` is run,
+      each independently resourced, with zero manual `qsub` edits
+      required. Gadi's queue may still throttle how many jobs can be
+      RUNNING at once regardless of how many were submitted - that is a
+      scheduler-level policy EasiGP does not control.
+
+    GPU support (all three schedulers): an optional 'Request GPU(s)'
+    checkbox adds the scheduler's GPU-request directive to every
+    generated script - `--gres=gpu:<type>:<count>` (or `--gres=gpu:<count>`
+    if no type is given) for Slurm, `-l ngpus=<count>` for PBS/NCI (NCI
+    Gadi's GPU queue is 'gpuvolta'; its ncpus must be a multiple of 12 per
+    GPU requested - not enforced automatically here, so size 'CPUs per
+    task' accordingly). For a Gadi native job-array, the GPU count is
+    per-INDIVIDUAL-batch, exactly like ncpus/mem above.
+
+    Patch 3 v2, Requirement 3 - Slurm QoS: Slurm ALSO gets an optional
+    `--qos=...` directive ('QoS (Slurm only, optional)'), auto-suggested
+    to 'gpu' the moment 'Request GPU(s)' is checked - some Slurm clusters
+    (e.g. UQ RCC's Bunya - see
+    https://github.com/UQ-RCC/hpc-docs/blob/main/guides/Bunya-User-Guide.md)
+    gate GPU access behind a specific QoS in addition to the partition
+    itself. Not applicable to PBS/NCI, which has no QoS directive anywhere
+    in this generator.
+
+    Array-task throttling (more array tasks than available GPUs): for any
+    array job (Step 1, or a Gadi native array), 'Max concurrently running
+    array tasks' appends a `%<limit>` slot-limit suffix to the array
+    directive (`#SBATCH -a start-end%N` / `#PBS -J start-end%N`) - the
+    scheduler then never runs more than N tasks of the array at once,
+    however many are queued. The moment 'Request GPU(s)' is checked, this
+    field is auto-suggested to equal 'GPUs per task' (so the array is
+    throttled immediately, not left unthrottled by default) - the person
+    exporting the job should then edit it to match the number of GPUs
+    ACTUALLY available on the whole partition/queue, e.g. "12 array tasks
+    each requesting 1 GPU, but only 4 GPUs exist on the partition" ->
+    edit the suggested value up to 4, matching Slurm's own
+    `--array=1-12%4`. For a Gadi native array, the same limit is applied
+    inside each `submit_arrays.sh`-issued `qsub -J 0-<chunk size - 1>%N`
+    call, capped at that call's own chunk size.
     """
     kp = purpose
     default_job_name = f"EasiGP_{st.session_state.get('result_name', 'job')}_{purpose}"
     default_max_index = 0
 
+    # Patch 3 v4, Requirement 1: 'HPC cluster profile' used to be drawn
+    # right HERE, as this function's first action. It now renders much
+    # further up the page - right under 'Run pipeline', immediately after
+    # choosing 'Option A' (see _render_hpc_cluster_profile_selector(),
+    # called by the top-level script before this function is ever
+    # reached) - so both this function and _render_resource_advisor_panel()
+    # below simply READ its session_state value (f'{kp}_hpc_profile' etc.)
+    # rather than drawing their own copy. Nothing else in this function
+    # changes: every downstream read of f'{kp}_hpc_profile'/
+    # f'{kp}_hpc_max_array_override'/f'{kp}_hpc_ncpus_per_gpu_override'
+    # below is unchanged.
+    _render_resource_advisor_panel(kp, export_mode, export_step)
+
     with st.expander('HPC job resource requests (customise the generated script)', expanded=False):
         st.caption(
-            "These settings control the #SBATCH / #PBS directives (and any extra setup "
-            "commands) in the generated script - they don't affect the pipeline "
-            "configuration itself."
+            "'CPUs per task' / 'Memory' / 'GPU' below control BOTH the #SBATCH / #PBS "
+            "resource-request directives in the generated script AND (via 'Pipeline compute "
+            "settings' further down) the N_CPU_WORKERS/N_GPU_SLOTS/N_JOBS values written into "
+            "the saved config JSON - so the scheduler allocation and what GP() actually uses "
+            "stay in sync. Everything else in this expander (job name, walltime, partition, "
+            "account, ...) affects the generated script only."
         )
         st.selectbox(
             'Job scheduler', options=['Slurm', 'PBS', 'NCI'], key=f'{kp}_hpc_scheduler',
             help=("Only script(s) for the chosen scheduler are generated below. 'NCI' targets "
                   "NCI's Gadi cluster specifically - for an array/batch job it generates a "
-                  "single nci-parallel task-farming job (NCI's recommended approach, see "
-                  "https://opus.nci.org.au/spaces/Help/pages/90308851/nci-parallel) instead of "
-                  "a plain PBS array; for a single job it's the same as 'PBS'.")
+                  "native PBS job-array submission (`run_batch_array.pbs` + `submit_arrays.sh`, "
+                  "see this section's own help text below) sized per-batch, rather than packing "
+                  "every batch into one shared allocation; for a single job it's the same as "
+                  "'PBS'. Suggested automatically from 'HPC cluster profile' above ('UQ Bunya' "
+                  "-> 'Slurm', 'NCI Gadi' -> 'PBS') and kept in sync with 'Batch ID source' "
+                  "under 'Parallel batch configuration', for Step 1 - change "
+                  "it here any time, e.g. to 'NCI' for Gadi's native per-batch job-array "
+                  "generator.")
         )
         scheduler = st.session_state.get(f'{kp}_hpc_scheduler', 'Slurm')
         is_pbs_family = scheduler in ('PBS', 'NCI')
-        uses_nci_parallel = (scheduler == 'NCI' and include_array)
+        uses_gadi_array = (scheduler == 'NCI' and include_array)
+        # Read (rather than render) the GPU checkbox's own state here,
+        # BEFORE it is actually drawn further down - needed so the
+        # 'Partition / queue' autofill below (which is rendered first,
+        # inside the c1/c2/c3 columns) can already suggest a GPU queue
+        # when the box is checked. Streamlit persists widget state in
+        # session_state across reruns, so reading it early is safe -
+        # this mirrors the existing 'scheduler'/'is_pbs_family' pattern.
+        use_gpu = bool(st.session_state.get(f'{kp}_hpc_use_gpu', False))
+
+        # Patch 3, Requirement 4 ("the suggestion of optimum CPUs needs to
+        # be calibrated when using a GPU"): auto-suggest 'CPUs per task'
+        # the moment 'Request GPU(s)' is checked, mirroring the SAME
+        # auto-fill-unless-overridden pattern already used for 'Partition
+        # / queue' below (read the not-yet-drawn GPU widgets' session
+        # state early - safe, since Streamlit persists a widget's value
+        # from the user's last interaction regardless of render order).
+        # Previously this field's help text explicitly warned "this app
+        # does not adjust 'CPUs per task' automatically" - this closes
+        # that gap using the SAME calibration
+        # resource_profiles._apply_gpu_cpu_calibration_to_core() applies
+        # to the 'Suggested compute resources' panel above, so the two
+        # never disagree. Patch 3 v3, Requirement 3: calibrated against
+        # the SELECTED 'HPC cluster profile' (Patch 3 v4: drawn even
+        # further up the page now - see _render_hpc_cluster_profile_selector())
+        # rather than always Gadi's fixed ratio - a profile with no known
+        # CPUs-per-GPU ratio (e.g. UQ
+        # Bunya) applies no floor here either, matching the advisor
+        # panel's own behaviour exactly.
+        _gpus_per_task_now = int(st.session_state.get(f'{kp}_hpc_gpus_per_task', 1) or 1)
+        _cpus_key = f'{kp}_hpc_cpus_per_task'
+        _cpus_autofill_key = f'_{_cpus_key}_last_autofill'
+        _profile_max_array, _profile_ncpus_per_gpu, _profile_note, _ = resolve_hpc_profile(
+            st.session_state.get(f'{kp}_hpc_profile', DEFAULT_HPC_PROFILE),
+            st.session_state.get(f'{kp}_hpc_max_array_override'),
+            st.session_state.get(f'{kp}_hpc_ncpus_per_gpu_override'),
+        )
+        if use_gpu:
+            if _profile_ncpus_per_gpu and _profile_ncpus_per_gpu > 0:
+                _suggested_cpus = _profile_ncpus_per_gpu * _gpus_per_task_now
+                if st.session_state.get('ld_prune_enabled', False) or st.session_state.get('rf_filter_enabled', False):
+                    _suggested_cpus = int(math.ceil(_suggested_cpus * _GPU_PREPROCESS_CPU_HEADROOM))
+                    _suggested_cpus = int(math.ceil(_suggested_cpus / (_profile_ncpus_per_gpu * _gpus_per_task_now))
+                                           * (_profile_ncpus_per_gpu * _gpus_per_task_now))
+            else:
+                # No fixed CPUs-per-GPU ratio for this profile - only the
+                # LD/RF headroom (if any) applies, no floor/rounding.
+                _suggested_cpus = 1
+                if st.session_state.get('ld_prune_enabled', False) or st.session_state.get('rf_filter_enabled', False):
+                    _suggested_cpus = int(math.ceil(_suggested_cpus * _GPU_PREPROCESS_CPU_HEADROOM))
+        else:
+            _suggested_cpus = 1
+        _current_cpus = st.session_state.get(_cpus_key)
+        _last_cpus_autofill = st.session_state.get(_cpus_autofill_key)
+        if _current_cpus is None or _current_cpus == _last_cpus_autofill:
+            if _current_cpus != _suggested_cpus:
+                st.session_state[_cpus_key] = _suggested_cpus
+                st.session_state[_cpus_autofill_key] = _suggested_cpus
 
         c1, c2, c3 = st.columns(3)
         with c1:
@@ -2019,31 +4175,34 @@ def render_hpc_export_section(export_mode, export_step, purpose, headless_script
             st.number_input('Nodes', min_value=1, value=1, step=1, key=f'{kp}_hpc_nodes',
                              help="How many physical machines to request. Almost always 1 for this pipeline, "
                                   "since it isn't written to split a single run across multiple machines."
-                                  + (" Not used for NCI task-farming jobs below." if uses_nci_parallel else ""))
+                                  + (" Not used for Gadi native job-array jobs below." if uses_gadi_array else ""))
             st.number_input('Tasks per node', min_value=1, value=1, step=1, key=f'{kp}_hpc_ntasks_per_node',
                              help="How many separate processes to run per node. Leave at 1 unless you "
                                   "specifically know you need more."
-                                  + (" Not used for NCI task-farming jobs below." if uses_nci_parallel else ""))
+                                  + (" Not used for Gadi native job-array jobs below." if uses_gadi_array else ""))
         with c2:
             st.number_input(
-                'CPUs per task', min_value=1, value=1, step=1, key=f'{kp}_hpc_cpus_per_task',
+                'CPUs per task', min_value=1, step=1, key=_cpus_key,
                 help="How many CPU cores to reserve for this job (e.g. for Random Forest's "
-                     "parallel tree fitting)."
-                     + (" For NCI task-farming, this is nci-parallel's own ncores_per_task - "
-                        "cores dedicated to EACH concurrently-running batch." if uses_nci_parallel else "")
+                     "parallel tree fitting). Auto-suggested to a Gadi-gpuvolta-compliant value "
+                     "(a multiple of 12 per GPU, plus headroom if LD pruning/RF filtering is "
+                     "also enabled) the moment 'Request GPU(s)' below is checked - type your own "
+                     "value to override; it will stick across reruns."
+                     + (" For a Gadi native job-array, this is the ncpus reserved for EACH "
+                        "individual batch (every PBS subjob gets its own, independently-sized "
+                        "allocation - not shared across batches)." if uses_gadi_array else "")
             )
             st.text_input('Memory (e.g. 10G)', value='10G', key=f'{kp}_hpc_mem',
                           help="How much RAM to reserve for this job."
-                               + (" For NCI task-farming, this is the TOTAL memory for the whole "
-                                  "job (shared across every concurrently-running batch), not per "
-                                  "batch - size it generously." if uses_nci_parallel else
+                               + (" For a Gadi native job-array, this is the memory reserved for "
+                                  "EACH individual batch (every PBS subjob gets its own allocation)."
+                                  if uses_gadi_array else
                                   " Increase this for large genotype files."))
             st.text_input('Walltime (HH:MM:SS)', value='01:00:00', key=f'{kp}_hpc_time',
                           help="Maximum time the job is allowed to run before the scheduler kills it. "
                                "Set this generously - a job that hits this limit is stopped part-way through."
-                               + (" For NCI task-farming, this is the budget for ALL batches "
-                                  "combined (not just one), since they all run inside this one "
-                                  "job." if uses_nci_parallel else ""))
+                               + (" For a Gadi native job-array, this is the budget for EACH batch "
+                                  "(subjob), not the whole array." if uses_gadi_array else ""))
         with c3:
             # Requirement 7 (bugfix): text_input's own value= is only
             # ever used for a widget's VERY FIRST render - once its
@@ -2059,7 +4218,19 @@ def render_hpc_export_section(export_mode, export_step, purpose, headless_script
             # depends on the scheduler rather than always being blank.
             _partition_key = f'{kp}_hpc_partition'
             _partition_autofill_key = f'_{_partition_key}_last_autofill'
-            _suggested_partition = 'normal' if is_pbs_family else 'general'
+            # GPU-aware suggestion: most clusters route GPU jobs through a
+            # separate partition/queue from the CPU-only default (NCI
+            # Gadi's GPU queue is specifically named 'gpuvolta'; Slurm
+            # sites conventionally name theirs 'gpu', matching the
+            # reference script this section was updated against - see
+            # this function's docstring). Re-evaluated on every render, so
+            # ticking/unticking 'Request GPU(s)' below updates this
+            # suggestion immediately, same auto-fill-unless-overridden
+            # pattern as the rest of this field.
+            if is_pbs_family:
+                _suggested_partition = 'gpuvolta' if use_gpu else 'normal'
+            else:
+                _suggested_partition = 'gpu' if use_gpu else 'general'
             _current_partition = st.session_state.get(_partition_key)
             _last_partition_autofill = st.session_state.get(_partition_autofill_key)
             if _current_partition is None or _current_partition == _last_partition_autofill:
@@ -2069,8 +4240,10 @@ def render_hpc_export_section(export_mode, export_step, purpose, headless_script
             st.text_input('Partition / queue', key=_partition_key,
                           help="Which partition/queue on your cluster to submit to - check with your "
                                "cluster's documentation or administrator for the available names "
-                               "(NCI Gadi's general-purpose queue is 'normal'). Defaults to 'normal' "
-                               "for PBS/NCI and 'general' for Slurm - type your own value to override.")
+                               "(NCI Gadi's general-purpose queue is 'normal', its GPU queue is "
+                               "'gpuvolta'). Defaults to 'normal'/'gpuvolta' for PBS/NCI and "
+                               "'general'/'gpu' for Slurm depending on whether 'Request GPU(s)' "
+                               "below is checked - type your own value to override.")
             st.text_input('Account / project code (leave blank to omit)', value='', key=f'{kp}_hpc_account',
                           help="Billing/allocation code to charge this job's usage to. Slurm calls this "
                                "the 'account' (`--account`); PBS/NCI call it the 'project' (`-P`) - "
@@ -2078,6 +4251,81 @@ def render_hpc_export_section(export_mode, export_step, purpose, headless_script
             st.checkbox('Use login shell (--login)', value=True, key=f'{kp}_hpc_login_shell',
                         help="Runs the job in a login shell, which loads your usual environment/module "
                              "setup (e.g. conda, R). Leave checked unless you know you need otherwise.")
+
+        st.markdown("**GPU**")
+        cg1, cg2, cg3 = st.columns(3)
+        with cg1:
+            st.checkbox(
+                'Request GPU(s)', value=False, key=f'{kp}_hpc_use_gpu',
+                help="Check this if the run needs GPU acceleration (the MLP model and any of the "
+                     "four GAT_* models, which run in PyTorch/PyTorch Geometric, benefit most). "
+                     "Adds the scheduler's GPU-request directive to the generated script(s) below - "
+                     "`--gres=gpu:...` for Slurm, `-l ngpus=...` for PBS/NCI - and, unless you've "
+                     "typed your own 'Partition / queue' above, switches the suggested queue to a "
+                     "GPU one."
+            )
+        with cg2:
+            st.number_input(
+                'GPUs per task', min_value=1, value=1, step=1, key=f'{kp}_hpc_gpus_per_task',
+                disabled=not use_gpu,
+                help="How many GPUs to reserve for this job."
+                     + (" For a Gadi native job-array, this is per INDIVIDUAL batch/subjob - every "
+                        "subjob gets its own independent GPU allocation, exactly like 'CPUs per "
+                        "task'/'Memory' above." if uses_gadi_array else
+                        " For an array job, EVERY array task requests this many GPUs "
+                        "independently - see 'Max concurrently running array tasks' below if you "
+                        "have more array tasks than GPUs available on the partition."
+                        if include_array else "")
+            )
+        with cg3:
+            st.text_input(
+                'GPU type (optional)', value='', key=f'{kp}_hpc_gpu_type',
+                disabled=not use_gpu,
+                help="Slurm only - a specific GPU model to request, e.g. 'a100' or 'v100' "
+                     "(generates `--gres=gpu:<type>:<count>`). Leave blank to let the scheduler "
+                     "assign any available GPU (`--gres=gpu:<count>`). Not used for PBS/NCI, which "
+                     "request a GPU COUNT only (`-l ngpus=<count>`) - on NCI Gadi the GPU-enabled "
+                     "queue is 'gpuvolta', where ncpus must be a multiple of 12 per GPU requested; "
+                     "this app does not adjust 'CPUs per task' automatically, so size it "
+                     "accordingly if you request GPUs there."
+            )
+
+        # Patch 3 v2, Requirement 3: "If GPU is set to > 0, Slurm should
+        # generate the QoS field" (see
+        # https://github.com/UQ-RCC/hpc-docs/blob/main/guides/Bunya-User-Guide.md).
+        # Slurm's Quality-of-Service (`--qos=...`) is a separate concept
+        # from 'Partition / queue' and, on some Slurm clusters, is REQUIRED
+        # to actually get a GPU allocation - e.g. UQ RCC's Bunya cluster's
+        # own documented GPU job template sets `--qos=gpu` alongside
+        # `--partition=gpu_cuda`. PBS/NCI has no QoS directive anywhere in
+        # this generator, so this is Slurm-only, matching the requirement's
+        # own wording. Auto-suggested to 'gpu' the moment 'Request GPU(s)'
+        # is checked (same auto-fill-unless-overridden pattern as
+        # 'Partition / queue'/'CPUs per task' above) - blank omits `--qos`
+        # entirely, which is also today's (pre-Patch-3-v2) behaviour for
+        # every non-GPU job.
+        if scheduler == 'Slurm':
+            _qos_key = f'{kp}_hpc_qos'
+            _qos_autofill_key = f'_{_qos_key}_last_autofill'
+            _suggested_qos = 'gpu' if use_gpu else ''
+            _current_qos = st.session_state.get(_qos_key)
+            _last_qos_autofill = st.session_state.get(_qos_autofill_key)
+            if _current_qos is None or _current_qos == _last_qos_autofill:
+                if _current_qos != _suggested_qos:
+                    st.session_state[_qos_key] = _suggested_qos
+                    st.session_state[_qos_autofill_key] = _suggested_qos
+            st.text_input(
+                'QoS (Slurm only, optional - e.g. "gpu" on UQ Bunya)', key=_qos_key,
+                help="Slurm's Quality-of-Service label (`--qos=...`). Separate from 'Partition / "
+                     "queue' and often REQUIRED to actually obtain a GPU allocation on Slurm "
+                     "clusters that gate GPU access behind a specific QoS (UQ RCC's Bunya, for "
+                     "example, documents `--qos=gpu` alongside `--partition=gpu_cuda` for its own "
+                     "GPU jobs - see "
+                     "https://github.com/UQ-RCC/hpc-docs/blob/main/guides/Bunya-User-Guide.md). "
+                     "Auto-suggested to 'gpu' the moment 'Request GPU(s)' is checked; leave blank "
+                     "to omit `--qos` entirely and use your account's/partition's own default "
+                     "(always the case for a non-GPU job)."
+            )
 
         if is_pbs_family:
             c3b, c3c = st.columns(2)
@@ -2107,11 +4355,7 @@ def render_hpc_export_section(export_mode, export_step, purpose, headless_script
                 'Output file base name', value='', key=f'{kp}_hpc_output_base',
                 help=f"Leave blank to default to '{default_job_name}'. "
                      + ("The array-task index placeholder is appended automatically."
-                        if include_array and not uses_nci_parallel else
-                        "" if not uses_nci_parallel else
-                        "NCI task-farming runs as a single job, so there's just one output file "
-                        "for the whole job (see 'Redirect each task's own output' below for "
-                        "per-batch files instead).")
+                        if include_array else "")
             )
         with c5:
             st.text_input(
@@ -2133,56 +4377,99 @@ def render_hpc_export_section(export_mode, export_step, purpose, headless_script
                 "Set the array index range to match your total number of batches "
                 "(e.g. 0-999 for 1000 batches) - also useful for resubmitting only a "
                 "subset of failed batches."
-                + (" For NCI, this defines which batch IDs go into the generated cmds.txt "
-                   "task list, not a real PBS array." if uses_nci_parallel else "")
+                + (" For a Gadi native job-array, this full range is split automatically into "
+                   "'Chunk size'-sized PBS arrays by submit_arrays.sh below." if uses_gadi_array else "")
             )
 
-            if uses_nci_parallel:
-                st.markdown("**NCI task-farming (`nci-parallel`)**")
+            # Auto-suggest a concurrency limit as soon as 'Request GPU(s)'
+            # is ticked - matches the Slurm reference pattern this section
+            # was updated against ('--gres=gpu:1' PLUS '--array=...%4' to
+            # cap the WHOLE array at 4 GPUs total; without the '%N' suffix,
+            # nothing stops the scheduler running all array tasks at once
+            # and over-subscribing the partition's GPUs). Same
+            # auto-fill-unless-manually-overridden pattern as
+            # 'Partition / queue' above: typing a different number here
+            # sticks across reruns, and only reverts to auto-suggestion if
+            # 'Request GPU(s)' is unticked again (or 'GPUs per task'
+            # changes back to what was last auto-applied).
+            #
+            # Bugfix: this field can already hold a value in
+            # session_state (e.g. its own widget default of 0 from a
+            # session that started before auto-suggestion existed, or a
+            # value restored by load_gui_state()) even though the
+            # AUTOFILL mechanism itself has never actually run yet for
+            # this session - '_throttle_autofill_key not in
+            # st.session_state' is what detects that "never run before"
+            # state. Without this check, a pre-existing 0 reads as
+            # indistinguishable from "the person deliberately chose 0",
+            # so the very first suggestion after GPUs are requested was
+            # silently dropped and '-a'/'-J' kept generating with no
+            # '%N' suffix even with --gres/-l ngpus correctly set - this
+            # is the bug reported after the previous fix.
+            #
+            # Patch 3 v2, Requirement 5 ("the default of 'Max concurrently
+            # running array tasks' should correspond to the number of GPUs
+            # allocated; no GPUs should always be set to zero"): this is
+            # EXACTLY what the block below already does
+            # (`_suggested_throttle = _gpus_per_task_now if use_gpu else 0`)
+            # - verified against the requirement text this session, no
+            # change was needed here.
+            _throttle_key = f'{kp}_hpc_array_throttle'
+            _throttle_autofill_key = f'_{_throttle_key}_last_autofill'
+            _gpus_per_task_now = int(st.session_state.get(f'{kp}_hpc_gpus_per_task', 1))
+            _suggested_throttle = _gpus_per_task_now if use_gpu else 0
+            _current_throttle = st.session_state.get(_throttle_key)
+            _last_throttle_autofill = st.session_state.get(_throttle_autofill_key)
+            _throttle_never_autofilled = _throttle_autofill_key not in st.session_state
+            if _current_throttle is None or _current_throttle == _last_throttle_autofill \
+                    or _throttle_never_autofilled:
+                if _current_throttle != _suggested_throttle:
+                    st.session_state[_throttle_key] = _suggested_throttle
+                    st.session_state[_throttle_autofill_key] = _suggested_throttle
+            st.number_input(
+                'Max concurrently running array tasks (optional, 0 = no limit)', min_value=0,
+                step=1, key=_throttle_key,
+                help=(
+                    "Caps how many array tasks the scheduler will run AT ONCE, however many are "
+                    "queued - the standard fix when an array has more tasks than a resource each "
+                    "task needs, most commonly GPUs. Auto-suggested to match 'GPUs per task' above "
+                    "the moment 'Request GPU(s)' is checked, so the array directive is throttled "
+                    "immediately - but EDIT THIS to match the number of GPUs actually available on "
+                    "your partition/queue AS A WHOLE (e.g. 12 array tasks, 1 GPU each, but only 4 "
+                    "GPUs exist on the partition -> set this to 4, matching Slurm's own "
+                    "'--array=1-12%4', not left at the auto-suggested 1). Generates a `%<limit>` "
+                    "suffix on the array directive (`#SBATCH -a start-end%<limit>` / `#PBS -J "
+                    "start-end%<limit>`). Set to 0 to let every task start as soon as the "
+                    "scheduler can place it (no GPU-oversubscription protection)."
+                    + (" For a Gadi native job-array, the same limit is applied inside EACH "
+                       "`submit_arrays.sh`-issued `qsub -J 0-<chunk size - 1>%<limit>` call "
+                       "(automatically capped at that call's own 'Chunk size', since a single "
+                       "PBS array can't usefully be throttled below its own size)."
+                       if uses_gadi_array else "")
+                )
+            )
+
+            if uses_gadi_array:
+                st.markdown("**Gadi native job-array submission**")
                 st.caption(
-                    "NCI's own guidance recommends running every batch inside ONE PBS job via "
-                    "`nci-parallel`, rather than a large PBS array job - see "
-                    "https://opus.nci.org.au/spaces/Help/pages/90308851/nci-parallel"
+                    "Generates a per-batch-resourced native PBS job array (`#PBS -J`), submitted "
+                    "as several small automated arrays via a generated `submit_arrays.sh` driver - "
+                    "the scalable pattern recommended for large or memory-heavy batch counts on "
+                    "Gadi, in place of packing every batch into one shared `nci-parallel` "
+                    "allocation."
                 )
-                c8, c9, c10 = st.columns(3)
-                with c8:
-                    st.number_input(
-                        'Concurrent batches', min_value=1, value=4, step=1, key=f'{kp}_hpc_nci_concurrent',
-                        help=("How many batches run AT ONCE within the single job. Total CPUs "
-                              "requested = 'CPUs per task' x this. NCI recommends requesting no "
-                              "more than ~1/10th of the total batch count when batch runtimes "
-                              "vary a lot, for better overall utilisation.")
+                st.number_input(
+                    'Chunk size (subjobs per PBS array submission)', min_value=1,
+                    max_value=GADI_MAX_ARRAY_SUBJOBS,
+                    value=min(10, GADI_MAX_ARRAY_SUBJOBS), step=1,
+                    key=f'{kp}_hpc_gadi_chunk_size',
+                    help=(
+                        f"How many batches go into EACH individual `qsub`-submitted PBS array. "
+                        f"`submit_arrays.sh` submits `ceil(N_batches / chunk size)` separate "
+                        f"arrays automatically, one after another - capped here at "
+                        f"{GADI_MAX_ARRAY_SUBJOBS} (verify NCI Gadi's CURRENT maximum subjob "
+                        f"count per array before relying on this value; it may have changed)."
                     )
-                with c9:
-                    st.number_input(
-                        'Cores per NUMA node', min_value=1, value=12, step=1, key=f'{kp}_hpc_nci_numa_cores',
-                        help=("A Gadi hardware detail used to bind each batch's CPU cores together "
-                              "efficiently (`--map-by` in the generated mpirun command) - 12 is "
-                              "correct for Gadi's standard Cascade Lake nodes; leave as-is unless "
-                              "you know your node type differs.")
-                    )
-                with c10:
-                    st.number_input(
-                        'Per-task timeout (seconds, 0 = none)', min_value=0, value=0, step=60,
-                        key=f'{kp}_hpc_nci_timeout',
-                        help=("nci-parallel kills any single batch that runs longer than this "
-                              "(0 = no timeout). Useful for cutting off unusually slow batches "
-                              "rather than leaving cores idle waiting for them.")
-                    )
-                st.text_input(
-                    'nci-parallel module version', value='1.0.0a', key=f'{kp}_hpc_nci_module_version',
-                    help="Check `module avail nci-parallel` on Gadi for the current version if this default is outdated."
-                )
-                st.checkbox(
-                    "Redirect each batch's own stdout/stderr to separate files", value=False,
-                    key=f'{kp}_hpc_nci_output_dir',
-                    help=("Off (default): every batch's console output is interleaved into the "
-                          "one shared job output file (fine for a moderate number of batches - "
-                          "each batch ALSO always gets its own clean per-batch log file under "
-                          "Result/<result name>/logs/ regardless of this setting). On: additionally "
-                          "have nci-parallel itself write each batch's stdout/stderr to its own "
-                          "file - recommended if the combined output would otherwise approach GB "
-                          "scale (very many batches and/or very verbose models).")
                 )
 
         st.text_area(
@@ -2196,6 +4483,30 @@ def render_hpc_export_section(export_mode, export_step, purpose, headless_script
             ),
         )
 
+        # Requirements.md item 5: 'Advanced setting components' (worker
+        # fan-out) is now revealed only after this button is clicked,
+        # rather than always rendered - most runs never need it (see
+        # _render_advanced_setting_components()'s own docstring), and the
+        # plain 'Suggested compute resources' panel above already covers
+        # the CPU/memory/GPU headline every run does need. A persistent
+        # session_state flag (not the button's own transient click-state)
+        # keeps the section visible across reruns once shown, and the
+        # button toggles it back off if clicked again.
+        _advanced_shown_key = f'{kp}_show_advanced_setting_components'
+        if st.button(
+            ('Hide' if st.session_state.get(_advanced_shown_key, False) else 'Show')
+            + ' advanced setting components (worker fan-out)',
+            key=f'_btn_{kp}_toggle_advanced_setting_components',
+            help="Worker fan-out (N_CPU_WORKERS/N_MODEL_WORKERS) and CPU-threading settings - "
+                 "most runs never need these; see 'Suggested compute resources' above for the "
+                 "plain CPU/memory/GPU headline most runs actually want."
+        ):
+            st.session_state[_advanced_shown_key] = not st.session_state.get(_advanced_shown_key, False)
+            st.rerun()
+
+        if st.session_state.get(_advanced_shown_key, False):
+            _render_advanced_setting_components(kp)
+
     if st.button('Generate and save job files', key=f'_btn_{kp}_generate_save'):
         try:
             export_cfg = gather_config(export_mode, export_step)
@@ -2203,7 +4514,7 @@ def render_hpc_export_section(export_mode, export_step, purpose, headless_script
             st.error(str(exc))
             return
 
-        result_dir = os.path.abspath(os.path.join('.', 'Result', export_cfg['RESULT_NAME']))
+        result_dir = result_dir_path(export_cfg['RESULT_NAME'])
         os.makedirs(result_dir, exist_ok=True)
         config_path = os.path.join(result_dir, config_filename)
         logs_dir = os.path.join(result_dir, 'logs')
@@ -2212,17 +4523,117 @@ def render_hpc_export_section(export_mode, export_step, purpose, headless_script
         if include_array:
             # batch_id is per-task and must NOT be baked into the shared
             # config - the headless script resolves it at run time from
-            # SLURM_ARRAY_TASK_ID / PBS_ARRAY_INDEX (Slurm/PBS array jobs),
-            # or is passed explicitly via --batch-id (NCI task-farming -
-            # see cmds.txt generation below) for each individual task.
+            # SLURM_ARRAY_TASK_ID / PBS_ARRAY_INDEX (+ OFFSET, for a Gadi
+            # native job-array - see pipeline_utils.resolve_batch_id_from_env),
+            # or is passed explicitly via --batch-id (used directly by the
+            # generated Gadi array script below) for each individual task.
             export_cfg['PARALLEL'] = {'batch_size': export_cfg['PARALLEL']['batch_size']}
+
+        # Phase 2, Requirement 7 (bugfix): the 'Pipeline compute settings'
+        # block above (CPUs per task -> N_CPU_WORKERS/N_JOBS, GPUs per task
+        # -> N_GPU_SLOTS) previously only ever reached the generated
+        # #SBATCH/#PBS script, never this JSON - meaning run_step1_batch.py
+        # always saw N_CPU_WORKERS default to 1 (no intra-batch
+        # parallelism at all) no matter how many CPUs were requested above.
+        # Written here, right before the file is saved, from the SAME
+        # session_state values the resource-request fields themselves use,
+        # so the two can never drift apart.
+        _export_cpus_per_task = int(st.session_state.get(f'{kp}_hpc_cpus_per_task', 1))
+        _export_n_cpu_workers = int(st.session_state.get(f'{kp}_n_cpu_workers', _export_cpus_per_task) or 1)
+        _export_n_cpu_workers = max(1, min(_export_n_cpu_workers, _export_cpus_per_task))
+        # Requirement.md item 1 fix: also cap N_CPU_WORKERS by how many
+        # tasks THIS batch will actually contain (export_cfg['PARALLEL']
+        # ['batch_size'], just resolved above for an array export) -
+        # task-level fan-out can never usefully run more concurrent
+        # workers than there are tasks to hand them (intra_batch_
+        # parallel.py's own run_batch_with_intra_batch_parallelism()
+        # already falls back to a single serial GP() call whenever
+        # batch_size < min_tasks_for_parallel, so any N_CPU_WORKERS above
+        # batch_size buys nothing at run time). Without this cap, N_JOBS/
+        # PLINK_THREADS below get divided by a worker count that will
+        # never actually run - e.g. a one-task-per-array-job GPU
+        # submission (batch_size=1, the natural shape when each task
+        # needs its own GPU - the common case for GAT_biological_prior_
+        # knowledge) paired with N_CPU_WORKERS sized for a many-task batch
+        # silently divides this run's ENTIRE CPU allocation down to
+        # N_JOBS=PLINK_THREADS=1, starving the CPU-bound LD pruning/RF
+        # filtering that model's own data-driven merge (architecture doc
+        # §12.4) performs over the full marker pool - reported as "LD
+        # filtering and RF filtering take too much time when using a GPU
+        # and a GAT biological prior knowledge model". Capping here
+        # instead redirects that otherwise-wasted worker capacity into
+        # N_JOBS/PLINK_THREADS, matching the policy resource_profiles.py's
+        # own suggest_compute_layout() already documents ("task-level
+        # width is grown FIRST, up to min(total_tasks_per_batch, budget)
+        # ... only once every task in the batch already has its own
+        # concurrent worker does any REMAINING CPU budget get spent on
+        # n_jobs") - that function is unreferenced dead code (see its own
+        # docstring), so this is the one place that policy actually needs
+        # enforcing. Only applies for an array export, where batch_size is
+        # a real per-batch task count (see the `if include_array:` block
+        # immediately above); a Sequential export has no such number here.
+        if include_array:
+            _export_batch_size = max(1, int(export_cfg['PARALLEL'].get('batch_size', 1) or 1))
+            _export_n_cpu_workers = max(1, min(_export_n_cpu_workers, _export_batch_size))
+        _export_use_gpu = bool(st.session_state.get(f'{kp}_hpc_use_gpu', False))
+        _export_gpus_per_task = int(st.session_state.get(f'{kp}_hpc_gpus_per_task', 1))
+        export_cfg['N_CPU_WORKERS'] = _export_n_cpu_workers
+        export_cfg['N_JOBS'] = max(1, _export_cpus_per_task // _export_n_cpu_workers)
+        export_cfg['N_GPU_SLOTS'] = _export_gpus_per_task if _export_use_gpu else 0
+        # Bugfix (companion to the N_JOBS fix immediately above): PLINK_THREADS
+        # was never written into the exported config at all, so it silently
+        # stayed at resolve_compute_resources()'s own default of 1 no matter
+        # how many CPUs were reserved above - meaning every plink2 subprocess
+        # call inside LD pruning fell back to plink2's own hardware
+        # auto-detection (not cgroup-aware) instead of the actual per-job
+        # allocation. Most consequential for GPU jobs, which typically
+        # request far fewer CPUs than a CPU-only job of the same size: plink2
+        # would still try to use threads sized to the whole node, causing
+        # severe oversubscription/thrashing rather than the intended
+        # single-task allocation. Kept in sync with N_JOBS (same
+        # CPUs-per-task / worker-count division), same as every other
+        # 'Pipeline compute settings' key on this page.
+        export_cfg['PLINK_THREADS'] = max(1, _export_cpus_per_task // _export_n_cpu_workers)
+
+        # Update ID 2 (R1/R2, blueprint T12/T20): the model-level-
+        # parallelism counterpart of the N_CPU_WORKERS/N_JOBS/N_GPU_SLOTS
+        # block just above - written the SAME way, for the SAME
+        # documented reason (existing code behaviour over a literal
+        # reading of the blueprint - Phase2_Coding_2.md §1): gather_config()
+        # itself does not set any compute-settings key, so these are
+        # written here, right before the file is saved, from the SAME
+        # session_state value the 'Model-level workers (N_MODEL_WORKERS)'
+        # widget uses (now inside `_render_advanced_setting_components()`
+        # - ver4-4, R2), mirroring N_CPU_WORKERS/N_JOBS/N_GPU_SLOTS exactly.
+        # N_JOBS above is intentionally divided by N_CPU_WORKERS only, NOT
+        # also by N_MODEL_WORKERS here - the second division happens at
+        # RUN TIME instead (run_step1_batch.py's own orchestration-level
+        # call to pipeline_utils.resolve_compute_resources()), so a
+        # config with N_MODEL_WORKERS left at its default (1) writes an
+        # N_JOBS byte-identical to a config saved before this feature
+        # existed (A1.5/A2.2).
+        # ver4-4, R2: the widget itself now always renders with
+        # value=1 and is never auto-filled by any suggestion (the
+        # opt-in checkbox that used to gate whether this widget was
+        # even visible is gone - see _render_resource_advisor_panel())
+        # - so a session that never opens 'Advanced setting components' at
+        # all still exports EXACTLY N_MODEL_WORKERS=1, and reading the
+        # widget's own session_state (falling back to 1 if the expander
+        # was never opened this session) is now sufficient on its own.
+        _export_n_model_workers = int(st.session_state.get(f'{kp}_n_model_workers', 1) or 1)
+        export_cfg['N_CPU_WORKERS_TASK'] = _export_n_cpu_workers
+        export_cfg['N_MODEL_WORKERS'] = _export_n_model_workers
+        export_cfg['MODEL_GROUPING'] = st.session_state.get(f'{kp}_model_grouping', 'cost_balanced')
+        export_cfg['BIO_PRIOR_GROUPING'] = st.session_state.get(f'{kp}_bio_prior_grouping', 'affinity')
+        export_cfg['MIN_MODELS_FOR_PARALLEL'] = int(st.session_state.get(f'{kp}_min_models_for_parallel', 2) or 2)
+        export_cfg['GPU_SLOTS_PER_DEVICE'] = 1
 
         with open(config_path, 'w', encoding='utf-8') as f:
             json.dump(export_cfg, f, indent=2)
 
         scheduler = st.session_state.get(f'{kp}_hpc_scheduler', 'Slurm')
         is_pbs_family = scheduler in ('PBS', 'NCI')
-        uses_nci_parallel = (scheduler == 'NCI' and include_array)
+        uses_gadi_array = (scheduler == 'NCI' and include_array)
         job_name = st.session_state.get(f'{kp}_hpc_job_name', '').strip() or default_job_name
         nodes = int(st.session_state.get(f'{kp}_hpc_nodes', 1))
         ntasks_per_node = int(st.session_state.get(f'{kp}_hpc_ntasks_per_node', 1))
@@ -2239,89 +4650,201 @@ def render_hpc_export_section(export_mode, export_step, purpose, headless_script
         extra_lines = st.session_state.get(f'{kp}_hpc_extra_lines', '').strip()
         extra_block = (extra_lines + '\n') if extra_lines else ''
 
+        # GPU request, read the same way as every other resource field
+        # above. gpu_type only ever affects Slurm's --gres syntax; PBS/NCI
+        # request a bare GPU count via -l ngpus= (see this function's
+        # docstring for why a type isn't requested there).
+        use_gpu = bool(st.session_state.get(f'{kp}_hpc_use_gpu', False))
+        gpus_per_task = int(st.session_state.get(f'{kp}_hpc_gpus_per_task', 1))
+        gpu_type = st.session_state.get(f'{kp}_hpc_gpu_type', '').strip()
+        # Patch 3 v2, Requirement 3: Slurm-only QoS (`--qos=...`) - see the
+        # widget's own help text above for why (Bunya-style GPU QoS gating).
+        # Read regardless of scheduler (mirrors every other field's
+        # read-unconditionally-then-branch-on-scheduler pattern below);
+        # only ever emitted into the Slurm script text, and only when
+        # non-blank.
+        qos = st.session_state.get(f'{kp}_hpc_qos', '').strip()
+
         shebang = '#!/bin/bash --login' if login_shell else '#!/bin/bash'
         account_line_slurm = f'#SBATCH --account={account}\n' if account else ''
         project_line_pbs = f'#PBS -P {account}\n' if account else ''
         storage_line_pbs = f'#PBS -l storage={storage}\n' if storage else ''
         rerunnable_line_pbs = f"#PBS -r {'y' if rerunnable else 'n'}\n"
+        if use_gpu:
+            gpu_line_slurm = (f'#SBATCH --gres=gpu:{gpu_type}:{gpus_per_task}\n' if gpu_type
+                               else f'#SBATCH --gres=gpu:{gpus_per_task}\n')
+            gpu_line_pbs = f'#PBS -l ngpus={gpus_per_task}\n'
+        else:
+            gpu_line_slurm = ''
+            gpu_line_pbs = ''
+        # Patch 3 v2, Requirement 3: "If GPU is set to > 0, Slurm should
+        # generate the QoS field" - emitted only when both `use_gpu` and a
+        # non-blank `qos` are set (a person can still clear the field to
+        # omit `--qos` even for a GPU job, e.g. on a cluster where QoS
+        # isn't gated by GPU access at all).
+        qos_line_slurm = f'#SBATCH --qos={qos}\n' if (use_gpu and qos) else ''
 
         if include_array:
             array_start = int(st.session_state.get(f'{kp}_hpc_array_start', 0))
             array_end = int(st.session_state.get(f'{kp}_hpc_array_end', default_max_index))
+            # Optional slot-limit ('%N') on the array directive, so the
+            # scheduler never runs more than N tasks of the array at once -
+            # the fix for having more array tasks than a shared resource
+            # (typically GPUs) can support simultaneously. 0 = no limit.
+            array_throttle = max(0, int(st.session_state.get(f'{kp}_hpc_array_throttle', 0)))
         else:
             array_start = array_end = 0
+            array_throttle = 0
 
         project_dir = os.path.dirname(os.path.abspath(__file__))
+        # Absolute path to the headless script, used (instead of a bare
+        # filename) in every generated script below. Bugfix: the previous
+        # generator invoked `python3 {headless_script}` with no path at
+        # all, relying entirely on the job actually starting with cwd ==
+        # `project_dir` - true only if the scheduler's own submission-
+        # directory variable ($PBS_O_WORKDIR / $SLURM_SUBMIT_DIR) happens
+        # to match it, which is not guaranteed (e.g. `submit_arrays.sh`
+        # run from a different directory than the EasiGP install
+        # directory). Every script generated below now BOTH explicitly
+        # `cd`s into `project_dir` (a literal absolute path baked in at
+        # generation time, not a scheduler-supplied variable) AND invokes
+        # the headless script by its full absolute path, so the job runs
+        # correctly regardless of where/how it was submitted from.
+        headless_script_path = os.path.join(project_dir, headless_script)
         generated_paths = []  # every file written below, for the final success message
 
-        if uses_nci_parallel:
+        if uses_gadi_array:
             # ---------------------------------------------------------- #
-            # NCI task-farming (Step 1 only): ONE PBS job (no #PBS -J at
-            # all) that farms every batch out internally via nci-parallel,
-            # per NCI's own recommendation for large batch counts - see
-            # https://opus.nci.org.au/spaces/Help/pages/90308851/nci-parallel
+            # Gadi native job-array (Step 1 only, Requirement 1): TWO
+            # files - a per-array PBS template sized for exactly ONE
+            # batch's ncpus/mem, and a submission driver that qsub's it
+            # once per OFFSET, in 'Chunk size'-sized array submissions,
+            # covering the whole array_start..array_end range with
+            # ceil(N/CHUNK_SIZE) separate qsub calls - no nci-parallel,
+            # no per-batch manual qsub.
             # ---------------------------------------------------------- #
-            concurrent = int(st.session_state.get(f'{kp}_hpc_nci_concurrent', 4))
-            numa_cores = int(st.session_state.get(f'{kp}_hpc_nci_numa_cores', 12))
-            timeout_s = int(st.session_state.get(f'{kp}_hpc_nci_timeout', 0))
-            module_version = st.session_state.get(f'{kp}_hpc_nci_module_version', '1.0.0a').strip() or '1.0.0a'
-            use_output_dir = bool(st.session_state.get(f'{kp}_hpc_nci_output_dir', False))
+            chunk_size = int(st.session_state.get(f'{kp}_hpc_gadi_chunk_size', min(100, GADI_MAX_ARRAY_SUBJOBS)))
+            chunk_size = max(1, min(chunk_size, GADI_MAX_ARRAY_SUBJOBS))
+            # Slot-limit applied inside EACH qsub call below is capped at
+            # that call's own chunk size - a PBS array can't usefully be
+            # throttled below its own subjob count, and a limit bigger
+            # than the array is simply a no-op, so capping here keeps the
+            # generated qsub commands sane regardless of what was typed
+            # into the GUI.
+            gadi_throttle = min(array_throttle, chunk_size) if array_throttle > 0 else 0
 
-            total_ncpus = cpus_per_task * concurrent
-            cmds_filename = f'{job_name}_cmds.txt'
-            cmds_path = os.path.join(project_dir, cmds_filename)
-            with open(cmds_path, 'w', encoding='utf-8', newline='\n') as f:
-                for batch_id in range(array_start, array_end + 1):
-                    f.write(f'python3 {headless_script} --config "{config_path}" --batch-id {batch_id}\n')
-            generated_paths.append(cmds_path)
+            pbs_out_pattern = os.path.join(logs_dir, f'{output_base}_^array_index^.output')
+            pbs_err_pattern = os.path.join(logs_dir, f'{error_base}_^array_index^.error')
+            manifest_path = os.path.join(result_dir, 'hpc_submission_manifest.json')
 
-            pbs_out_pattern = os.path.join(logs_dir, f'{output_base}.output')
-            pbs_err_pattern = os.path.join(logs_dir, f'{error_base}.error')
-            nci_output_dir_line = ''
-            output_dir_arg = ''
-            if use_output_dir:
-                nci_task_output_dir = os.path.join(logs_dir, f'{job_name}_nci_parallel_output')
-                nci_output_dir_line = f'mkdir -p "{nci_task_output_dir}"\n'
-                output_dir_arg = f' --output-dir "{nci_task_output_dir}"'
-            timeout_arg = f' --timeout {timeout_s}' if timeout_s > 0 else ''
-
-            script_text = f"""{shebang}
-# EasiGP - {purpose} job (NCI task-farming via nci-parallel)
-#PBS -l ncpus={total_ncpus}
+            pbs_script_filename = f'{job_name}_run_batch_array.pbs'
+            pbs_script_path = os.path.join(project_dir, pbs_script_filename)
+            pbs_script_text = f"""{shebang}
+# EasiGP - {purpose} job (Gadi native job-array batch template)
+#PBS -l ncpus={cpus_per_task}
 #PBS -l mem={mem}
 #PBS -N {job_name}
 #PBS -l walltime={walltime}
 #PBS -q {partition}
 {project_line_pbs}{storage_line_pbs}#PBS -o {pbs_out_pattern}
 #PBS -e {pbs_err_pattern}
-{rerunnable_line_pbs}#PBS -l wd
+{rerunnable_line_pbs}{gpu_line_pbs}#PBS -l wd
 
-# Submit with:  qsub {job_name}.sh
-# Runs all {array_end - array_start + 1} batch(es) ({array_start}..{array_end}) inside this ONE
-# PBS job, {concurrent} at a time, via nci-parallel - see
-# https://opus.nci.org.au/spaces/Help/pages/90308851/nci-parallel . Each
-# batch still writes its own clean per-batch log under
-# {logs_dir} regardless of this job's own
-# (possibly interleaved, if {concurrent} > 1) combined output above.
+# NOT meant to be submitted directly with `qsub {pbs_script_filename}` -
+# submit_arrays.sh (generated alongside this file) submits it repeatedly,
+# once per OFFSET, each call covering up to {chunk_size} batch(es) via
+# `-J 0-<chunk size - 1>{f'%{gadi_throttle}' if gadi_throttle else ''} -v OFFSET=<n>`.
+# ncpus/mem{'/ngpus' if use_gpu else ''} above are sized for exactly ONE
+# batch - every PBS subjob gets its own independent allocation, never
+# shared with any other batch.
+#
+# This subjob's actual EasiGP batch ID is PBS_ARRAY_INDEX + OFFSET.
 
+# Bugfix: `cd` explicitly into the EasiGP install directory (a literal
+# absolute path baked in at generation time), NOT `$PBS_O_WORKDIR` - that
+# variable is set from wherever `qsub`/`submit_arrays.sh` was actually
+# invoked, which need not be this directory. Getting cwd wrong here breaks
+# more than just finding this script: genomic_prediction.py's own R-model
+# sourcing and this run's `Result/` output location are also resolved
+# relative to cwd.
+cd "{project_dir}"
 
-cd "$PBS_O_WORKDIR"
-module load nci-parallel/{module_version}
+ACTUAL_BATCH_ID=$((PBS_ARRAY_INDEX + OFFSET))
+if [ "$ACTUAL_BATCH_ID" -gt {array_end} ]; then
+    echo "EasiGP: ACTUAL_BATCH_ID=$ACTUAL_BATCH_ID exceeds the configured array end index ({array_end}) - this subjob is padding beyond the last real batch; exiting cleanly."
+    exit 0
+fi
 
-export ncores_per_task={cpus_per_task}
-export ncores_per_numanode={numa_cores}
-
-{nci_output_dir_line}{extra_block}mpirun -np $((PBS_NCPUS/ncores_per_task)) --map-by ppr:$((ncores_per_numanode/ncores_per_task)):NUMA:PE=${{ncores_per_task}} nci-parallel --input-file "{cmds_path}"{output_dir_arg}{timeout_arg}
+{extra_block}python3 "{headless_script_path}" --config "{config_path}" --batch-id "$ACTUAL_BATCH_ID"
 """
-            script_filename = f'{job_name}.sh'
-            script_path = os.path.join(project_dir, script_filename)
-            with open(script_path, 'w', encoding='utf-8', newline='\n') as f:
-                f.write(script_text)
+            with open(pbs_script_path, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(pbs_script_text)
             try:
-                os.chmod(script_path, 0o755)
+                os.chmod(pbs_script_path, 0o755)
             except OSError:
                 pass
-            generated_paths.insert(0, script_path)
+            generated_paths.append(pbs_script_path)
+
+            submit_script_filename = f'{job_name}_submit_arrays.sh'
+            submit_script_path = os.path.join(project_dir, submit_script_filename)
+            _gadi_throttle_suffix = f'%{gadi_throttle}' if gadi_throttle else ''
+            _gadi_throttle_comment = (
+                "#\n"
+                f"# Each qsub call below is ALSO explicitly capped at {gadi_throttle} concurrently\n"
+                f"# running subjob(s) (a '{_gadi_throttle_suffix}' slot limit on '-J') - set from this\n"
+                "# section's 'Max concurrently running array tasks' field, most commonly used to\n"
+                "# avoid requesting more GPUs at once than the 'gpuvolta' queue can actually give\n"
+                "# this job.\n"
+            ) if gadi_throttle else ""
+            submit_script_text = f"""#!/bin/bash
+# EasiGP - submission driver for '{job_name}' (Gadi native job-array).
+# Submits batches {array_start}..{array_end} as ceil(N/{chunk_size}) separate
+# small PBS job arrays (chunk size {chunk_size}), each independently
+# resourced ({cpus_per_task} ncpus, {mem} mem{f', {gpus_per_task} gpu(s)' if use_gpu else ''} PER BATCH) via
+# {pbs_script_filename} - no manual qsub editing required. Run this ONCE,
+# from the login node (or wherever `qsub` is available):
+#
+#     bash {submit_script_filename}
+#
+# If `qsub` rejects a chunk as too large, NCI Gadi's current max-subjobs-
+# per-array limit is lower than {chunk_size} - lower 'Chunk size' in the
+# GUI and regenerate. The queue may also throttle how many jobs can be
+# RUNNING at once regardless of how many are submitted - a scheduler-level
+# policy, not something EasiGP controls.
+{_gadi_throttle_comment}
+set -euo pipefail
+
+PBS_SCRIPT="{pbs_script_path}"
+MANIFEST="{manifest_path}"
+
+echo "[" > "$MANIFEST"
+first=1
+for OFFSET in $(seq {array_start} {chunk_size} {array_end}); do
+    END=$((OFFSET + {chunk_size} - 1))
+    if [ "$END" -gt {array_end} ]; then
+        END={array_end}
+    fi
+    SIZE=$((END - OFFSET + 1))
+    JOB_ID=$(qsub -J 0-$((SIZE - 1)){_gadi_throttle_suffix} -v OFFSET=$OFFSET "$PBS_SCRIPT")
+    echo "Submitted batches $OFFSET..$END as array job $JOB_ID"
+    if [ "$first" -eq 0 ]; then
+        echo "," >> "$MANIFEST"
+    fi
+    first=0
+    printf '  {{"offset": %d, "chunk_size": %d, "array_job_id": "%s"}}' "$OFFSET" "$SIZE" "$JOB_ID" >> "$MANIFEST"
+done
+echo "" >> "$MANIFEST"
+echo "]" >> "$MANIFEST"
+echo "Manifest written to $MANIFEST"
+"""
+            with open(submit_script_path, 'w', encoding='utf-8', newline='\n') as f:
+                f.write(submit_script_text)
+            try:
+                os.chmod(submit_script_path, 0o755)
+            except OSError:
+                pass
+            generated_paths.insert(0, submit_script_path)
+            script_text = submit_script_text
 
         else:
             # ---------------------------------------------------------- #
@@ -2330,8 +4853,14 @@ export ncores_per_numanode={numa_cores}
             # runs ordinary PBS Pro for non-farmed jobs too).
             # ---------------------------------------------------------- #
             if include_array:
-                slurm_array_line = f'#SBATCH -a {array_start}-{array_end}\n'
-                pbs_array_line = f'#PBS -J {array_start}-{array_end}\n'
+                # '%N' slot-limit suffix (only appended when a positive
+                # throttle was set) caps how many array tasks run AT ONCE -
+                # e.g. Slurm's own '#SBATCH --array=1-12%4' for 12 tasks
+                # sharing only 4 GPUs. See 'Max concurrently running array
+                # tasks' above / this function's docstring.
+                _throttle_suffix = f'%{array_throttle}' if array_throttle else ''
+                slurm_array_line = f'#SBATCH -a {array_start}-{array_end}{_throttle_suffix}\n'
+                pbs_array_line = f'#PBS -J {array_start}-{array_end}{_throttle_suffix}\n'
                 slurm_out_pattern = os.path.join(logs_dir, f'{output_base}_%A_%a.output')
                 slurm_err_pattern = os.path.join(logs_dir, f'{error_base}_%A_%a.error')
                 pbs_out_pattern = os.path.join(logs_dir, f'{output_base}_^array_index^.output')
@@ -2358,12 +4887,20 @@ export ncores_per_numanode={numa_cores}
 #SBATCH --partition={partition}
 {account_line_slurm}#SBATCH -o {slurm_out_pattern}
 #SBATCH -e {slurm_err_pattern}
-{slurm_array_line}
+{slurm_array_line}{gpu_line_slurm}{qos_line_slurm}
 # Submit with:  sbatch {job_name}.sh
 # Runs {index_note} via {headless_script} - no GUI and no manual
 # configuration is needed beyond this one-time export.
 
-{extra_block}python3 {headless_script} --config "{config_path}"
+# Bugfix: `cd` explicitly into the EasiGP install directory (a literal
+# absolute path baked in at generation time) rather than relying on Slurm's
+# default of starting in $SLURM_SUBMIT_DIR, which is only correct if this
+# script happens to be submitted from that exact directory. Getting cwd
+# wrong here breaks more than just finding this script: genomic_
+# prediction.py's own R-model sourcing and this run's `Result/` output
+# location are also resolved relative to cwd.
+cd "{project_dir}"
+{extra_block}python3 "{headless_script_path}" --config "{config_path}"
 """
             else:
                 # PBS and NCI-non-array: directive set/order matches a real,
@@ -2371,6 +4908,11 @@ export ncores_per_numanode={numa_cores}
                 # ncpus=`/`-l mem=` lines (not `select=nodes:ncpus:mem`),
                 # `-P` for the project code, optional `-l storage=`, and
                 # `-r y/n` for rerunnable.
+                gpu_reminder_pbs = (
+                    "# GPU queue reminder: NCI Gadi requires the gpuvolta queue for GPU jobs,\n"
+                    "# with ncpus a multiple of 12 per GPU requested - verify this matches your\n"
+                    "# 'CPUs per task' setting above.\n"
+                ) if (use_gpu and scheduler == 'NCI') else ''
                 script_text = f"""{shebang}
 # EasiGP - {purpose} job
 #PBS -l ncpus={cpus_per_task}
@@ -2380,15 +4922,21 @@ export ncores_per_numanode={numa_cores}
 #PBS -q {partition}
 {project_line_pbs}{storage_line_pbs}#PBS -o {pbs_out_pattern}
 #PBS -e {pbs_err_pattern}
-{rerunnable_line_pbs}{pbs_array_line}
+{rerunnable_line_pbs}{pbs_array_line}{gpu_line_pbs}
 # Submit with:  qsub {job_name}.sh
 # Runs {index_note} via {headless_script} - no GUI and no manual
 # configuration is needed beyond this one-time export. Note: PBS memory
 # units are typically lowercase (e.g. 10gb); adjust 'Memory' above if needed.
+{gpu_reminder_pbs}
 
-
-cd "$PBS_O_WORKDIR"
-{extra_block}python3 {headless_script} --config "{config_path}"
+# Bugfix: `cd` explicitly into the EasiGP install directory (a literal
+# absolute path baked in at generation time), NOT `$PBS_O_WORKDIR` - that
+# variable is set from wherever `qsub` was actually invoked, which need not
+# be this directory. Getting cwd wrong here breaks more than just finding
+# this script: genomic_prediction.py's own R-model sourcing and this run's
+# `Result/` output location are also resolved relative to cwd.
+cd "{project_dir}"
+{extra_block}python3 "{headless_script_path}" --config "{config_path}"
 """
 
             script_filename = f'{job_name}.sh'
@@ -2412,6 +4960,16 @@ cd "$PBS_O_WORKDIR"
             f"`{project_dir}` (or adjust the paths in the script). Submitting the "
             "saved script runs everything non-interactively - the GUI is only needed "
             "for this one-time configuration step."
+            + (" For a Gadi native job-array, run the `submit_arrays.sh` driver shown above - "
+               "it calls `qsub` for you, once per chunk." if uses_gadi_array else "")
+            + (f" Requesting {gpus_per_task} GPU(s) per task"
+               + (f" (type: {gpu_type})" if gpu_type and scheduler == 'Slurm' else "")
+               + (f" (QoS: {qos})" if qos and scheduler == 'Slurm' else "") + "."
+               if use_gpu else "")
+            + (f" Array tasks are capped at {array_throttle} running concurrently - raise or "
+               "remove this limit above if you have more GPUs (or other shared resources) "
+               "available than that."
+               if include_array and array_throttle else "")
         )
 
     if st.session_state.get(f'{kp}_script_draft'):
@@ -2468,10 +5026,26 @@ cd "$PBS_O_WORKDIR"
             "Or upload any other bash file to get back a copy with Linux-style (LF-only) line "
             "endings - useful for a script generated or edited on Windows some other way."
         )
+        # Requirement 2 (bugfix): st.file_uploader's own session_state
+        # value can never be programmatically restored (Streamlit raises
+        # StreamlitValueAssignmentNotAllowedError if anything tries) - see
+        # _NON_RESTORABLE_WIDGET_KEYS / load_gui_state()'s own comment
+        # near the top of this file for the general fix. This uploader's
+        # key is registered there; here we only show a small
+        # informational hint (the last-used filename, persisted under a
+        # plain, non-widget session_state key) instead of attempting to
+        # restore the upload itself.
+        _upload_key = f'_{kp}_sh_convert_upload'
+        _last_filename_key = f'{_upload_key}_last_filename'
+        _last_filename = st.session_state.get(_last_filename_key)
+        if _last_filename:
+            st.caption(f"Last used: `{_last_filename}` - please re-upload (uploaded files can't "
+                       "be remembered across app launches).")
         _uploaded_sh = st.file_uploader(
-            "Bash file to convert", type=None, key=f'_{kp}_sh_convert_upload'
+            "Bash file to convert", type=None, key=_upload_key
         )
         if _uploaded_sh is not None:
+            st.session_state[_last_filename_key] = _uploaded_sh.name
             _raw_bytes = _uploaded_sh.getvalue()
             try:
                 _sh_text = _raw_bytes.decode('utf-8')
@@ -2752,6 +5326,122 @@ def gather_config(mode, step):
 
     cfg['R_PATH'] = None if st.session_state.get('r_path_none') else st.session_state.get('r_path', '').strip()
 
+    # Patch 3, Requirement 3: read unconditionally (not gated on is_step1/
+    # is_step2/mode) - resolve_compute_resources() consumes this exactly
+    # like N_JOBS/TORCH_DEVICE, regardless of execution mode. Absent-key
+    # default (an older config, or the checkbox never rendered this
+    # session because Tab 2 was never opened) is False - byte-for-byte
+    # today's behaviour (see Preprocess/RF_marker_filtering.py's own
+    # _random_forest_regressor_cls(), which already treats a missing/False
+    # 'use_gpu_sklearn' resource key as "scikit-learn CPU, as before").
+    cfg['USE_GPU_SKLEARN'] = bool(st.session_state.get('use_gpu_sklearn', False))
+
+    # ver4-4 (blueprint §4/§4a) - the sixteen new config keys this update
+    # introduces, written HERE, unconditionally (same pattern as
+    # USE_GPU_SKLEARN just above), regardless of which stage actually
+    # adds the GUI widget/consuming engine code for each one. This is
+    # deliberate: `gather_config()` only needs to be touched ONCE for
+    # the whole update rather than once per later stage, and every
+    # default below already reproduces `ver4-3` behaviour exactly
+    # (I11) - a widget that doesn't exist yet simply means
+    # `st.session_state.get(...)` returns that same default every time,
+    # so nothing observable changes until the stage that adds the
+    # widget (and, separately, the engine code that reads the key)
+    # actually lands. Every widget lives inside `_render_advanced_
+    # setting_components()` (R2's new expander, inside 'HPC job
+    # resource requests') unless noted otherwise below - see blueprint
+    # §4's 'GUI widget' column for the authoritative placement of each.
+    #
+    # R3.b/c (Stage 3) - torch/BLAS threading plumbing.
+    cfg['R_BLAS_THREADS'] = st.session_state.get('r_blas_threads')
+    cfg['R_BLAS_FOLLOWS_N_JOBS'] = bool(st.session_state.get('r_blas_follows_n_jobs', True))
+    cfg['TORCH_NUM_THREADS'] = st.session_state.get('torch_num_threads')
+    cfg['TORCH_DATALOADER_WORKERS'] = int(st.session_state.get('torch_dataloader_workers', 0) or 0)
+    # R4.a (Stage 5) - GPU dispatch/AMP. TORCH_DEVICE's widget will be a
+    # selectbox offering 'auto' (mapped to None here - resolve_compute_
+    # resources() already treats a missing/None TORCH_DEVICE as "auto-
+    # detect"), 'cpu', 'cuda', 'cuda:N'.
+    _torch_device_raw = st.session_state.get('torch_device')
+    cfg['TORCH_DEVICE'] = None if not _torch_device_raw or _torch_device_raw == 'auto' else _torch_device_raw
+    cfg['CUDNN_BENCHMARK'] = bool(st.session_state.get('cudnn_benchmark', True))
+    cfg['USE_AMP'] = bool(st.session_state.get('use_amp', True))
+    cfg['GPU_EVAL_BATCH'] = int(st.session_state.get('gpu_eval_batch', 32) or 32)
+    # R4.g (Stage 5) - GPU LD r^2 kernel. Widget: Tab 2 (Preprocessing),
+    # alongside the other LD-pruning fields - not 'Advanced setting
+    # components' (see blueprint §4's 'GUI widget' column).
+    cfg['GPU_LD_R2'] = bool(st.session_state.get('gpu_ld_r2', True))
+    # R4.h (Stage 5) - GPU kernel precompute for GBLUP/RKHS.
+    cfg['GPU_KERNEL_PRECOMPUTE'] = bool(st.session_state.get('gpu_kernel_precompute', True))
+    # R3.f (Stage 6) - parallel Grid/Random hyperparameter-search trials.
+    # Widget: Tab 3 (Models & Hyperparameters), not 'Advanced setting
+    # components'.
+    cfg['HP_TUNE_PARALLEL_TRIALS'] = bool(st.session_state.get('hp_tune_parallel_trials', True))
+    # ver4-5 R1 (blueprint §3.6) - four further hyperparameter-tuning
+    # settings, same Tab 3 widget group as HP_TUNE_PARALLEL_TRIALS above.
+    cfg['HP_TUNE_BAYES_BATCH'] = bool(st.session_state.get('hp_tune_bayes_batch', True))
+    cfg['HP_TUNE_BAYES_BATCH_MAX'] = int(st.session_state.get('hp_tune_bayes_batch_max', 8))
+    cfg['HP_TUNE_BAYES_LIAR'] = st.session_state.get('hp_tune_bayes_liar', 'max')
+    cfg['HP_TUNE_PARALLEL_RESTARTS'] = bool(st.session_state.get('hp_tune_parallel_restarts', True))
+    # Update ID ver4-6 (blueprint §4 config schema delta) - five further
+    # hyperparameter-tuning settings (R1/R3/R4) and three weight-
+    # optimisation settings (R5/R6/R7), same Tab 3 / Tab 4 widget groups
+    # as the ver4-5 keys immediately above. Every default matches
+    # pipeline_utils.resolve_compute_resources()'s own documented
+    # default - see that function's docstring for the full rationale of
+    # each; several are DELIBERATE, DISCLOSED non-ver4-5-equivalent
+    # defaults (RK-3/RK-4 in the ver4-6 blueprint's risk register), not
+    # oversights.
+    cfg['HP_TUNE_BAYES_DOMAIN_REDUCTION'] = st.session_state.get('hp_tune_bayes_domain_reduction', 'auto')
+    cfg['HP_TUNE_WARM_START'] = bool(st.session_state.get('hp_tune_warm_start', False))
+    cfg['HP_TUNE_SELECTION_MARGIN'] = float(st.session_state.get('hp_tune_selection_margin', 0.02) or 0.0)
+    cfg['HP_TUNE_VALID_REPEATS'] = int(st.session_state.get('hp_tune_valid_repeats', 1) or 1)
+    cfg['HP_TUNE_SCOPE'] = st.session_state.get('hp_tune_scope', 'per_task')
+    cfg['W_OPT_ANALYTIC_SEED'] = bool(st.session_state.get('w_opt_analytic_seed', False))
+    cfg['W_OPT_VALIDATION_FLOOR'] = bool(st.session_state.get('w_opt_validation_floor', False))
+    cfg['W_OPT_SIMPLEX_SEARCH'] = bool(st.session_state.get('w_opt_simplex_search', True))
+    # Update ID ver4-5, R2 Stage 11 (decision D2, blueprint §4.6): whether
+    # GP() should FAIL FAST (raise, before any task starts) if a selected
+    # Tier 2 model's optional package turns out to be unavailable. Widget:
+    # Tab 3 (Models & Hyperparameters), alongside the other global
+    # tuning-fan-out settings. True (the default) matches the codebase's
+    # own general "log negative states unconditionally, fail fast on
+    # contract violations" principle (architecture doc §17); the GUI
+    # itself already filters unavailable Tier 2 models out of the
+    # selectable checkboxes (see TIER_2_MODELS above), so this key
+    # mainly matters for a saved/hand-edited config that names one
+    # anyway.
+    cfg['MODEL_AVAILABILITY_STRICT'] = bool(st.session_state.get('model_availability_strict', True))
+    # R3.g (Stage 6, highest risk) - Sequential intra-batch routing.
+    # ver4-4 §4a's ONE deliberate "default off" exception among these
+    # sixteen keys: this is a control-flow change with a genuine,
+    # not-yet-verified unknown (the blueprint's own PC-2 pre-check), not
+    # a numerics-only acceleration, so it stays False until that
+    # pre-check is confirmed in a real environment - see the Stage 6
+    # entry in the hand-off note for what's still outstanding.
+    cfg['SEQUENTIAL_INTRA_BATCH'] = bool(st.session_state.get('sequential_intra_batch', False))
+    # R6 (Stage 4) - QTL windowing in the scatter-plot matrix. Widget:
+    # Tab 5 (Visualisation).
+    cfg['QTL_WINDOW'] = float(st.session_state.get('qtl_window', 0.0) or 0.0)
+    cfg['QTL_WINDOW_MODE'] = st.session_state.get('qtl_window_mode') or 'all_in_window'
+    # R7.g/R7.h (Stage 3) - circos/plotting performance. Widgets: Tab 5/6
+    # (Visualisation).
+    cfg['PLOT_EFFECT_FLOAT32'] = bool(st.session_state.get('plot_effect_float32', True))
+    # R7.h (Stage 3) - image quality (DPI) for the three raster plot
+    # outputs, resolved as THREE INDEPENDENT keys - one per plot section
+    # (Tab 5's violin/scatter widgets, Tab 6's circos widget) - rather
+    # than the single shared 'PLOT_DPI' this app used before. A user
+    # publishing a paper figure often wants the circos plot (the primary
+    # deliverable - architecture doc S1) at print resolution while
+    # leaving the quick-look violin/scatter diagnostics at a smaller,
+    # faster-to-save default, so one shared knob forced an unwanted
+    # trade-off between "everything crisp and slow" and "everything fast
+    # and coarse". Each defaults to 300, matching this app's own previous
+    # single-field default, so a config that never touches these widgets
+    # renders identically to before.
+    cfg['METRIC_PLOT_DPI'] = int(st.session_state.get('metric_plot_dpi', 300) or 300)
+    cfg['SCATTER_PLOT_DPI'] = int(st.session_state.get('scatter_plot_dpi', 300) or 300)
+    cfg['CIRCOS_PLOT_DPI'] = int(st.session_state.get('circos_plot_dpi', 300) or 300)
+
     raw_pheno = st.session_state.get('phenotype_targets', '').strip()
     if raw_pheno.lower() == 'all':
         cfg['PHENOTYPE'] = 'all'
@@ -2765,6 +5455,15 @@ def gather_config(mode, step):
     cfg['RESULT_NAME'] = st.session_state.get('result_name', '').strip()
     if not cfg['RESULT_NAME']:
         raise ValueError('Please provide a result folder name.')
+
+    # Update ID ver4-9, R7: set UNCONDITIONALLY (never inside an
+    # is_step1/is_step2 guard) - unlike METRIC_SUMMARY_CREATE/
+    # DPT_SUMMARY_CREATE/WEIGHT_PLOT_* (Tab-5-only, plotting-stage
+    # settings), RESULT_COMPRESSION is consumed by GP() itself (Step 1 AND
+    # Sequential mode both write result files) as well as by assemble()
+    # (Step 2) - every execution mode this GUI can configure needs this
+    # key present. Default 'gzip' matches GP()'s own default.
+    cfg['RESULT_COMPRESSION'] = st.session_state.get('result_compression', 'gzip')
 
     # Everything below this point (model selection, hyperparameters, ratio,
     # genotype/phenotype files) is only gathered when Tab 2 ("Models &
@@ -2978,11 +5677,16 @@ def gather_config(mode, step):
         batch_size = int(st.session_state.get('batch_size', 3))
         cfg['PARALLEL'] = {'batch_id': batch_id, 'batch_size': batch_size}
 
-    # Whether Step 2 should skip re-combining every batch and just reload the
-    # already-assembled combined CSVs from a previous run (see load_assembled()
-    # in assemble.py) - only meaningful for Step 2.
+    # Patch 3, Requirement 1: which of the three explicit Step 2
+    # gather-results options was chosen (see assemble.load_for_step2()'s
+    # own docstring for the full decision table) - only meaningful for
+    # Step 2. cfg['SKIP_ASSEMBLE']/['SKIP_ASSEMBLE_BATCH_FALLBACK'] are
+    # deliberately NOT written by this (current) GUI anymore - ASSEMBLE_MODE
+    # is now authoritative for any config this GUI produces; those two
+    # legacy keys remain meaningful only as load_for_step2()'s own fallback
+    # for a config JSON written by a GUI version that predates this option.
     if is_step2:
-        cfg['SKIP_ASSEMBLE'] = bool(st.session_state.get('step2_skip_assemble', False))
+        cfg['ASSEMBLE_MODE'] = st.session_state.get('step2_assemble_mode', 'assemble')
         # Requirement: optional total batch count, so assemble() can report
         # a batch missing at the very end (beyond the highest batch number
         # actually found on disk), not just gaps between ones that ran.
@@ -3018,6 +5722,30 @@ def gather_config(mode, step):
     # when those tabs are shown, i.e. Sequential mode or Parallel / Step 2.
     if not is_step1:
         cfg['METRIC_PLOT_CREATE'] = bool(st.session_state.get('metric_plot_create', True))
+        # Update ID 3, R3: absent key -> True is the one intentional
+        # behaviour change for old configs (I11) - the artefact is purely
+        # additive (a new workbook) and overwrites nothing that exists
+        # today, so an older step2_config.json/sequential_config.json
+        # simply gains it rather than erroring (blueprint §R3.11).
+        cfg['METRIC_SUMMARY_CREATE'] = bool(st.session_state.get('metric_summary_create', True))
+        # Update ID ver4-9, R5: absent key -> True is the SAME intentional,
+        # purely-additive default METRIC_SUMMARY_CREATE itself set as
+        # precedent (design blueprint SS2.2.7/I11) - this artefact is new
+        # and overwrites nothing that exists today.
+        cfg['DPT_SUMMARY_CREATE'] = bool(st.session_state.get('dpt_summary_create', True))
+        # Update ID ver4-9, R6: unlike METRIC_SUMMARY_CREATE/DPT_SUMMARY_CREATE
+        # above, WEIGHT_PLOT_CREATE's own documented default is False
+        # EVERYWHERE (design blueprint SS2.3.7/I11) - the GUI checkbox
+        # below also defaults unchecked, so an existing config that never
+        # mentions this key and a brand-new run left at its own defaults
+        # behave identically (no new PNG files) until a person actively
+        # opts in, rather than a new plot type appearing unannounced.
+        cfg['WEIGHT_PLOT_CREATE'] = bool(st.session_state.get('weight_plot_create', False))
+        cfg['WEIGHT_PLOT_CONFIG'] = {
+            'font_size': int(st.session_state.get('weight_plot_font', 1)),
+            'fig_size': int(st.session_state.get('weight_plot_fig', 5)),
+        }
+        cfg['WEIGHT_PLOT_DPI'] = int(st.session_state.get('weight_plot_dpi', 300) or 300)
         cfg['SCATTER_CREATE'] = bool(st.session_state.get('scatter_create', True))
         cfg['CIRCOS_CREATE'] = bool(st.session_state.get('circos_create', True))
         qtl = st.session_state.get('qtl_path', '').strip()
@@ -3065,9 +5793,26 @@ def gather_config(mode, step):
             'end': _num_or_default('circos_end', 345),
             'link_alpha_min': _num_or_default('circos_link_alpha_min', 0.15),
             'interaction_top': _num_or_default('circos_topinteraction', 0.01),
+            # Requirement 4: 'percentage' (default, backward-compatible)
+            # or 'count' - see circos_plot._select_top_interactions()'s
+            # own docstring for exactly how each mode is applied.
+            'interaction_top_mode': st.session_state.get('circos_topinteraction_mode') or 'percentage',
+            'interaction_top_count': int(_num_or_default('circos_topinteraction_count', 75)),
             'label_size': _num_or_default('circos_labelsize', 6),
             'scale': _num_or_default('circos_scale', 100),
             'unit': st.session_state.get('circos_unit', 'bp'),
+            # Update ID ver4-6, R2 (blueprint §5.1): unlike every field
+            # above, these six write the NEW, improved values by default
+            # for a config THIS GUI builds - circos_plot.py's own
+            # `circos_config.get(key, <legacy default>)` reads are what
+            # keep an OLDER, already-written config JSON (missing these
+            # keys entirely) rendering exactly as it always has (I11).
+            'ring_label_size': _num_or_default('circos_ring_label_size', 8.0),
+            'ring_label_fit': st.session_state.get('circos_ring_label_fit') or 'shrink_then_truncate',
+            'ring_layout': st.session_state.get('circos_ring_layout') or 'fit',
+            'figsize': st.session_state.get('circos_figsize'),  # None -> pycirclize's own 8.0 default
+            'seam_gap_max': _num_or_default('circos_seam_gap_max', 40.0),
+            'ring_label_max_chars': int(_num_or_default('circos_ring_label_max_chars', 0)),
         }
         if not (0.0 <= cfg['CIRCOS_CONFIG']['link_alpha_min'] <= 1.0):
             raise ValueError(
@@ -3132,22 +5877,43 @@ if mode == 'Parallel':
         ),
     )
     if step == 'Step 2':
-        st.checkbox(
-            'Skip assemble (reuse previously assembled results)',
-            key='step2_skip_assemble',
-            value=False,
+        # Patch 3, Requirement 1: restores the three explicit,
+        # independently-selectable options a single "Skip assemble"
+        # checkbox used to conflate into one binary choice (checked ->
+        # "use pre-assembled files, or fall back to per-batch files if
+        # they don't exist yet" - two genuinely different behaviours
+        # under one label). See assemble.load_for_step2()'s own
+        # docstring for exactly what each option below does.
+        st.radio(
+            'How should results be gathered for plotting?',
+            options=['Assemble into combined files', 'Use existing pre-assembled files',
+                     'Do not assemble (plot directly from batch files)'],
+            key='step2_assemble_mode_label',
             help=(
-                "If Step 2 has already been run successfully once for this result "
-                "name (so Metric.csv, Prediction_result_test.csv, etc. already exist "
-                "in its Result folder) and only the scatter/circos plotting step is "
-                "failing - e.g. because of a QTL file or circos config issue - check "
-                "this to skip re-combining every batch and just reload the "
-                "already-assembled files, then retry the plots. Leave unchecked for "
-                "a normal Step 2 run, or if this is the first time assembling this "
-                "result."
+                "**Assemble into combined files** (the normal choice): merge every batch's "
+                "own output into one combined Metric.csv/Prediction_result_*.csv/etc., then "
+                "plot from those. Overwrites any combined files from a previous assemble.\n\n"
+                "**Use existing pre-assembled files**: skip merging entirely and plot directly "
+                "from the combined files a previous 'Assemble into combined files' run already "
+                "wrote - fails with a clear error if they don't exist yet. Useful when only the "
+                "scatter/circos plotting step needs retrying (e.g. after fixing a QTL file or "
+                "circos config issue) and you don't want to pay the merge cost again.\n\n"
+                "**Do not assemble**: plot directly from each batch's own per-batch files, "
+                "without ever writing (or even looking at) the combined files - even if a "
+                "previous 'Assemble' run already produced them. Never writes anything. Useful "
+                "for a quick look at partial/updated results, or on a very large run where "
+                "writing the combined files themselves isn't needed this time."
             ),
         )
-        if not st.session_state.get('step2_skip_assemble', False):
+        _assemble_mode_by_label = {
+            'Assemble into combined files': 'assemble',
+            'Use existing pre-assembled files': 'use_preassembled',
+            'Do not assemble (plot directly from batch files)': 'no_assemble',
+        }
+        st.session_state['step2_assemble_mode'] = _assemble_mode_by_label[
+            st.session_state.get('step2_assemble_mode_label', 'Assemble into combined files')
+        ]
+        if st.session_state['step2_assemble_mode'] == 'assemble':
             st.number_input(
                 'Expected total number of batches (optional - 0 = unknown)',
                 min_value=0, value=0, step=1, key='step2_expected_batches',
@@ -3237,17 +6003,25 @@ show_tab_plots = (mode == 'Sequential') or (mode == 'Parallel' and step == 'Step
 tab_labels = ['1. Data & Setup']
 tab_keys = ['setup']
 if show_tab_models:
-    tab_labels.append('2. Data preprocessing')
+    tab_labels.append('2. Data Preprocessing')
     tab_keys.append('data_preprocessing')
     tab_labels.append('3. Models & Hyperparameters')
     tab_keys.append('models')
 tab_labels.append('4. Ensemble')
 tab_keys.append('ensemble')
 if show_tab_plots:
-    tab_labels.append('5. Violin & Scatter Plots')
+    tab_labels.append('5. Violin, Bar & Scatter Plots')
     tab_keys.append('scatter')
     tab_labels.append('6. Circos Plot')
     tab_keys.append('circos')
+
+# Requirements.md item 6: a dedicated 'Run pipeline' tab, holding exactly
+# what used to be the standalone 'Run pipeline' section further down this
+# script (now moved inside `with tab_map['run_pipeline']:` - see that
+# block's own comment). Always present, regardless of mode/step (unlike
+# the conditional tabs above), and always LAST in the tab list.
+tab_labels.append('7. Run pipeline')
+tab_keys.append('run_pipeline')
 
 _tabs = st.tabs(tab_labels)
 tab_map = dict(zip(tab_keys, _tabs))
@@ -3328,14 +6102,28 @@ with tab_map['setup']:
     )
     file_status(phenotype_path)
 
-    st.text_input(
-        "Target phenotype(s) - comma separated, or 'all'", value='days2anthesis', key='phenotype_targets',
-        help=("Which trait(s) from the phenotype file to predict. Name one or more columns "
-              "(comma separated) exactly as they appear in that file, or type 'all' to "
-              "predict every trait column found there.")
-    )
+    _render_phenotype_target_selector(phenotype_path)
     st.text_input('Result folder name', value='MaizeNAM', key='result_name',
                   help="A name for this run - results are saved under ./Result/<this name>/.")
+
+    # Update ID ver4-9, R7.
+    st.selectbox(
+        'Result file compression', options=['gzip', 'none'], key='result_compression',
+        format_func=lambda v: {
+            'gzip': "gzip (.csv.gz) - smaller files on disk, the default",
+            'none': "none (.csv) - plain CSV, matches every pre-ver4-9 run",
+        }[v],
+        help=("Six of the ten result files - Prediction_result_{train,valid,test}.csv, "
+              "Marker_effect.csv, Interaction.csv, Attention.csv - are the large, "
+              "per-individual/per-marker/per-pair files that dominate a Result folder's disk "
+              "usage; 'gzip' compresses those six as they're written (transparently readable "
+              "by pandas, and by `zcat`/`gunzip` from the command line). The other four "
+              "(Metric.csv, Weight.csv, hyperparameter.csv, Basic_stats.csv) are always left as "
+              "plain CSV either way - they're already small, and staying plain keeps a quick "
+              "`head`/spreadsheet-double-click workflow available for them. Safe to change "
+              "between a run and its own resume - EasiGP checks for both a file's compressed "
+              "and uncompressed form when reading."),
+    )
 
     st.selectbox(
         'Prediction scenario', options=['within', 'between'], key='scenario', on_change=on_scenario_change,
@@ -3377,63 +6165,13 @@ with tab_map['setup']:
     #else:
     #    st.caption("'between' expects a list of (train, validation, test) tuples, e.g. [(0.8,0.1,0.1)]")
 
-    # ------------------------------------------------------------------- #
-    # Parallel batch configuration - only shown for Parallel / Step 1.
-    # ------------------------------------------------------------------- #
-    if mode == 'Parallel' and step == 'Step 1':
-        st.divider()
-        st.subheader('Parallel batch configuration (PARALLEL)')
-        st.caption(
-            "All prediction scenarios are split into a number of batches. "
-            "Choose how the batch ID should be determined; only 'Manual integer' "
-            "requires you to enter anything - for Slurm/PBS it's assigned "
-            "automatically and never needs to be typed in here."
-        )
-        st.selectbox(
-            'Batch ID source', options=BATCH_ID_SOURCES, key='batch_id_source',
-            help=(
-                "'Manual integer' lets you type the batch ID directly - only used "
-                "for a local single-batch test run below. "
-                "'Slurm' and 'PBS' need no input here: the actual batch ID is "
-                "assigned automatically at run time (SLURM_ARRAY_TASK_ID / "
-                "PBS_ARRAY_INDEX, set per-task by the scheduler itself)."
-            ),
-        )
-        batch_id_source = st.session_state.get('batch_id_source', BATCH_ID_SOURCES[0])
-        if batch_id_source == 'Manual integer':
-            st.number_input('Batch ID', min_value=0, value=0, step=1, key='batch_id_manual',
-                             help="Which batch (0-indexed) this particular run should process.")
-        elif batch_id_source.startswith('Slurm'):
-            st.caption(
-                "No input needed - `run_step1_batch.py` will read `SLURM_ARRAY_TASK_ID` "
-                "automatically on each array task."
-            )
-            env_val = os.environ.get('SLURM_ARRAY_TASK_ID')
-            if env_val is not None:
-                st.caption(f'\u2705 Detected in this environment right now: SLURM_ARRAY_TASK_ID = {env_val}')
-        else:
-            st.caption(
-                "No input needed - `run_step1_batch.py` will read `PBS_ARRAY_INDEX` "
-                "(or `PBS_ARRAYID`) automatically on each array task."
-            )
-            env_val = os.environ.get('PBS_ARRAY_INDEX', os.environ.get('PBS_ARRAYID'))
-            if env_val is not None:
-                st.caption(f'\u2705 Detected in this environment right now: PBS array index = {env_val}')
-
-        st.number_input('Batch size (number of prediction scenarios per batch)',
-                         min_value=1, value=3, step=1, key='batch_size',
-                         help=("How many population/phenotype/ratio/replicate combinations each "
-                               "array-job task processes. Larger batches mean fewer, longer-running "
-                               "tasks; smaller batches mean more, shorter tasks that finish in "
-                               "parallel sooner (if your cluster has the capacity to run them "
-                               "simultaneously)."))
-        st.caption(
-            "\U0001f4a1 This tab is only configured **once**. The batch ID for each "
-            "individual array-job task is *not* set here - it's picked up automatically "
-            "at run time from the scheduler's own environment variable "
-            "(`SLURM_ARRAY_TASK_ID` / `PBS_ARRAY_INDEX`) by `run_step1_batch.py`, a plain "
-            "script with no GUI. See 'Run pipeline' below."
-        )
+    # Patch 3 v3, Requirement 1: 'Parallel batch configuration (PARALLEL)'
+    # used to live here (Tab 1). It has been relocated to right after the
+    # 'Run pipeline' header, further down this script, together with a
+    # new 'Suggested job-array size' panel + 'Update these values' button
+    # shown BEFORE 'Batch ID source' there - "clearly separate the
+    # array-related configuration and other resource-related
+    # configuration." See _render_parallel_batch_configuration() below.
 
 # ------------------------ Tab 2: Data preprocessing ------------------------ #
 if show_tab_models:
@@ -3487,6 +6225,23 @@ if show_tab_models:
             )
             window_unit = st.session_state.get('ld_window_unit', 'kb')
 
+            # Requirement 1 (Additional_requirements.md): apply a pending
+            # Window size/r^2 threshold suggestion BEFORE the 'ld_window'/
+            # 'ld_r2_threshold' number_input widgets below are drawn -
+            # Streamlit forbids writing to a widget's session_state key
+            # after that widget has already been instantiated in the same
+            # run (the same rule every other suggestion/auto-fill in this
+            # file already works around - see _autofill_number_field's
+            # docstring). The flag itself is set by the 'Suggest' button's
+            # on_click callback further down, which only triggers a rerun.
+            if st.session_state.pop('_pending_suggest_ld_window_r2', False):
+                _sugg_window, _sugg_r2, _sugg_note = _ld_suggest_window_and_r2()
+                st.session_state['ld_window'] = _sugg_window
+                st.session_state['ld_r2_threshold'] = _sugg_r2
+                st.session_state['_suggest_msg_ld_window_r2'] = (
+                    'success', f"Applied window={_sugg_window:g}, r\u00b2={_sugg_r2:g} - {_sugg_note}."
+                )
+
             c1, c2, c3 = st.columns(3)
             with c1:
                 st.number_input(
@@ -3504,6 +6259,21 @@ if show_tab_models:
                     help="Unphased hardcall r\u00b2 threshold above which a variant is pruned "
                          "(same meaning as PLINK's --indep-pairwise)."
                 )
+
+            st.button(
+                'Suggest window size / r\u00b2 threshold', key='_btn_suggest_ld_window_r2',
+                on_click=_trigger_suggest_ld_window_r2_cb,
+                help=(
+                    "Suggests a Window size from this dataset's own median marker spacing (needs a "
+                    "valid 'SNP info csv file path' below for 'kb'/'cm', or a .bim file for PLINK "
+                    "input - 'variants' never needs one), and an r\u00b2 threshold based on how many "
+                    "individuals are in the dataset (fewer individuals \u2192 noisier r\u00b2 estimates "
+                    "\u2192 a more lenient threshold is suggested). See the message below once clicked "
+                    "for exactly what each value was based on."
+                    "Can be used when there is no initial candidate values."
+                )
+            )
+            _show_suggest_message('_suggest_msg_ld_window_r2')
 
             st.checkbox(
                 'Also apply minor allele frequency (MAF) filtering',
@@ -3676,6 +6446,29 @@ if show_tab_models:
                           "per-combination numeric .csv 'log' data is affected by this setting.")
                 )
                 with st.expander('Advanced LD decay plot settings'):
+                    # Requirement 2 (Additional_requirements.md): apply a
+                    # pending Max distance/Distance bin width/Max marker
+                    # pairs suggestion BEFORE the number_input widgets
+                    # below are drawn - same "callback sets a flag, the
+                    # flag is applied on the rerun it triggers, before the
+                    # target widgets are (re-)instantiated" pattern as the
+                    # Window size/r^2 threshold suggestion above (see
+                    # _trigger_suggest_ld_window_r2_cb's docstring). The
+                    # two distance-unit-dependent keys are suffixed by
+                    # `window_unit`, exactly like the widgets themselves,
+                    # so a suggestion always lands on the field that's
+                    # actually visible for the currently selected unit.
+                    if st.session_state.pop('_pending_suggest_ld_decay_params', False):
+                        _sugg_maxd, _sugg_binw, _sugg_pairs, _sugg_note = _ld_decay_suggest_params()
+                        st.session_state[f'ld_decay_max_distance_{window_unit}'] = _sugg_maxd
+                        st.session_state[f'ld_decay_bin_width_{window_unit}'] = _sugg_binw
+                        st.session_state['ld_decay_max_pairs_per_chr'] = _sugg_pairs
+                        st.session_state['_suggest_msg_ld_decay_params'] = (
+                            'success',
+                            f"Applied max distance={_sugg_maxd:g}, bin width={_sugg_binw:g}, "
+                            f"max pairs/chromosome={_sugg_pairs:,} - {_sugg_note}."
+                        )
+
                     cu1, cu2 = st.columns(2)
                     with cu1:
                         st.number_input(
@@ -3698,6 +6491,20 @@ if show_tab_models:
                               "chromosome, subsampled randomly if exceeded, to keep this "
                               "diagnostic step fast even on datasets with many markers.")
                     )
+                    st.button(
+                        'Suggest max distance / bin width / max pairs', key='_btn_suggest_ld_decay_params',
+                        on_click=_trigger_suggest_ld_decay_params_cb,
+                        help=(
+                            "Suggests 'Max distance shown' as 10x the configured LD-pruning Window "
+                            "size above (capped to this dataset's longest mapped chromosome span, "
+                            "when a SNP info/.bim source is available), 'Distance bin width' for "
+                            "\u224860 points across that range, and 'Max marker pairs per chromosome' "
+                            "scaled so the total pairs sampled stays roughly constant regardless of "
+                            "how many chromosomes the dataset has. See the message below once "
+                            "clicked for exactly what each value was based on."
+                        )
+                    )
+                    _show_suggest_message('_suggest_msg_ld_decay_params')
 
         st.divider()
         st.subheader('RF Marker Importance Filtering')
@@ -3716,6 +6523,52 @@ if show_tab_models:
                 f"({', '.join(_other_models_selected)}); GAT_biological_prior_knowledge always "
                 "uses the full marker set."
             )
+
+        # Patch 3, Requirement 3: an optional cuML GPU backend for the
+        # Random Forest fit(s) used to SELECT markers (both this
+        # preprocessing step below, and GAT_biological_prior_knowledge's
+        # own data-driven-merge side pipeline, Tab 3 - NOT the SHAP
+        # pairwise-interaction search, which always stays CPU-only
+        # regardless of this setting; see
+        # Preprocess/data_driven_prior_network.py's own comment for why).
+        # This mirrors models/RF.py's already-existing USE_GPU_SKLEARN
+        # switch (Phase 2, Requirement 6) - previously only the model-
+        # fitting RF used it; the marker-SELECTION RF (this checkbox) was
+        # never wired to it at all, so a GPU job never actually benefited
+        # here even when cuML was installed. Auto-suggested ON the moment
+        # any GPU-capable model is selected AND at least one 'Request
+        # GPU(s)' HPC export purpose has been checked this session -
+        # otherwise left at its previous value/default (off), so a
+        # CPU-only run's behaviour is completely unaffected.
+        _any_gpu_requested = any(
+            bool(st.session_state.get(f'{_purpose}_hpc_use_gpu', False))
+            for _purpose in ('step1', 'sequential')
+        )
+        _gpu_sklearn_key = 'use_gpu_sklearn'
+        _gpu_sklearn_autofill_key = f'_{_gpu_sklearn_key}_last_autofill'
+        _current_gpu_sklearn = st.session_state.get(_gpu_sklearn_key)
+        _last_gpu_sklearn_autofill = st.session_state.get(_gpu_sklearn_autofill_key)
+        if _current_gpu_sklearn is None or _current_gpu_sklearn == _last_gpu_sklearn_autofill:
+            if _current_gpu_sklearn != _any_gpu_requested:
+                st.session_state[_gpu_sklearn_key] = _any_gpu_requested
+                st.session_state[_gpu_sklearn_autofill_key] = _any_gpu_requested
+        st.checkbox(
+            'Use GPU-accelerated Random Forest for marker selection when available '
+            '(USE_GPU_SKLEARN, experimental)',
+            key=_gpu_sklearn_key,
+            help="Applies to the Random Forest fit(s) that DECIDE which markers survive "
+                 "filtering - RF-based marker importance filtering below, and "
+                 "GAT_biological_prior_knowledge's own data-driven-merge feature (Tab 3) - via "
+                 "RAPIDS cuML, when a GPU is available and cuML is installed. Never affects the "
+                 "SHAP pairwise-interaction search, which always runs on CPU regardless (SHAP's "
+                 "TreeExplainer requires a scikit-learn-compatible tree, which cuML's GPU forest "
+                 "doesn't provide). If cuML isn't installed, or no GPU is available at run time, "
+                 "this silently falls back to today's scikit-learn CPU behaviour - safe to leave "
+                 "checked even on a CPU-only node. Auto-suggested on when 'Request GPU(s)' is "
+                 "checked elsewhere in this session; untick if you need exact reproducibility "
+                 "with a prior CPU-only run (cuML's forest is not guaranteed bit-identical to "
+                 "scikit-learn's)."
+        )
 
         st.checkbox(
             'Apply RF-based marker importance filtering as a data pre-processing step',
@@ -3763,6 +6616,9 @@ if show_tab_models:
                 )
 
             with st.expander('Advanced Random Forest settings'):
+                # Requirement: pair up logically-related fields on the same
+                # row (rather than stacking unrelated widgets unevenly across
+                # the two columns), and give every field its own helper text.
                 c1, c2 = st.columns(2)
                 with c1:
                     st.number_input(
@@ -3770,26 +6626,47 @@ if show_tab_models:
                         help="More trees give a more stable importance ranking, at the cost of "
                              "longer fitting time."
                     )
+                with c2:
                     st.selectbox(
                         'Max features per split', options=['sqrt', 'log2', 'all'], key='rf_filter_max_features',
                         help="How many markers each tree considers at each split. 'all' "
                              "considers every marker (slower, and more prone to overfitting on "
                              "correlated markers)."
                     )
-                with c2:
-                    st.checkbox('Limit max tree depth', value=False, key='rf_filter_max_depth_enabled')
+
+                c3, c4 = st.columns(2)
+                with c3:
+                    st.checkbox(
+                        'Limit max tree depth', value=False, key='rf_filter_max_depth_enabled',
+                        help="When checked, caps how many splits deep each tree can grow (set "
+                             "with 'Max tree depth' alongside it), which can reduce overfitting "
+                             "and speed up fitting. When left unchecked, trees grow until their "
+                             "leaves are pure, matching scikit-learn's default behaviour."
+                    )
+                with c4:
                     st.number_input(
                         'Max tree depth', min_value=1, value=10, step=1, key='rf_filter_max_depth',
-                        disabled=not st.session_state.get('rf_filter_max_depth_enabled', False)
+                        disabled=not st.session_state.get('rf_filter_max_depth_enabled', False),
+                        help="Maximum number of splits from root to leaf, applied only when "
+                             "'Limit max tree depth' (alongside it) is checked. Smaller values "
+                             "give simpler, faster trees but risk underfitting the importance "
+                             "ranking."
                     )
+
+                c5, c6 = st.columns(2)
+                with c5:
                     st.number_input(
-                        'Min samples per leaf', min_value=1, value=1, step=1, key='rf_filter_min_samples_leaf'
+                        'Min samples per leaf', min_value=1, value=1, step=1, key='rf_filter_min_samples_leaf',
+                        help="Minimum number of training samples required at a leaf node. "
+                             "Higher values smooth the importance ranking by preventing splits "
+                             "that are based on very small, often noisy, groups of samples."
                     )
-                st.number_input(
-                    'Random seed', min_value=0, value=0, step=1, key='rf_filter_random_state',
-                    help="Fixed for reproducibility - the same seed gives the same importance "
-                         "ranking (and hence the same kept markers) for the same data."
-                )
+                with c6:
+                    st.number_input(
+                        'Random seed', min_value=0, value=0, step=1, key='rf_filter_random_state',
+                        help="Fixed for reproducibility - the same seed gives the same importance "
+                             "ranking (and hence the same kept markers) for the same data."
+                    )
 
 def render_other_models_marker_source_widget():
     """The 'other selected models' marker-source choice - rendered as the
@@ -4868,8 +7745,22 @@ if show_tab_models:
         # 'ensemble' itself is chosen on Tab 4 ('4. Ensemble') now, alongside
         # the weighted ensemble methods, rather than here - see Requirement 5.
         _selectable_models = [m for m in AVAILABLE_MODELS if m != 'ensemble']
+        # Update ID ver4-5, R2 Stage 11: Tier 2 models (decision D2) are
+        # filtered OUT of the selectable checkboxes when their optional
+        # package isn't importable in this environment - replaced with an
+        # explanatory caption naming the missing package, rather than a
+        # checkbox that would only fail later (blueprint §4.6 failure-mode
+        # table: "fail fast ... never mid-run after hours of fitting").
         cols = st.columns(3)
         for i, model in enumerate(_selectable_models):
+            if model in TIER_2_MODELS and not is_available(model):
+                with cols[i % 3]:
+                    st.caption(
+                        f"\u26a0\ufe0f **{model}** unavailable - install the optional "
+                        f"'{optional_dependency_for(model)}' package to enable it "
+                        f"(e.g. `pip install {optional_dependency_for(model)}`)."
+                    )
+                continue
             default_checked = model in ('rrBLUP', 'BayesB', 'RF')
             with cols[i % 3]:
                 st.checkbox(model, value=default_checked, key=f'model_selected_{model}',
@@ -4879,15 +7770,158 @@ if show_tab_models:
         for model in AVAILABLE_MODELS:
             if model == 'ensemble':
                 continue
+            if model in TIER_2_MODELS and not is_available(model):
+                continue
             if st.session_state.get(f'model_selected_{model}', False):
                 render_hparam_panel(model)
-                render_hp_tune_panel(model)
                 if model == 'GAT_biological_prior_knowledge':
                     st.caption(
                         "\U0001f4a1 The network JSON / gene location CSV are configured entirely "
                         "on the **'Biological Prior Network'** tab (per phenotype, and/or as "
                         "several independent networks) - there's nothing to set for them here."
                     )
+
+        # ver4-4 R3.f (Stage 6, blueprint §2.3.2/§4 config schema table -
+        # 'Tab 3 → checkbox'): a single, GLOBAL setting (not per-model,
+        # unlike the tuning enable/algorithm checkboxes inside each
+        # render_hparam_panel() above) - applies to every model's own
+        # hyperparameter search, whenever HP_TUNE is enabled for it.
+        #
+        # Each of these five GLOBAL settings only does anything for a
+        # particular subset of search algorithms (see each one's own help
+        # text), so each is now only rendered once at least one currently-
+        # selected model+algorithm combination could actually use it -
+        # rather than always showing all five regardless of which (if any)
+        # tuning algorithms are actually in play. Widgets not currently
+        # rendered simply keep whatever value they last had in
+        # st.session_state (or their spec default on first run), read back
+        # exactly the same way by cfg['HP_TUNE_...'] below - a person never
+        # loses a value by an algorithm choice temporarily hiding its widget.
+        _active_algos = _active_tuning_algorithms()
+        if _active_algos:
+            st.divider()
+            st.checkbox(
+                'Parallelise hyperparameter-search trials (HP_TUNE_PARALLEL_TRIALS)',
+                value=True, key='hp_tune_parallel_trials',
+                help="When a model's own hyperparameter tuning is enabled, evaluate its trial "
+                     "candidates across N_JOBS worker processes instead of one at a time - Grid/"
+                     "Random fan out across candidates directly; Bayesian can additionally use "
+                     "'Batch suggestion' below to fan out several candidates per round; Nelder-"
+                     "Mead/Powell fan out their own independent restarts ('Parallel restarts' "
+                     "below). Safe to leave on: if a particular model's own trial-evaluation "
+                     "function cannot safely cross a process boundary, this falls back to "
+                     "evaluating trials one at a time automatically (with a note in the run log) "
+                     "rather than failing the run - it can only help wall-clock time, never change "
+                     "which hyperparameters are ultimately selected."
+            )
+        if {'Nelder-Mead', 'Powell'} & _active_algos:
+            st.checkbox(
+                'Parallel restarts (HP_TUNE_PARALLEL_RESTARTS)',
+                value=True, key='hp_tune_parallel_restarts',
+                help="When a model's own tuning uses the Nelder-Mead or Powell search algorithm, "
+                     "run its independent multi-start restarts across worker processes instead of "
+                     "one after another. Result-preserving either way (each restart is already "
+                     "fully independent) - this can only affect wall-clock time."
+            )
+        # Requirements.md item 4: every Bayesian-tuning-related GLOBAL
+        # setting - the original batch-search trio (HP_TUNE_BAYES_BATCH/
+        # _BATCH_MAX/_LIAR) AND the further ver4-6 settings that matter for
+        # Bayesian search (HP_TUNE_BAYES_DOMAIN_REDUCTION, HP_TUNE_WARM_
+        # START, HP_TUNE_SELECTION_MARGIN, HP_TUNE_VALID_REPEATS) - now
+        # live together in ONE section, shown only when Bayesian search is
+        # actually selected for at least one model. Previously these were
+        # split across two separate blocks (one already Bayesian-gated,
+        # one shown whenever ANY tuning algorithm was active, Bayesian or
+        # not).
+        #
+        # Requirements.md item 2: 'Tuning scope (HP_TUNE_SCOPE)' used to
+        # render here too - it is now hidden entirely (no widget below),
+        # simply keeping its own spec default forever (HP_TUNE_SCOPE=
+        # 'per_task') via the same st.session_state.get(key, default)
+        # fallback every other never-rendered field in this app already
+        # relies on (see gather_config() below, and HIDDEN_HPARAM_FIELDS's
+        # own docstring for the general pattern this mirrors).
+        # ('Repeated-resample validation draws (HP_TUNE_VALID_REPEATS)'
+        # was hidden the same way in the same update, then unhidden again
+        # and moved into this section per a follow-up request - see the
+        # widget below.)
+        if 'Bayesian' in _active_algos:
+            st.divider()
+            st.markdown('**Bayesian hyperparameter-tuning settings**')
+            st.checkbox(
+                'Batch Bayesian search (HP_TUNE_BAYES_BATCH)',
+                value=True, key='hp_tune_bayes_batch',
+                help="When a model's own tuning uses the Bayesian search algorithm, suggest and "
+                     "evaluate several candidates per round (constant-liar batch mode) instead of "
+                     "one at a time, whenever more than one worker process is available. Turn off "
+                     "to keep Bayesian search strictly one-candidate-at-a-time regardless of "
+                     "N_JOBS."
+            )
+            st.number_input(
+                'Bayesian batch width cap (HP_TUNE_BAYES_BATCH_MAX)',
+                min_value=1, max_value=64, value=8, step=1, key='hp_tune_bayes_batch_max',
+                help="Upper limit on how many candidates a single batch round (above) ever "
+                     "requests at once, even on a very wide node - a very large batch can make "
+                     "each round's own guesses less well-informed by earlier results."
+            )
+            st.selectbox(
+                'Batch liar strategy (HP_TUNE_BAYES_LIAR)',
+                options=['max', 'mean', 'believer'], index=0, key='hp_tune_bayes_liar',
+                help="How a not-yet-evaluated candidate within the same batch round is "
+                     "provisionally scored, so the next candidate in that round isn't just a "
+                     "repeat of it. 'max' (default, recommended) is the standard, cautious choice."
+            )
+            st.selectbox(
+                'Bayesian domain reduction (HP_TUNE_BAYES_DOMAIN_REDUCTION)',
+                options=['auto', 'always', 'never'], index=0, key='hp_tune_bayes_domain_reduction',
+                help="Whether the Bayesian search progressively narrows its search box toward "
+                     "promising regions. 'auto' (new default) enables this only when the "
+                     "model's tunable fields have no drop-down/choice-type dimension (narrowing "
+                     "can permanently exclude some choices after a few noisy early results); "
+                     "'always' restores the previous (pre-ver4-6) unconditional behaviour; "
+                     "'never' disables it outright."
+            )
+            st.checkbox(
+                'Warm-start tuning across replicates (HP_TUNE_WARM_START)',
+                value=False, key='hp_tune_warm_start',
+                help="Off (new default): every tuned (task, model) search starts from your own "
+                     "configured hyperparameters, never a previous replicate's tuned result - this "
+                     "fixes a bug where Sequential and Parallel(HPC) runs of the identical config "
+                     "could silently produce different numbers. On restores the previous "
+                     "(pre-ver4-6) behaviour of carrying a tuned result forward into the next task."
+            )
+            st.number_input(
+                'Tuning selection margin (HP_TUNE_SELECTION_MARGIN)',
+                min_value=0.0, max_value=1.0, value=0.02, step=0.01, format='%.3f',
+                key='hp_tune_selection_margin',
+                help="A tuned search's winning hyperparameters must beat your own configured "
+                     "defaults by at least this much (in objective-score units) or the defaults "
+                     "are kept instead - guards the 'never worse than untuned' guarantee against "
+                     "comparing one noisy default score against the best of many search attempts. "
+                     "0.02 (new default) is a modest margin; 0.0 restores the previous (pre-ver4-6) "
+                     "bare comparison."
+            )
+            st.number_input(
+                'Repeated-resample validation draws (HP_TUNE_VALID_REPEATS)',
+                min_value=1, max_value=10, value=1, step=1, key='hp_tune_valid_repeats',
+                help="When greater than 1, each tuning candidate is scored as the average over "
+                     "this many independent inner train/validation resamples of the CURRENT "
+                     "task's own training data (never touching its real validation/test split), "
+                     "reducing the score's own sampling noise at a proportional cost in extra "
+                     "model fits. 1 (default) reproduces the previous single-score behaviour."
+            )
+        st.divider()
+        st.checkbox(
+            'Fail fast on missing optional model dependencies (MODEL_AVAILABILITY_STRICT)',
+            value=True, key='model_availability_strict',
+            help="If a selected model (e.g. XGBoost, EBM) needs an optional package that isn't "
+                 "installed, stop immediately with an install instruction rather than partway "
+                 "through a run. The checkboxes above already hide unavailable Tier 2 models, so "
+                 "this mainly matters for a saved or hand-edited config. Turning this off lets "
+                 "the run start anyway - the affected model will still fail the first time it's "
+                 "actually dispatched."
+        )
+
 
 # ------------------------------ Tab 4: Ensemble ------------------------------ #
 with tab_map['ensemble']:
@@ -4918,6 +7952,30 @@ with tab_map['ensemble']:
         with cols[i]:
             st.checkbox(method, value=False, key=f'wopt_selected_{method}',
                         help=W_OPT_METHOD_DESCRIPTIONS.get(method))
+
+    # Update ID ver4-6 (blueprint §4/§10 Stage 6-8) - GLOBAL
+    # weight-optimisation setting, shared by every method above (not a
+    # per-method HYPERPARAMETERS_OPT field - see pipeline_utils.
+    # resolve_compute_resources()'s own docstring). Only rendered once at
+    # least one weighted method is actually selected. Two siblings
+    # (W_OPT_ANALYTIC_SEED, W_OPT_VALIDATION_FLOOR) used to render here
+    # too - both are now hidden (Requirements.md items 5 & 6; see
+    # gather_config()'s own now-False fallback defaults for each).
+    if any(st.session_state.get(f'wopt_selected_{m}', False) for m in W_OPT_METHODS):
+        st.divider()
+        st.checkbox(
+            'Search the weight simplex directly (W_OPT_SIMPLEX_SEARCH)',
+            value=True, key='w_opt_simplex_search',
+            help="Nelder Mead and Bayesian optimisation both search directly over valid weight "
+                 "combinations (non-negative, summing to 1) instead of an unconstrained box - "
+                 "more efficient, since the unconstrained box has an entire dimension that "
+                 "cannot affect the result (only the RATIO between weights ever matters). "
+                 "'Minimum/Maximum boundary' on each method's own settings below become a "
+                 "post-search clip on the resulting shares rather than literal per-weight "
+                 "bounds. On by default (new default); off restores the previous (pre-ver4-6) "
+                 "unconstrained box search, where negative weights are reachable if 'Minimum "
+                 "boundary' is set below 0."
+        )
 
     st.divider()
     for method in W_OPT_METHODS:
@@ -4970,30 +8028,192 @@ if show_tab_plots:
                          help="Text size used for labels in the violin plots (passed to seaborn's font_scale).")
         st.number_input('Figure size', min_value=1, value=5, step=1, key='metric_fig',
                          help="Height of each panel in the violin plots, in inches.")
+        # R7.h (Stage 3) - per-section image quality. Own field, independent
+        # of the scatter-plot-matrix and circos DPI fields below/on Tab 6 -
+        # see gather_config()'s cfg['METRIC_PLOT_DPI'] comment for why these
+        # are three separate knobs rather than one shared one.
+        st.number_input(
+            'Plot quality (DPI)', min_value=72, max_value=1200,
+            value=int(st.session_state.get('metric_plot_dpi', 300) or 300), step=50,
+            key='metric_plot_dpi',
+            help=("Resolution, in dots per inch, used when saving the violin plot PNGs "
+                  "(Pearson correlation.png, MSE.png, and their '_total' variants). Higher "
+                  "values give crisper images for print/publication at the cost of larger "
+                  "files and slower saving. 300 is a reasonable default; 600+ is print "
+                  "quality. Only affects this section's own plots.")
+        )
+
+        # Update ID 3, R3: writes Result/<n>/Metric_summary.xlsx (or, on an
+        # openpyxl-free interpreter, three named CSVs) - median/mean
+        # Pearson correlation and MSE at three levels of aggregation. Not
+        # gated behind the violin plots' own condition - this is its own,
+        # independent artefact.
+        st.checkbox('Create the metric summary workbook (Metric_summary.xlsx)', value=True,
+                    key='metric_summary_create',
+                    help=("Writes a workbook whose first sheet ('summary') is a wide table - one "
+                          "block for Pearson correlation, one for MSE - with phenotype as rows and "
+                          "model as columns, in the SAME order as the violin plots. Three further "
+                          "sheets give a median/mean breakdown by phenotype, by "
+                          "phenotype+population, and by phenotype+population+ratio. Degrades to "
+                          "CSV files (the pivot table as Metric_summary.csv, plus three more) if "
+                          "openpyxl isn't installed in this environment (e.g. a stock Linux "
+                          "install)."))
+
+        st.divider()
+
+        # Requirement: the Diversity Prediction Theorem-related components
+        # (the DPT summary checkbox, the ensemble weight plot checkbox, and
+        # that weight plot's own font/figure-size/DPI fields) now live in
+        # their own independent section, placed after the violin plots
+        # section rather than appended to the end of it.
+        st.subheader('Diversity Prediction Theorem')
+
+        # Update ID ver4-9, R5: writes
+        # Result/<n>/Diversity_prediction_theorem.xlsx - the four Diversity
+        # Prediction Theorem quantities (Page 2018) for
+        # every ensemble selected, naive ensemble included as a first-class
+        # row. Not gated behind the violin plots' own condition, same as
+        # the metric summary checkbox in that section.
+        st.checkbox('Create the Diversity Prediction Theorem summary (Diversity_prediction_theorem.xlsx)',
+                    value=True, key='dpt_summary_create',
+                    help=("Writes a workbook reporting the four Diversity Prediction Theorem terms "
+                          "(Page 2018) for every ensemble method "
+                          "selected - the naive (equal-weight) ensemble is reported as a first-class "
+                          "row, not a special case. Computed entirely from Prediction_result_test.csv "
+                          "and Weight.csv; requires at least one ensemble method (naive and/or "
+                          "weighted) with 2 or more contributing models to produce any output. "
+                          "Degrades to CSV files if openpyxl isn't installed in this environment."))
+
+        # Update ID ver4-9, R6: writes Result/<n>/Weight.png and
+        # Weight_total.png - stacked bar plots of the mean optimised
+        # ensemble weight each model received. Unchecked by default
+        # EVERYWHERE (gather_config()'s own WEIGHT_PLOT_CREATE comment) -
+        # a new plot type, opt-in rather than appearing unannounced.
+        st.checkbox('Create ensemble weight plots (Weight.png)', value=False, key='weight_plot_create',
+                    help=("Draws a stacked bar chart per population x phenotype - one bar per "
+                          "ensemble method (the naive, equal-weight ensemble, if selected, then "
+                          "every weighted method actually used) - showing the MEAN weight each "
+                          "contributing model received, coloured by model family (conventional "
+                          "models in blue, machine-learning models in green). Requires at least "
+                          "one ensemble method (naive and/or weighted) with 2 or more contributing "
+                          "models to produce any output."))
+        st.number_input('Font size', min_value=1, value=1, step=1, key='weight_plot_font',
+                         help="Text size used for labels in the weight plots (passed to matplotlib's font.size).")
+        st.number_input('Figure size', min_value=1, value=5, step=1, key='weight_plot_fig',
+                         help="Height of each panel in the weight plots, in inches.")
+        st.number_input(
+            'Plot quality (DPI)', min_value=72, max_value=1200,
+            value=int(st.session_state.get('weight_plot_dpi', 300) or 300), step=50,
+            key='weight_plot_dpi',
+            help=("Resolution, in dots per inch, used when saving the weight plot PNGs "
+                  "(Weight.png, Weight_total.png). Higher values give crisper images for "
+                  "print/publication at the cost of larger files and slower saving. 300 is a "
+                  "reasonable default; 600+ is print quality. Only affects this section's own "
+                  "plots.")
+        )
 
         st.divider()
 
         st.subheader('Scatter plot matrix')
         st.checkbox('Create scatter plot matrix?', value=True, key='scatter_create',
                     help=("Draws a grid comparing every pair of selected single models at both predicted phenotype and marker effect levels"))
-        # Requirement 5: hidden for now (not removed - the field is still
-        # read by gather_config() below via st.session_state.get('qtl_path',
-        # '') the same way it always was, so this can be re-enabled later
-        # by simply un-commenting the widget again, with no other code
-        # changes needed. Leaving the widget commented out rather than
-        # deleting it keeps that re-enabling a one-line change.
-        # qtl_path = st.text_input('QTL file path (leave blank for None)', value='', key='qtl_path',
-        #                           help=("Optional: a csv file listing markers already known to be real "
-        #                                 "QTLs, so they can be highlighted separately from other "
-        #                                 "markers in the scatter plots."
-        #                                 "each row represents QTL and contains two columns: "
-        #                                 "phenotype|marker name identified as QTL"))
-        # if qtl_path:
-        #     file_status(qtl_path)
+        # ver4-4 R6: re-enabled (was hidden/commented out in ver4-3 - see
+        # the ver4-4 Design Blueprint S2.6.1 for why: exact marker-NAME
+        # matching, the only mode this widget offered then, essentially
+        # never matches a real genotyped marker to a reported QTL
+        # position, since the two are rarely at the exact same base
+        # pair). R6 fixes the root cause - coordinate-based window
+        # matching, below - rather than only re-exposing the same,
+        # largely-inert, legacy behaviour. The field is still read by
+        # gather_config() below via st.session_state.get('qtl_path', '')
+        # exactly as before; a legacy 2-column QTL file still works
+        # exactly as it always did (see scatter_plot.py's own dual-schema
+        # detection).
+        qtl_path = st.text_input(
+            'QTL file path (leave blank for None)', value='', key='qtl_path',
+            help=("Optional: a csv file listing QTLs, so nearby markers can be highlighted "
+                  "separately from other markers in the scatter plots. Two formats are accepted, "
+                  "auto-detected by column count:\n"
+                  "- Legacy (2 columns): phenotype, marker - exact marker-name match only "
+                  "(ver4-3 behaviour).\n"
+                  "- Coordinate (5+ columns): chromosome, start, end, name, phenotype[, colour] "
+                  "- markers within the window below are flagged, using the marker info file "
+                  "(Tab 6) to map QTL positions to nearby markers by genomic distance."))
+        if qtl_path:
+            file_status(qtl_path)
+            # Requirement (widget-ordering constraint - same pattern as the
+            # LD pruning/LD decay 'Suggest' buttons above; see
+            # _trigger_suggest_ld_window_r2_cb()'s docstring): apply a
+            # pending QTL-window suggestion BEFORE the 'qtl_window'
+            # number_input below is drawn in this same run.
+            if st.session_state.pop('_pending_suggest_qtl_window', False):
+                _qtl_sugg_window, _qtl_sugg_note = _qtl_suggest_window()
+                st.session_state['qtl_window'] = _qtl_sugg_window
+                st.session_state['_suggest_msg_qtl_window'] = (
+                    'success', f"Applied window={_qtl_sugg_window:g} - {_qtl_sugg_note}."
+                )
+
+            st.number_input(
+                "QTL window (coordinate-mode QTL files only; same units as marker_info.csv's "
+                "start/end)",
+                min_value=0.0, value=float(st.session_state.get('qtl_window', 0.0) or 0.0),
+                step=1000.0, key='qtl_window',
+                help=("Every QTL region is widened by this amount on each side before markers "
+                      "are matched to it. 0 matches only markers that genuinely, exactly overlap "
+                      "the QTL region - the same behaviour a legacy 2-column QTL file always has. "
+                      "Has no effect for a legacy 2-column (phenotype, marker) QTL file.")
+            )
+            st.radio(
+                'QTL window mode', options=['all_in_window', 'nearest'],
+                index=['all_in_window', 'nearest'].index(
+                    st.session_state.get('qtl_window_mode') or 'all_in_window'
+                ),
+                key='qtl_window_mode',
+                format_func=lambda v: {
+                    'all_in_window': 'Flag every marker within the window',
+                    'nearest': 'Flag only the single nearest marker',
+                }[v],
+                help=("'Flag every marker within the window' highlights every marker whose "
+                      "position overlaps the (possibly widened) QTL region - useful when several "
+                      "markers plausibly tag the same QTL. 'Flag only the single nearest marker' "
+                      "highlights just the closest one - this still finds a marker even with a "
+                      "window of 0. Has no effect for a legacy 2-column QTL file.")
+            )
+            # Requirements.md item 2: hidden for now (kept in place,
+            # not deleted, so it's a one-line flip to re-enable later -
+            # the pending-suggestion plumbing above (the
+            # '_pending_suggest_qtl_window' check before this
+            # number_input) and _trigger_suggest_qtl_window_cb() are
+            # untouched, they just never get triggered while this is
+            # False).
+            _SHOW_QTL_WINDOW_SUGGEST_BUTTON = False
+            if _SHOW_QTL_WINDOW_SUGGEST_BUTTON:
+                st.button(
+                    'Suggest QTL window', key='_btn_suggest_qtl_window',
+                    on_click=_trigger_suggest_qtl_window_cb,
+                    help=("Prefers the LD-decay distance already computed for this exact "
+                          "RESULT_NAME (Tab 2's LD decay plot - the distance at which averaged r\u00b2 "
+                          "first drops below 0.2), falling back to 25x median marker spacing when no "
+                          "LD decay data exists yet for this RESULT_NAME. See the message below once "
+                          "clicked for exactly which one was used.")
+                )
+                _show_suggest_message('_suggest_msg_qtl_window')
         st.number_input('Font size', min_value=1, value=2, step=1, key='scatter_font',
                          help="Text size used for axis labels in the scatter plot matrix.")
         st.number_input('Figure size', min_value=1, value=30, step=1, key='scatter_fig',
                          help="Overall size of the scatter plot matrix image, in inches.")
+        # R7.h (Stage 3) - per-section image quality, independent of the
+        # violin-plot and circos DPI fields above/on Tab 6.
+        st.number_input(
+            'Plot quality (DPI)', min_value=72, max_value=1200,
+            value=int(st.session_state.get('scatter_plot_dpi', 300) or 300), step=50,
+            key='scatter_plot_dpi',
+            help=("Resolution, in dots per inch, used when saving the scatter-plot-matrix "
+                  "PNGs (one per phenotype) and their shared legend PNG. Higher values give "
+                  "crisper images for print/publication at the cost of larger files and "
+                  "slower saving. 300 is a reasonable default; 600+ is print quality. Only "
+                  "affects this section's own plots.")
+        )
 
     # ------------------------------ Tab 6: Circos ------------------------------ #
     with tab_map['circos']:
@@ -5049,21 +8269,44 @@ if show_tab_plots:
         # rather than read from any file (Interaction.csv could be large
         # enough to cause real memory/performance problems to read just
         # for this).
-        _ci1, _ci2 = st.columns([3, 1])
-        with _ci1:
-            st.number_input('Top interaction percentage to display', value=0.001, format='%.4f', key='circos_topinteraction',
-                             help=CIRCOS_HELP['interaction_top'])
-        with _ci2:
-            st.write("")
-            st.write("")
-            if st.button('Suggest', key='_btn_suggest_interaction_top', help=(
-                "Asks for your estimate of the final marker count (after pruning), then combines "
-                "that with RF's own interaction-search settings - never reads Interaction.csv (it "
-                "can be too large to read quickly)."
-            )):
-                _render_interaction_top_estimate_form()
-        _show_suggest_message('_suggest_msg_interaction_top')
-        st.caption("Lower this if the plot looks too cluttered with links; raise it to surface more interactions.")
+        # Requirement 4 (Requirements.md item 4): choose whether the
+        # strongest interactions to draw as links are selected by a
+        # percentage of candidate marker pairs (the original behaviour,
+        # still the default - every config that predates this feature has
+        # no 'circos_topinteraction_mode' key at all, and gather_config()
+        # below defaults it to 'percentage', reproducing exactly today's
+        # behaviour) or by a fixed absolute number (M) of the strongest
+        # pairs instead.
+        st.radio(
+            'Select top interactions by', options=['percentage', 'count'],
+            index=['percentage', 'count'].index(st.session_state.get('circos_topinteraction_mode') or 'percentage'),
+            key='circos_topinteraction_mode', horizontal=True,
+            format_func=lambda v: {'percentage': 'Percentage', 'count': 'Number (M)'}[v],
+            help=("'Percentage' keeps the top N% strongest marker-pair interactions (the "
+                  "original behaviour). 'Number (M)' instead keeps exactly the M strongest "
+                  "interactions, regardless of how many candidate pairs exist.")
+        )
+        if st.session_state.get('circos_topinteraction_mode', 'percentage') == 'percentage':
+            _ci1, _ci2 = st.columns([3, 1])
+            with _ci1:
+                st.number_input('Top interaction percentage to display', value=0.001, format='%.4f', key='circos_topinteraction',
+                                 help=CIRCOS_HELP['interaction_top'])
+            with _ci2:
+                st.write("")
+                st.write("")
+                if st.button('Suggest', key='_btn_suggest_interaction_top', help=(
+                    "Asks for your estimate of the final marker count (after pruning), then combines "
+                    "that with RF's own interaction-search settings - never reads Interaction.csv (it "
+                    "can be too large to read quickly)."
+                )):
+                    _render_interaction_top_estimate_form()
+            _show_suggest_message('_suggest_msg_interaction_top')
+            st.caption("Lower this if the plot looks too cluttered with links; raise it to surface more interactions.")
+        else:
+            st.number_input(
+                'Top number of interactions to display (M)', min_value=1, value=75, step=1,
+                key='circos_topinteraction_count', help=CIRCOS_HELP['interaction_top_count'])
+            st.caption("Keeps exactly this many of the strongest marker-pair interactions (fewer if fewer exist).")
 
         # Requirement 5: 'Space between rings', 'Start angle', 'End
         # angle' auto-fill from a chromosome count (cheap, no genotype/
@@ -5106,6 +8349,16 @@ if show_tab_plots:
         st.caption("Auto-filled from the number of chromosomes once a 'Chromosome info file' is set "
                    "above; type your own value to override. 6-8 is usually readable.")
 
+        # Update ID ver4-6, R2 (blueprint §5.1): separate from the
+        # chromosome-name 'Label font size' above - this is the font size
+        # for the labels drawn ON each ring itself (model names/gene
+        # sources), which is what R2 actually fixes overlap for.
+        _autofill_number_field('circos_ring_label_size', _circos_suggest_ring_label_size)
+        st.number_input('Ring label font size', value=None, key='circos_ring_label_size', placeholder='auto',
+                         help=CIRCOS_HELP['ring_label_size'])
+        st.caption("Auto-filled once at least one model is selected; type your own value to override. "
+                   "8pt is this tool's traditional default.")
+
         st.selectbox(
             'Chromosome coordinate unit', options=['bp', 'cM'], index=0, key='circos_unit',
             help="What the chromosome/marker/gene position numbers in your input files are measured "
@@ -5142,6 +8395,24 @@ if show_tab_plots:
                    "visualisation - a larger value may not represent the true location of each "
                    "marker.")
 
+        # R7.h (Stage 3) - per-section image quality, independent of the
+        # violin-plot and scatter-plot-matrix DPI fields on Tab 5 (see
+        # gather_config()'s cfg['CIRCOS_PLOT_DPI'] comment). Circos is the
+        # primary deliverable (architecture doc S1), so kept in the main,
+        # always-visible area rather than tucked inside 'Advanced settings'
+        # below.
+        st.number_input(
+            'Plot quality (DPI)', min_value=72, max_value=1200,
+            value=int(st.session_state.get('circos_plot_dpi', 300) or 300), step=50,
+            key='circos_plot_dpi',
+            help=("Resolution, in dots per inch, used when saving every circos plot PNG "
+                  "(the marker-effect rings, each interaction/attention overlay, and their "
+                  "separate legend PNGs). Higher values give crisper images for print/"
+                  "publication at the cost of larger files and slower saving. 300 is a "
+                  "reasonable default; 600+ is print quality. Only affects this section's "
+                  "own plots.")
+        )
+
         with st.expander('Advanced settings'):
             _autofill_number_field('end_adjust', _circos_suggest_end_adjust)
             st.number_input('Edge location adjustment (END_ADJUST)', value=None, key='end_adjust', placeholder='auto',
@@ -5155,6 +8426,49 @@ if show_tab_plots:
             st.selectbox('Marker effect ordering (ASCENDING)', options=['True', 'False', 'None'], index=2, key='ascending',
                          help=CIRCOS_HELP['ascending'])
             st.caption("Leave as 'None' unless you specifically want overlapping marker regions resolved by effect strength.")
+
+            # Update ID ver4-6, R2 (blueprint §5.1, §3.4 S4): five further
+            # advanced fields, all read via `circos_config.get(key,
+            # <legacy default>)` in circos_plot.py, so leaving every one
+            # of these untouched reproduces a pre-ver4-6 render exactly
+            # (I11, AC2.5).
+            st.markdown('**Ring label sizing** (fixes ring labels overlapping each other on plots with many models/gene sources)')
+            st.selectbox(
+                'Ring label fit', options=['off', 'shrink', 'shrink_then_truncate'],
+                index=0, key='circos_ring_label_fit', help=CIRCOS_HELP['ring_label_fit'],
+            )
+            st.caption("'off' matches every version of this tool before this option existed. "
+                       "'shrink_then_truncate' (recommended) is what actually guarantees no ring "
+                       "label ever overlaps another, however many rings are drawn.")
+
+            st.selectbox(
+                'Ring layout', options=['legacy', 'fit'], index=1, key='circos_ring_layout',
+                help=CIRCOS_HELP['ring_layout'],
+            )
+            st.caption("'legacy' matches this tool's traditional ring stacking, but runs out of room "
+                       "beyond ~33 rings. Switch to 'fit' for a many-model/many-gene-source comparison.")
+
+            st.number_input(
+                'Figure size (inches)', value=None, min_value=4.0, max_value=40.0, step=0.5,
+                key='circos_figsize', placeholder='auto (8.0)', help=CIRCOS_HELP['figsize'],
+            )
+            st.caption("Leave blank for this tool's traditional 8-inch figure. A larger figure gives "
+                       "ring/tick labels more physical room to be readable.")
+
+            st.number_input(
+                'Maximum auto-suggested seam gap (degrees)', value=None, min_value=8.0, max_value=180.0,
+                step=1.0, key='circos_seam_gap_max', placeholder='auto (40.0)', help=CIRCOS_HELP['seam_gap_max'],
+            )
+            st.caption("Caps how wide 'Start angle'/'End angle' above will be auto-suggested, however "
+                       "large a ring label would otherwise need. A label that still doesn't fit within "
+                       "this cap is shrunk/truncated at render time instead (see 'Ring label fit' above).")
+
+            st.number_input(
+                'Ring label maximum characters (0 = no limit)', value=0, min_value=0, step=1,
+                key='circos_ring_label_max_chars', help=CIRCOS_HELP['ring_label_max_chars'],
+            )
+            st.caption("Rarely needed; the 'Ring label fit' setting above already keeps labels from "
+                       "overlapping without a fixed character limit.")
 
         st.divider()
 
@@ -5252,550 +8566,1009 @@ if show_tab_plots:
                     st.error('Please enter a name for the new colour.')
 
 # --------------------------------------------------------------------------- #
-# Run pipeline
+# Run pipeline (Requirements.md item 6: moved into its own tab, below)
 # --------------------------------------------------------------------------- #
+with tab_map['run_pipeline']:
+    # --------------------------------------------------------------------------- #
+    # Run pipeline
+    # --------------------------------------------------------------------------- #
 
-st.divider()
-st.header('Run pipeline')
+    #st.divider()
+    #st.header('Run pipeline')
+    st.subheader('Workflow for this run')
 
-is_step1 = (mode == 'Parallel' and step == 'Step 1')
-is_step2 = (mode == 'Parallel' and step == 'Step 2')
-is_sequential = (mode == 'Sequential')
+    is_step1 = (mode == 'Parallel' and step == 'Step 1')
+    is_step2 = (mode == 'Parallel' and step == 'Step 2')
+    is_sequential = (mode == 'Sequential')
+    purpose = 'step1' if is_step1 else ('step2' if is_step2 else 'sequential')
 
-st.subheader('Option A (recommended for HPC): export config, then submit a job')
-if is_step1:
-    st.caption(
-        "Configure everything above **once**, then click the button below to write the "
-        "config and submission script straight into this project's folder. Each array "
-        "task runs `run_step1_batch.py` directly - a plain script with no Streamlit/GUI - "
-        "and picks up its own batch ID automatically from the scheduler. This is the only "
-        "workflow that scales to thousands of batches."
+    # --------------------------------------------------------------------------- #
+    # Patch 3 v4, Requirement 1: choose the workflow FIRST, right under 'Run
+    # pipeline', so only the relevant configuration below renders - rather
+    # than showing the complete HPC-export machinery (HPC cluster profile,
+    # scheduler, resource requests...) to someone who only wants 'Option B:
+    # run now (local)', and vice versa hiding Option B's own local
+    # 'Batch ID'/'Run now' controls once 'Option A' is chosen.
+    # --------------------------------------------------------------------------- #
+    _RUN_OPTION_LABELS = {
+        'A': 'Option A (recommended for HPC): export config, then submit a job',
+        'B': 'Option B: run now (local)',
+    }
+    st.radio(
+        "Choose from the two options below",
+        options=list(_RUN_OPTION_LABELS.keys()), format_func=lambda k: _RUN_OPTION_LABELS[k],
+        key=f'{purpose}_run_option', horizontal=True,
+        help=("Pick ONE workflow - only its own configuration renders below. 'Option A' only "
+              "writes a config + submission script for your HPC scheduler (Slurm/PBS) - nothing "
+              "runs on this machine. 'Option B' runs the pipeline immediately, right here - "
+              "convenient for a quick local test, but not a substitute for Option A once you "
+              "have a real-sized job."),
     )
-    render_hpc_export_section(mode, step, 'step1', 'run_step1_batch.py', 'step1_config.json', include_array=True)
-elif is_step2:
-    st.caption(
-        "Configure everything above **once**, then click the button below to write the "
-        "config and submission script straight into this project's folder. The job runs "
-        "`run_step2_assemble.py` directly - a plain script with no Streamlit/GUI - which "
-        "assembles all Step 1 batches and produces the metric/scatter/circos plots."
-    )
-    render_hpc_export_section(mode, step, 'step2', 'run_step2_assemble.py', 'step2_config.json', include_array=False)
-else:
-    st.caption(
-        "Configure everything above **once**, then click the button below to write the "
-        "config and submission script straight into this project's folder. The job runs "
-        "`run_sequential.py` directly - a plain script with no Streamlit/GUI - for the "
-        "full single-pass pipeline."
-    )
-    render_hpc_export_section(mode, step, 'sequential', 'run_sequential.py', 'sequential_config.json', include_array=False)
+    use_option_a = (st.session_state.get(f'{purpose}_run_option', 'A') == 'A')
 
-st.divider()
-if is_step1:
-    st.subheader('Option B: run a single batch now (local test only)')
-    st.caption(
-        "Uses the batch ID configured above under 'Parallel batch configuration'. "
-        "Useful for testing one batch interactively before submitting the full array "
-        "job, but not a substitute for Option A when you have many batches."
-    )
-    run_clicked = st.button('Run single batch now (local test)', key='_btn_run_step1_local')
-elif is_step2:
-    st.subheader('Option B: run now (local)')
-    st.caption("Assembles all Step 1 batches and generates the plots on this machine, right now.")
-    run_clicked = st.button('Run assemble + plots now (local)', key='_btn_run_step2_local')
-else:
-    st.subheader('Option B: run now (local)')
-    st.caption("Runs the full pipeline on this machine, right now.")
-    run_clicked = st.button('Run pipeline now (local)', type='primary', key='_btn_run_sequential_local')
+    if use_option_a:
+        # Requirement 1: "the second thing that will be asked should be 'HPC
+        # cluster profile'" - drawn here, immediately after the Option A/B
+        # choice, for every purpose (Sequential/Step 1/Step 2). Everything
+        # else below (Parallel batch configuration's 'Batch ID source', the
+        # 'Suggested compute resources' panel, and render_hpc_export_section()'s
+        # own 'Job scheduler') reads this selection rather than drawing its
+        # own copy.
+        _render_hpc_cluster_profile_selector(purpose)
 
-if run_clicked:
-    try:
-        cfg = gather_config(mode, step)
-    except ValueError as exc:
-        st.error(str(exc))
-    else:
-        result_dir = os.path.abspath(os.path.join('.', 'Result', cfg['RESULT_NAME']))
-        os.makedirs(result_dir, exist_ok=True)
+    # --------------------------------------------------------------------------- #
+    # Parallel batch configuration - only shown for Parallel / Step 1.
+    #
+    # Patch 3 v3, Requirement 1: relocated here, right after 'Run pipeline'
+    # (was previously on Tab 1) - and reordered so the 'Suggested job-array
+    # size' panel + its new 'Update these values' button come BEFORE 'Batch
+    # ID source', "clearly separat[ing] the array-related configuration and
+    # other resource-related configuration" (the CPU/memory/GPU advisor
+    # further down under 'Option A' > 'HPC job resource requests').
+    # --------------------------------------------------------------------------- #
+    if is_step1:
+        st.divider()
+        st.subheader('Parallel batch configuration (PARALLEL)')
+        st.caption(
+            "All prediction scenarios are split into a number of batches. "
+            "Choose how the batch ID should be determined; only 'Manual integer' "
+            "requires you to enter anything - for Slurm/PBS it's assigned "
+            "automatically and never needs to be typed in here."
+        )
 
-        shows_progress = (
-            not (mode == 'Parallel' and step == 'Step 2')
-            and 'progress_callback' in inspect.signature(GP).parameters
-        ) or (mode == 'Parallel' and step == 'Step 2')
-        if shows_progress:
-            progress_bar = st.progress(0)
-            progress_caption = st.empty()
-
-        # GP() (LD pruning + model fitting) and the post-processing plot
-        # phases are tracked on the SAME 0-100% bar, but GP() has no way to
-        # know in advance how many plot phases will follow it - so instead of
-        # extending GP()'s own total after the fact (which caused a visible
-        # backward jump: GP() reports 100% internally, then the total grows
-        # and the percentage drops before climbing again), GP()'s progress is
-        # rescaled into a fixed share of the bar, and the plot phases fill
-        # the remainder. This guarantees the bar only ever moves forward.
-        #   Sequential: GP() = 0-85%, plots fill 85-100%
-        #   Parallel Step 1: GP() = 0-100% (nothing plotted here - see below)
-        #   Parallel Step 2: no GP() call at all; assemble+plots = 0-100%
-        if mode == 'Sequential':
-            gp_phase_weight = 0.85
-        elif mode == 'Parallel' and step == 'Step 1':
-            gp_phase_weight = 1.0
+        if use_option_a:
+            _render_suggested_job_array_size()
+            st.divider()
+            _render_batch_id_source_selector(purpose)
         else:
-            gp_phase_weight = 0.0
+            # Patch 3 v4, Requirement 1: "For Option B, 'Batch ID source'
+            # should always be 'Manual integers'" - a local test run has no
+            # scheduler to read SLURM_ARRAY_TASK_ID/PBS_ARRAY_INDEX from, so
+            # the selectbox isn't even drawn; the value is simply forced. Also
+            # recorded as its own "last autofill" (the same bookkeeping
+            # _apply_autofill_unless_overridden() would set) so that
+            # switching BACK to Option A afterwards resumes the normal
+            # profile/scheduler-matched suggestion in
+            # _render_batch_id_source_selector() rather than leaving 'Manual
+            # integer' stuck as if it had been a deliberate manual choice
+            # made under Option A itself.
+            st.session_state['batch_id_source'] = 'Manual integer'
+            st.session_state['_batch_id_source_last_autofill'] = 'Manual integer'
+            st.caption(
+                "Batch ID source: fixed to **Manual integer** for Option B (local run) - there is "
+                "no scheduler here to assign it automatically."
+            )
+            st.number_input('Batch ID', min_value=0, value=0, step=1, key='batch_id_manual',
+                             help="Which batch (0-indexed) this particular run should process.")
 
-        post_phase_state = {'total_phases': 0, 'completed': 0}
-
-        def _update_progress(completed, total, label=None):
-            if not shows_progress:
-                return
-            gp_fraction = (completed / total) if total else 0
-            overall_fraction = gp_phase_weight * gp_fraction
-            progress_bar.progress(min(max(overall_fraction, 0.0), 1.0))
-            caption = f'{overall_fraction*100:.0f}%'
-            if label:
-                caption += f' - {label}'
-            progress_caption.caption(caption)
-
-        def _set_post_phase_count(n):
-            """Declare (or revise upward) how many post-processing phases
-            will run. Safe to call more than once - e.g. Step 2 doesn't know
-            whether the attention-plot phase applies until after
-            assemble()/load_assembled() returns, so it's called once with
-            the phases known up front, then again with the revised count.
-            Only ever increasing the count avoids any backward jump."""
-            post_phase_state['total_phases'] = max(post_phase_state['total_phases'], n)
-
-        # Tracks when the previous progress report happened (shared with GP()'s
-        # own timing further below via last_report_time), so post-processing
-        # phase announcements also show how long the previous step took.
-        last_report_time = [time.time()]
-
-        def _advance_progress(label):
-            """Tick the bar forward by one post-processing phase (plot
-            generation, assemble/load) that has no internal sub-progress of
-            its own - called once right before each such phase starts."""
-            if not shows_progress:
-                return
-            post_phase_state['completed'] += 1
-            n = max(post_phase_state['total_phases'], post_phase_state['completed'])
-            remaining_weight = 1.0 - gp_phase_weight
-            overall_fraction = gp_phase_weight + remaining_weight * (post_phase_state['completed'] / n)
-            progress_bar.progress(min(max(overall_fraction, 0.0), 1.0))
-            now = time.time()
-            elapsed = now - last_report_time[0]
-            last_report_time[0] = now
-            timestamp = datetime.now().strftime('%H:%M:%S')
-            progress_caption.caption(
-                f'{overall_fraction*100:.0f}% - {label} '
-                f'[{timestamp}, previous step took {elapsed:.1f}s]'
+        st.number_input('Batch size (number of prediction scenarios per batch)',
+                         min_value=1, value=3, step=1, key='batch_size',
+                         help=("How many population/phenotype/ratio/replicate combinations each "
+                               "array-job task processes. Larger batches mean fewer, longer-running "
+                               "tasks; smaller batches mean more, shorter tasks that finish in "
+                               "parallel sooner (if your cluster has the capacity to run them "
+                               "simultaneously)."))
+        if use_option_a:
+            st.caption(
+                "\U0001f4a1 The batch ID for each individual array-job task is *not* set here - "
+                "it's picked up automatically at run time from the scheduler's own environment "
+                "variable (`SLURM_ARRAY_TASK_ID` / `PBS_ARRAY_INDEX`) by `run_step1_batch.py`, a "
+                "plain script with no GUI. See 'Option A' below."
             )
 
-        def _log(message):
-            """Print a phase-completion message. No need to add a timestamp
-            here directly - stdout itself is wrapped in a TimestampedWriter
-            below, which timestamps every line uniformly (including this one)."""
-            print(message)
+    if use_option_a:
+        st.subheader('Option A (recommended for HPC): export config, then submit a job')
+        if is_step1:
+            st.caption(
+                "Configure everything above **once**, then click the button below to write the "
+                "config and submission script straight into this project's folder. Each array "
+                "task runs `run_step1_batch.py` directly - a plain script with no Streamlit/GUI - "
+                "and picks up its own batch ID automatically from the scheduler. This is the only "
+                "workflow that scales to thousands of batches."
+            )
+            render_hpc_export_section(mode, step, 'step1', 'run_step1_batch.py', 'step1_config.json', include_array=True)
+        elif is_step2:
+            st.caption(
+                "Configure everything above **once**, then click the button below to write the "
+                "config and submission script straight into this project's folder. The job runs "
+                "`run_step2_assemble.py` directly - a plain script with no Streamlit/GUI - which "
+                "assembles all Step 1 batches and produces the metric/scatter/circos plots."
+            )
+            render_hpc_export_section(mode, step, 'step2', 'run_step2_assemble.py', 'step2_config.json', include_array=False)
+        else:
+            st.caption(
+                "Configure everything above **once**, then click the button below to write the "
+                "config and submission script straight into this project's folder. The job runs "
+                "`run_sequential.py` directly - a plain script with no Streamlit/GUI - for the "
+                "full single-pass pipeline."
+            )
+            render_hpc_export_section(mode, step, 'sequential', 'run_sequential.py', 'sequential_config.json', include_array=False)
+        run_clicked = False
+    else:
+        st.divider()
+        if is_step1:
+            st.subheader('Option B: run a single batch now (local test only)')
+            st.caption(
+                "Uses the batch ID configured above under 'Parallel batch configuration'. "
+                "Useful for testing one batch interactively before submitting the full array "
+                "job, but not a substitute for Option A when you have many batches."
+            )
+            run_clicked = st.button('Run single batch now (local test)', key='_btn_run_step1_local')
+        elif is_step2:
+            st.subheader('Option B: run now (local)')
+            st.caption("Assembles all Step 1 batches and generates the plots on this machine, right now.")
+            run_clicked = st.button('Run assemble + plots now (local)', key='_btn_run_step2_local')
+        else:
+            st.subheader('Option B: run now (local)')
+            st.caption("Runs the full pipeline on this machine, right now.")
+            run_clicked = st.button('Run pipeline now (local)', type='primary', key='_btn_run_sequential_local')
 
-        # Only pass progress_callback through to GP() if this installation's
-        # genomic_prediction.py actually supports it - avoids
-        # "TypeError: GP() got an unexpected keyword argument 'progress_callback'"
-        # if the two files are ever out of sync.
-        gp_progress_kwargs = (
-            {'progress_callback': _update_progress}
-            if shows_progress and 'progress_callback' in inspect.signature(GP).parameters
-            else {}
-        )
+    if run_clicked:
+        try:
+            cfg = gather_config(mode, step)
+        except ValueError as exc:
+            st.error(str(exc))
+        else:
+            result_dir = result_dir_path(cfg['RESULT_NAME'])
+            os.makedirs(result_dir, exist_ok=True)
 
-        log_buffer = io.StringIO()
-        log_label = (
-            'sequential_local' if mode == 'Sequential'
-            else 'step1_local' if (mode == 'Parallel' and step == 'Step 1')
-            else 'step2_local'
-        )
-        log_file_path = make_run_log_path(cfg['RESULT_NAME'], log_label)
-        # Requirement: surfaced to the user (in addition to the pipeline log
-        # itself) after a Parallel/Step 2 assemble - see the 'missing batch'
-        # st.warning after the try/except below. Initialised here (rather
-        # than only inside the Step 2 branch) so it's always defined even
-        # if the run fails before reaching that branch, or isn't Step 2 at
-        # all.
-        missing_batches = None
-        incomplete_batches = None
-        with st.spinner('Running pipeline... this may take a while.'):
-            try:
-                configure_r_environment(cfg.get('R_PATH'))
-                init_rpy2_conversion()
+            shows_progress = (
+                not (mode == 'Parallel' and step == 'Step 2')
+                and 'progress_callback' in inspect.signature(GP).parameters
+            ) or (mode == 'Parallel' and step == 'Step 2')
+            if shows_progress:
+                progress_bar = st.progress(0)
+                progress_caption = st.empty()
 
-                with open(log_file_path, 'w', encoding='utf-8') as log_file, \
-                     contextlib.redirect_stdout(TimestampedWriter(log_buffer, log_file)):
+            # GP() (LD pruning + model fitting) and the post-processing plot
+            # phases are tracked on the SAME 0-100% bar, but GP() has no way to
+            # know in advance how many plot phases will follow it - so instead of
+            # extending GP()'s own total after the fact (which caused a visible
+            # backward jump: GP() reports 100% internally, then the total grows
+            # and the percentage drops before climbing again), GP()'s progress is
+            # rescaled into a fixed share of the bar, and the plot phases fill
+            # the remainder. This guarantees the bar only ever moves forward.
+            #   Sequential: GP() = 0-85%, plots fill 85-100%
+            #   Parallel Step 1: GP() = 0-100% (nothing plotted here - see below)
+            #   Parallel Step 2: no GP() call at all; assemble+plots = 0-100%
+            if mode == 'Sequential':
+                gp_phase_weight = 0.85
+            elif mode == 'Parallel' and step == 'Step 1':
+                gp_phase_weight = 1.0
+            else:
+                gp_phase_weight = 0.0
 
-                    if mode == 'Sequential':
-                        # ---------------------------------------------- #
-                        # Original, single-pass behaviour.
-                        # ---------------------------------------------- #
-                        (metrics, predicted_result_train, predicted_result_test, effect,
-                         interactions, population, phenotype, attention) = GP(
-                            cfg['GENOTYPE_FILE_NAME'], cfg['PHENOTYPE_FILE_NAME'], cfg['MODEL'],
-                            cfg['PHENOTYPE'], cfg['RATIO'], cfg['ITER_NUM'], cfg['HPARAMETERS'],
-                            cfg['R_PATH'], cfg['W_OPT'], cfg['RESULT_NAME'], cfg['HYPERPARAMETERS_OPT'],
-                            cfg['SCENARIO'], LD_prune=cfg['LD_PRUNE'], RF_filter=cfg['RF_FILTER'],
-                            GENOTYPE_FORMAT=cfg['GENOTYPE_FORMAT'], GENOTYPE_PLINK_PATH=cfg['GENOTYPE_PLINK_PATH'],
-                            OTHER_MODELS_MARKER_SOURCE=cfg['OTHER_MODELS_MARKER_SOURCE'],
-                            HP_TUNE=cfg.get('HP_TUNE'), HP_TUNE_ENSEMBLE_MODE=cfg.get('HP_TUNE_ENSEMBLE_MODE', 'per_method'),
-                            MIN_DATA_POINTS=cfg.get('MIN_DATA_POINTS', 100),
-                            **gp_progress_kwargs
-                        )
-                        _log('Genomic prediction finished.')
+            post_phase_state = {'total_phases': 0, 'completed': 0}
 
-                        # Declare how many plot phases will run so the remaining
-                        # 15% of the bar (85-100%) is divided evenly between them.
-                        has_attention = 'GAT_fully_connected' in cfg['MODEL'] or 'GAT_prior_knowledge' in cfg['MODEL'] or any(m.startswith('GAT_biological_prior_knowledge') for m in cfg['MODEL'])
-                        has_ld_decay = bool(
-                            cfg.get('LD_PRUNE') and cfg['LD_PRUNE'].get('decay_plot')
-                            and cfg['LD_PRUNE']['decay_plot'].get('enabled')
-                        )
-                        _set_post_phase_count(
-                            (1 if has_attention else 0) + (1 if has_ld_decay else 0)
-                            + (1 if cfg['METRIC_PLOT_CREATE'] else 0)
-                            + (1 if cfg['SCATTER_CREATE'] else 0) + (1 if cfg['CIRCOS_CREATE'] else 0)
-                        )
+            def _update_progress(completed, total, label=None):
+                if not shows_progress:
+                    return
+                gp_fraction = (completed / total) if total else 0
+                overall_fraction = gp_phase_weight * gp_fraction
+                progress_bar.progress(min(max(overall_fraction, 0.0), 1.0))
+                caption = f'{overall_fraction*100:.0f}%'
+                if label:
+                    caption += f' - {label}'
+                progress_caption.caption(caption)
 
-                        if has_ld_decay:
-                            _advance_progress('Generating average LD decay plots...')
-                            _t0 = time.time()
-                            _n_ld_decay_plots = average_and_plot_ld_decay(cfg['RESULT_NAME'])
-                            _log(f'{_n_ld_decay_plots} average LD decay plot(s) generated '
-                                 f'(took {time.time() - _t0:.1f}s).')
+            def _set_post_phase_count(n):
+                """Declare (or revise upward) how many post-processing phases
+                will run. Safe to call more than once - e.g. Step 2 doesn't know
+                whether the attention-plot phase applies until after
+                assemble()/load_assembled() returns, so it's called once with
+                the phases known up front, then again with the revised count.
+                Only ever increasing the count avoids any backward jump."""
+                post_phase_state['total_phases'] = max(post_phase_state['total_phases'], n)
 
-                        if has_attention:
-                            _advance_progress('Generating attention distribution plots...')
-                            _t0 = time.time()
-                            attention_distribution(attention, cfg['RESULT_NAME'], 10)
-                            _log(f'Attention distribution plots generated (took {time.time() - _t0:.1f}s).')
+            # Tracks when the previous progress report happened (shared with GP()'s
+            # own timing further below via last_report_time), so post-processing
+            # phase announcements also show how long the previous step took.
+            last_report_time = [time.time()]
 
-                        if cfg['METRIC_PLOT_CREATE']:
+            def _advance_progress(label):
+                """Tick the bar forward by one post-processing phase (plot
+                generation, assemble/load) that has no internal sub-progress of
+                its own - called once right before each such phase starts."""
+                if not shows_progress:
+                    return
+                post_phase_state['completed'] += 1
+                n = max(post_phase_state['total_phases'], post_phase_state['completed'])
+                remaining_weight = 1.0 - gp_phase_weight
+                overall_fraction = gp_phase_weight + remaining_weight * (post_phase_state['completed'] / n)
+                progress_bar.progress(min(max(overall_fraction, 0.0), 1.0))
+                now = time.time()
+                elapsed = now - last_report_time[0]
+                last_report_time[0] = now
+                timestamp = datetime.now().strftime('%H:%M:%S')
+                progress_caption.caption(
+                    f'{overall_fraction*100:.0f}% - {label} '
+                    f'[{timestamp}, previous step took {elapsed:.1f}s]'
+                )
+
+            def _log(message):
+                """Print a phase-completion message. No need to add a timestamp
+                here directly - stdout itself is wrapped in a TimestampedWriter
+                below, which timestamps every line uniformly (including this one)."""
+                print(message)
+
+            # Only pass progress_callback through to GP() if this installation's
+            # genomic_prediction.py actually supports it - avoids
+            # "TypeError: GP() got an unexpected keyword argument 'progress_callback'"
+            # if the two files are ever out of sync.
+            gp_progress_kwargs = (
+                {'progress_callback': _update_progress}
+                if shows_progress and 'progress_callback' in inspect.signature(GP).parameters
+                else {}
+            )
+
+            log_buffer = io.StringIO()
+            log_label = (
+                'sequential_local' if mode == 'Sequential'
+                else 'step1_local' if (mode == 'Parallel' and step == 'Step 1')
+                else 'step2_local'
+            )
+            log_file_path = make_run_log_path(cfg['RESULT_NAME'], log_label)
+            # Requirement: surfaced to the user (in addition to the pipeline log
+            # itself) after a Parallel/Step 2 assemble - see the 'missing batch'
+            # st.warning after the try/except below. Initialised here (rather
+            # than only inside the Step 2 branch) so it's always defined even
+            # if the run fails before reaching that branch, or isn't Step 2 at
+            # all.
+            missing_batches = None
+            incomplete_batches = None
+            with st.spinner('Running pipeline... this may take a while.'):
+                try:
+                    configure_r_environment(cfg.get('R_PATH'), r_max_ppsize=cfg.get('R_MAX_PPSIZE', 500000))
+                    init_rpy2_conversion()
+
+                    with open(log_file_path, 'w', encoding='utf-8') as log_file, \
+                         contextlib.redirect_stdout(TimestampedWriter(log_buffer, log_file)):
+
+                        if mode == 'Sequential':
+                            # ---------------------------------------------- #
+                            # Original, single-pass behaviour.
+                            # ---------------------------------------------- #
+                            (metrics, predicted_result_train, predicted_result_test, effect,
+                             interactions, population, phenotype, attention) = GP(
+                                cfg['GENOTYPE_FILE_NAME'], cfg['PHENOTYPE_FILE_NAME'], cfg['MODEL'],
+                                cfg['PHENOTYPE'], cfg['RATIO'], cfg['ITER_NUM'], cfg['HPARAMETERS'],
+                                cfg['R_PATH'], cfg['W_OPT'], cfg['RESULT_NAME'], cfg['HYPERPARAMETERS_OPT'],
+                                cfg['SCENARIO'], LD_prune=cfg['LD_PRUNE'], RF_filter=cfg['RF_FILTER'],
+                                GENOTYPE_FORMAT=cfg['GENOTYPE_FORMAT'], GENOTYPE_PLINK_PATH=cfg['GENOTYPE_PLINK_PATH'],
+                                OTHER_MODELS_MARKER_SOURCE=cfg['OTHER_MODELS_MARKER_SOURCE'],
+                                HP_TUNE=cfg.get('HP_TUNE'), HP_TUNE_ENSEMBLE_MODE=cfg.get('HP_TUNE_ENSEMBLE_MODE', 'per_method'),
+                                MIN_DATA_POINTS=cfg.get('MIN_DATA_POINTS', 100),
+                                # ver4-4 Stage 5 completion: this in-process
+                                # Sequential-local call site had the SAME
+                                # compute-resource forwarding gap disclosed
+                                # since Stage 3 for run_sequential.py itself
+                                # (see that script's own identical comment) -
+                                # NOT ONE of USE_GPU_SKLEARN/N_JOBS/
+                                # PLINK_THREADS/R_BLAS_THREADS/TORCH_DEVICE/
+                                # CUDNN_BENCHMARK/USE_AMP/N_CPU_WORKERS/
+                                # N_GPU_SLOTS/GPU_SLOTS_PER_DEVICE, nor any of
+                                # Stage 5's own new keys, ever reached GP()
+                                # from a local "Run pipeline" click in the GUI,
+                                # regardless of what gather_config() wrote into
+                                # cfg. Every default below matches GP()'s own
+                                # parameter default exactly (I11).
+                                USE_GPU_SKLEARN=cfg.get('USE_GPU_SKLEARN', False), N_JOBS=cfg.get('N_JOBS', -1),
+                                PLINK_THREADS=cfg.get('PLINK_THREADS', 1), R_BLAS_THREADS=cfg.get('R_BLAS_THREADS'),
+                                TORCH_DEVICE=cfg.get('TORCH_DEVICE'), CUDNN_BENCHMARK=cfg.get('CUDNN_BENCHMARK', True),
+                                USE_AMP=cfg.get('USE_AMP', False), N_CPU_WORKERS=cfg.get('N_CPU_WORKERS', 1),
+                                N_GPU_SLOTS=cfg.get('N_GPU_SLOTS'), GPU_SLOTS_PER_DEVICE=cfg.get('GPU_SLOTS_PER_DEVICE', 1),
+                                R_BLAS_FOLLOWS_N_JOBS=cfg.get('R_BLAS_FOLLOWS_N_JOBS', True),
+                                TORCH_NUM_THREADS=cfg.get('TORCH_NUM_THREADS'),
+                                TORCH_DATALOADER_WORKERS=cfg.get('TORCH_DATALOADER_WORKERS', 0),
+                                GPU_EVAL_BATCH=cfg.get('GPU_EVAL_BATCH', 32),
+                                GPU_LD_R2=cfg.get('GPU_LD_R2', True),
+                                GPU_KERNEL_PRECOMPUTE=cfg.get('GPU_KERNEL_PRECOMPUTE', True),
+                                # ver4-4 Stage 6: same forwarding gap, same fix,
+                                # for this call site's own newest compute-
+                                # resource key - see genomic_prediction.py's own
+                                # HP_TUNE dispatch site for the disclosed caveat
+                                # on what this can currently achieve in
+                                # practice. This block deliberately does NOT
+                                # gain a SEQUENTIAL_INTRA_BATCH route of its own
+                                # - see this update's Change Summary §7 for why
+                                # the GUI's local "Run pipeline" button is left
+                                # as a disclosed, deliberate scope decision
+                                # rather than silently never using intra-batch
+                                # parallelism with no explanation.
+                                HP_TUNE_PARALLEL_TRIALS=cfg.get('HP_TUNE_PARALLEL_TRIALS', True),
+                                # ver4-5 R1 (blueprint §3.6) - same forward-every-new-key
+                                # discipline as the line above, same legacy-preserving defaults.
+                                HP_TUNE_BAYES_BATCH=cfg.get('HP_TUNE_BAYES_BATCH', True),
+                                HP_TUNE_BAYES_BATCH_MAX=cfg.get('HP_TUNE_BAYES_BATCH_MAX', 8),
+                                HP_TUNE_BAYES_LIAR=cfg.get('HP_TUNE_BAYES_LIAR', 'max'),
+                                HP_TUNE_PARALLEL_RESTARTS=cfg.get('HP_TUNE_PARALLEL_RESTARTS', True),
+                                # Update ID ver4-6 (blueprint §4/§10) - eight further keys,
+                                # same forward-every-new-key discipline, same legacy-preserving
+                                # (or, where §4 documents a deliberate default flip, §4's own
+                                # documented new-default) values.
+                                HP_TUNE_BAYES_DOMAIN_REDUCTION=cfg.get('HP_TUNE_BAYES_DOMAIN_REDUCTION', 'auto'),
+                                HP_TUNE_WARM_START=cfg.get('HP_TUNE_WARM_START', False),
+                                HP_TUNE_SELECTION_MARGIN=cfg.get('HP_TUNE_SELECTION_MARGIN', 0.02),
+                                HP_TUNE_VALID_REPEATS=cfg.get('HP_TUNE_VALID_REPEATS', 1),
+                                HP_TUNE_SCOPE=cfg.get('HP_TUNE_SCOPE', 'per_task'),
+                                W_OPT_ANALYTIC_SEED=cfg.get('W_OPT_ANALYTIC_SEED', False),
+                                W_OPT_VALIDATION_FLOOR=cfg.get('W_OPT_VALIDATION_FLOOR', False),
+                                W_OPT_SIMPLEX_SEARCH=cfg.get('W_OPT_SIMPLEX_SEARCH', True),
+                                MODEL_AVAILABILITY_STRICT=cfg.get('MODEL_AVAILABILITY_STRICT', True),
+                                # Update ID ver4-9, R7.
+                                RESULT_COMPRESSION=cfg.get('RESULT_COMPRESSION', 'gzip'),
+                                **gp_progress_kwargs
+                            )
+                            _log('Genomic prediction finished.')
+
+                            # Update ID 3, R3: same position as every other R3
+                            # call site - immediately after the results become
+                            # available, before the first plot.
+                            #
+                            # Requirements.md item 8: model_labels (the SAME
+                            # list metric_plot() below passes as its own
+                            # 'hue_order', below) is computed HERE, before
+                            # write_metric_summary(), and reused there - so
+                            # the metric summary's own model column order is
+                            # always identical to the violin plots' own model
+                            # order, never independently derived.
                             model_labels = cfg['MODEL'] + cfg['W_OPT'] if cfg['W_OPT'] is not None else cfg['MODEL']
-                            _advance_progress('Generating metric plots...')
                             _t0 = time.time()
-                            metric_plot(metrics.copy(), model_labels, cfg['RESULT_NAME'], cfg['SCENARIO'], cfg['METRIC_PLOT_CONFIG'])
-                            _log(f'Metric plots generated (took {time.time() - _t0:.1f}s).')
-
-                        if cfg['SCATTER_CREATE']:
-                            _advance_progress('Generating scatter plot matrix...')
-                            _t0 = time.time()
-                            scatter_plot(cfg['MODEL'], phenotype, predicted_result_test, effect,
-                                         cfg['QTL'], cfg['SCATTER_CONFIG'], cfg['RESULT_NAME'])
-                            _log(f'Scatter plot matrix generated (took {time.time() - _t0:.1f}s).')
-
-                        if cfg['CIRCOS_CREATE']:
-                            _advance_progress('Generating circos plot...')
-                            _t0 = time.time()
-                            _chrom_info_path, _gene_info_path = cfg['CHROMOSOME_INFO'], cfg['GENE_INFO']
-                            # Requirement (diagnostic): logs exactly what
-                            # the broadcast step actually sees/does, so a
-                            # 'gene ring missing for a real population'
-                            # report can be diagnosed directly from the
-                            # person's own log output, rather than
-                            # guessing blind at what their specific
-                            # session/config produced - whether the
-                            # checkbox was actually on, what population
-                            # list it broadcast across, and whether a
-                            # gene info path was even set.
-                            _log(f"[circos] Broadcast checkbox: {cfg.get('CIRCOS_BROADCAST_POPULATION')} | "
-                                 f"population from results: {list(population)} | "
-                                 f"gene info path set: {bool(_gene_info_path)}")
-                            if cfg.get('CIRCOS_BROADCAST_POPULATION'):
-                                # Requirement 8: broadcast BEFORE circos_plot()
-                                # ever sees these paths, so its own internals
-                                # (and every downstream call within it) stay
-                                # completely unaware this ever happened - same
-                                # 'each population + all' target list
-                                # circos_plot() itself always uses internally.
-                                # Requirement (bugfix): normalize each population value to its
-                                # clean string form before it becomes the broadcast
-                                # file's own 'population' column - see
-                                # _clean_population_label()'s own docstring (circos_plot.py)
-                                # for why (a float-promoted 1.0 must broadcast under the SAME
-                                # label '1' that circos_plot()'s own now-normalized loop will
-                                # later look for, not '1.0'). For SCENARIO='between', 'population'
-                                # values are combined train->test labels (e.g.
-                                # 'Historical->2014') - split to the test-population half FIRST,
-                                # matching circos_plot()'s own identical split of its POPULATION
-                                # parameter, so the broadcast file's labels and what
-                                # circos_plot()'s loop later looks for are the SAME clean value
-                                # ('2014'), not one arrow-combined and the other not.
-                                _target_pop_source = population
-                                if cfg['SCENARIO'] == 'between':
-                                    _target_pop_source = [
-                                        p.split('->')[-1] if isinstance(p, str) and '->' in p else p
-                                        for p in population
-                                    ]
-                                _target_pops = [_clean_population_label(p) for p in _target_pop_source] + ['all']
-                                _chrom_info_path = _broadcast_population_info(_chrom_info_path, _target_pops, 'chrom')
-                                if _gene_info_path:
-                                    _gene_info_path = _broadcast_population_info(_gene_info_path, _target_pops, 'gene')
-                                _log(f"[circos] Broadcast target populations: {_target_pops} | "
-                                     f"broadcast chrom file: {_chrom_info_path} | "
-                                     f"broadcast gene file: {_gene_info_path}")
-                            circos_plot(effect, interactions, cfg['MARKER_INFO'], _chrom_info_path,
-                                        _gene_info_path, population, phenotype, cfg['CIRCOS_CONFIG'],
-                                        cfg['END_ADJUST'], cfg['WINDOW'], cfg['CYTOBAND_COLORMAP'],
-                                        cfg['RESULT_NAME'], attention, cfg['SCENARIO'], cfg['ASCENDING'],
-                                        gene_adjust=cfg.get('GENE_ADJUST', 0))
-                            _log(f'Circos plot generated (took {time.time() - _t0:.1f}s).')
-
-                    elif mode == 'Parallel' and step == 'Step 1':
-                        # ---------------------------------------------- #
-                        # Fit the selected models for a single batch of
-                        # prediction scenarios. Nothing gets plotted here -
-                        # that happens once, in Step 2, after all batches
-                        # have completed.
-                        # ---------------------------------------------- #
-                        parallel = dict(cfg['PARALLEL'])
-                        if parallel['batch_id'] is None:
-                            # Slurm/PBS was selected as the batch ID source -
-                            # resolve it now, from this process's own
-                            # environment, only because we're about to run
-                            # a single batch locally for testing. (This is
-                            # never required just to export a config.)
-                            parallel['batch_id'] = resolve_batch_id_from_env()
-
-                        (metrics, predicted_result_train, predicted_result_test, effect,
-                         interactions, population, phenotype, attention) = GP(
-                            cfg['GENOTYPE_FILE_NAME'], cfg['PHENOTYPE_FILE_NAME'], cfg['MODEL'],
-                            cfg['PHENOTYPE'], cfg['RATIO'], cfg['ITER_NUM'], cfg['HPARAMETERS'],
-                            cfg['R_PATH'], cfg['W_OPT'], cfg['RESULT_NAME'], cfg['HYPERPARAMETERS_OPT'],
-                            cfg['SCENARIO'], parallel, LD_prune=cfg['LD_PRUNE'], RF_filter=cfg['RF_FILTER'],
-                            GENOTYPE_FORMAT=cfg['GENOTYPE_FORMAT'], GENOTYPE_PLINK_PATH=cfg['GENOTYPE_PLINK_PATH'],
-                            OTHER_MODELS_MARKER_SOURCE=cfg['OTHER_MODELS_MARKER_SOURCE'],
-                            HP_TUNE=cfg.get('HP_TUNE'), HP_TUNE_ENSEMBLE_MODE=cfg.get('HP_TUNE_ENSEMBLE_MODE', 'per_method'),
-                            MIN_DATA_POINTS=cfg.get('MIN_DATA_POINTS', 100),
-                            **gp_progress_kwargs
-                        )
-                        print(f"Genomic prediction finished for batch_id={parallel['batch_id']} "
-                              f"(batch_size={parallel['batch_size']}).")
-
-                    elif mode == 'Parallel' and step == 'Step 2':
-                        # ---------------------------------------------- #
-                        # Assemble the results from all previously-run
-                        # Step 1 batches (or, if requested, reload a
-                        # previous assembly instead), then generate the
-                        # plots. There's no GP() call here to seed the
-                        # progress bar's total, so it's computed directly:
-                        # one unit for assemble/load, plus one per plot
-                        # phase that will actually run.
-                        # ---------------------------------------------- #
-                        # Declare the phases known up front (assemble/load, metric?,
-                        # scatter?, circos?); attention's applicability isn't known
-                        # until after assemble/load returns, so it's added below.
-                        _set_post_phase_count(
-                            1 + (1 if cfg['METRIC_PLOT_CREATE'] else 0)
-                            + (1 if cfg['SCATTER_CREATE'] else 0) + (1 if cfg['CIRCOS_CREATE'] else 0)
-                        )
-
-                        if cfg['SKIP_ASSEMBLE']:
-                            _advance_progress('Reloading previously assembled results...')
-                            _t0 = time.time()
-                            (metrics, predicted_result_train, predicted_result_test, effect,
-                             interactions, attention, population, phenotype, assembled_model,
-                             missing_batches, incomplete_batches) = load_assembled(
-                                cfg['RESULT_NAME']
+                            _summary_paths = write_metric_summary(
+                                metrics, cfg['RESULT_NAME'], create=cfg.get('METRIC_SUMMARY_CREATE', True),
+                                model_order=model_labels,
                             )
-                            _log(f'Skipped assemble - reloaded previously assembled results for models '
-                                 f'{assembled_model} (took {time.time() - _t0:.1f}s).')
-                        else:
-                            _advance_progress('Assembling results from all batches...')
+                            if _summary_paths:
+                                _log(f"Metric summary written: {', '.join(_summary_paths)} "
+                                     f"(took {time.time() - _t0:.1f}s).")
+
+                            # Update ID ver4-9, R5: same position as the metric
+                            # summary just above (both are lightweight,
+                            # regenerable reporting artefacts derived from
+                            # already-written files - neither is tracked as its
+                            # own post-GP() progress-bar phase, matching how
+                            # write_metric_summary() is already treated here).
+                            # GP() itself returns no 'weight' (its own 8-tuple),
+                            # so both Prediction_result_test.csv and Weight.csv
+                            # are read fresh off disk via load_combined().
                             _t0 = time.time()
-                            (metrics, predicted_result_train, predicted_result_test, effect,
-                             interactions, attention, population, phenotype, assembled_model,
-                             missing_batches, incomplete_batches) = assemble(
-                                cfg['RESULT_NAME'], expected_batches=cfg.get('EXPECTED_BATCHES')
+                            _prediction_test_for_dpt = load_combined(cfg['RESULT_NAME'], 'result_test')
+                            _weight_for_dpt = load_combined(cfg['RESULT_NAME'], 'weight')
+                            _dpt_terms = build_dpt_terms(_prediction_test_for_dpt, _weight_for_dpt, metrics)
+                            _dpt_paths = write_dpt_summary(
+                                _dpt_terms, cfg['RESULT_NAME'], create=cfg.get('DPT_SUMMARY_CREATE', True),
+                                # Requirements.md item 1: ensemble labels
+                                # only - see diversity_summary.dpt_model_
+                                # order()'s own docstring for why the full
+                                # model_labels list (as used for the metric
+                                # summary/violin plots) would otherwise
+                                # reintroduce a permanently-blank column per
+                                # single-prediction model.
+                                model_order=dpt_model_order(model_labels),
                             )
-                            _log(f'Assembled results from all batches for models '
-                                 f'{assembled_model} (took {time.time() - _t0:.1f}s).')
+                            if _dpt_paths:
+                                _log(f"Diversity Prediction Theorem summary written: "
+                                     f"{', '.join(_dpt_paths)} (took {time.time() - _t0:.1f}s).")
+
+                            # Declare how many plot phases will run so the remaining
+                            # 15% of the bar (85-100%) is divided evenly between them.
+                            has_attention = 'GAT_fully_connected' in cfg['MODEL'] or 'GAT_prior_knowledge' in cfg['MODEL'] or any(m.startswith('GAT_biological_prior_knowledge') for m in cfg['MODEL'])
+                            has_ld_decay = bool(
+                                cfg.get('LD_PRUNE') and cfg['LD_PRUNE'].get('decay_plot')
+                                and cfg['LD_PRUNE']['decay_plot'].get('enabled')
+                            )
+                            has_weight_plot = bool(cfg.get('WEIGHT_PLOT_CREATE', False))
+                            _set_post_phase_count(
+                                (1 if has_attention else 0) + (1 if has_ld_decay else 0)
+                                + (1 if cfg['METRIC_PLOT_CREATE'] else 0) + (1 if has_weight_plot else 0)
+                                + (1 if cfg['SCATTER_CREATE'] else 0) + (1 if cfg['CIRCOS_CREATE'] else 0)
+                            )
+
+                            if has_ld_decay:
+                                _advance_progress('Generating average LD decay plots...')
+                                _t0 = time.time()
+                                _n_ld_decay_plots = average_and_plot_ld_decay(cfg['RESULT_NAME'])
+                                _log(f'{_n_ld_decay_plots} average LD decay plot(s) generated '
+                                     f'(took {time.time() - _t0:.1f}s).')
+
+                            if has_attention:
+                                _advance_progress('Generating attention distribution plots...')
+                                _t0 = time.time()
+                                attention_distribution(attention, cfg['RESULT_NAME'], 10)
+                                _log(f'Attention distribution plots generated (took {time.time() - _t0:.1f}s).')
+
+                            if cfg['METRIC_PLOT_CREATE']:
+                                _advance_progress('Generating metric plots...')
+                                _t0 = time.time()
+                                metric_plot(metrics.copy(), model_labels, cfg['RESULT_NAME'], cfg['SCENARIO'], cfg['METRIC_PLOT_CONFIG'], PLOT_DPI=cfg['METRIC_PLOT_DPI'])
+                                _log(f'Metric plots generated (took {time.time() - _t0:.1f}s).')
+
+                            # Update ID ver4-9, R6: tracked as its own
+                            # post-phase (unlike the DPT summary above),
+                            # matching the design blueprint's explicit
+                            # SS2.3.7 instruction - a genuinely new plot
+                            # phase, not a lightweight table.
+                            if has_weight_plot:
+                                _advance_progress('Generating weight plots...')
+                                _t0 = time.time()
+                                _members_for_plot = resolve_ensemble_members(
+                                    metrics, _prediction_test_for_dpt, _weight_for_dpt,
+                                )
+                                _naive_for_plot = next(
+                                    (info['models'] for info in _members_for_plot.values() if info['is_naive']),
+                                    None,
+                                )
+                                _weight_plot_paths = weight_plot(
+                                    _weight_for_dpt, model_labels, cfg['RESULT_NAME'], cfg['SCENARIO'],
+                                    cfg['WEIGHT_PLOT_CONFIG'], PLOT_DPI=cfg['WEIGHT_PLOT_DPI'],
+                                    naive_models=_naive_for_plot,
+                                )
+                                if _weight_plot_paths:
+                                    _log(f"Weight plot(s) generated: {', '.join(_weight_plot_paths)} "
+                                         f"(took {time.time() - _t0:.1f}s).")
+
+                            # ver4-4 R7.g: apply the SAME float32 downcast
+                            # batch_reader.ResultSet.effect() offers Parallel
+                            # mode's plotting path - Sequential mode has no
+                            # ResultSet at all (`effect` is GP()'s own
+                            # in-memory accumulator), so this is done directly
+                            # here, once, and the SAME downcast frame is reused
+                            # by both scatter_plot() and circos_plot() below.
+                            # Marker_effect.csv itself (already written to disk
+                            # by GP(), long before this point) is completely
+                            # unaffected - this only ever touches an in-memory
+                            # COPY used for plotting. When PLOT_EFFECT_FLOAT32
+                            # is off, `effect_for_plots` is the SAME object as
+                            # `effect` (no copy) - byte-identical to this
+                            # code path's pre-ver4-4 behaviour.
+                            if cfg['PLOT_EFFECT_FLOAT32'] and effect.shape[1] > _EFFECT_METADATA_WIDTH:
+                                _marker_cols = effect.columns[_EFFECT_METADATA_WIDTH:]
+                                effect_for_plots = effect.copy()
+                                effect_for_plots[_marker_cols] = effect_for_plots[_marker_cols].astype('float32')
+                            else:
+                                effect_for_plots = effect
+
+                            if cfg['SCATTER_CREATE']:
+                                _advance_progress('Generating scatter plot matrix...')
+                                _t0 = time.time()
+                                # ver4-4 R6: cfg['QTL_WINDOW']/cfg['QTL_WINDOW_MODE']
+                                # are always populated by gather_config() (Stage 2
+                                # of this same update) whenever Tab 5 is shown, so
+                                # a direct cfg[...] read is safe here (this block
+                                # only ever runs immediately after gather_config()
+                                # built cfg fresh in this same session - unlike
+                                # run_sequential.py/run_step2_assemble.py, which
+                                # may load an OLDER config from disk and use
+                                # cfg.get(...) with a legacy-reproducing default
+                                # instead).
+                                scatter_plot(cfg['MODEL'], phenotype, predicted_result_test, effect_for_plots,
+                                             cfg['QTL'], cfg['SCATTER_CONFIG'], cfg['RESULT_NAME'],
+                                             MARKER_INFO=cfg['MARKER_INFO'],
+                                             QTL_WINDOW=cfg['QTL_WINDOW'],
+                                             QTL_WINDOW_MODE=cfg['QTL_WINDOW_MODE'],
+                                             PLOT_DPI=cfg['SCATTER_PLOT_DPI'])
+                                _log(f'Scatter plot matrix generated (took {time.time() - _t0:.1f}s).')
+
+                            if cfg['CIRCOS_CREATE']:
+                                _advance_progress('Generating circos plot...')
+                                _t0 = time.time()
+                                _chrom_info_path, _gene_info_path = cfg['CHROMOSOME_INFO'], cfg['GENE_INFO']
+                                # Requirement (diagnostic): logs exactly what
+                                # the broadcast step actually sees/does, so a
+                                # 'gene ring missing for a real population'
+                                # report can be diagnosed directly from the
+                                # person's own log output, rather than
+                                # guessing blind at what their specific
+                                # session/config produced - whether the
+                                # checkbox was actually on, what population
+                                # list it broadcast across, and whether a
+                                # gene info path was even set.
+                                _log(f"[circos] Broadcast checkbox: {cfg.get('CIRCOS_BROADCAST_POPULATION')} | "
+                                     f"population from results: {list(population)} | "
+                                     f"gene info path set: {bool(_gene_info_path)}")
+                                if cfg.get('CIRCOS_BROADCAST_POPULATION'):
+                                    # Requirement 8: broadcast BEFORE circos_plot()
+                                    # ever sees these paths, so its own internals
+                                    # (and every downstream call within it) stay
+                                    # completely unaware this ever happened - same
+                                    # 'each population + all' target list
+                                    # circos_plot() itself always uses internally.
+                                    # Requirement (bugfix): normalize each population value to its
+                                    # clean string form before it becomes the broadcast
+                                    # file's own 'population' column - see
+                                    # _clean_population_label()'s own docstring (circos_plot.py)
+                                    # for why (a float-promoted 1.0 must broadcast under the SAME
+                                    # label '1' that circos_plot()'s own now-normalized loop will
+                                    # later look for, not '1.0'). For SCENARIO='between', 'population'
+                                    # values are combined train->test labels (e.g.
+                                    # 'Historical->2014') - split to the test-population half FIRST,
+                                    # matching circos_plot()'s own identical split of its POPULATION
+                                    # parameter, so the broadcast file's labels and what
+                                    # circos_plot()'s loop later looks for are the SAME clean value
+                                    # ('2014'), not one arrow-combined and the other not.
+                                    _target_pop_source = population
+                                    if cfg['SCENARIO'] == 'between':
+                                        _target_pop_source = [
+                                            p.split('->')[-1] if isinstance(p, str) and '->' in p else p
+                                            for p in population
+                                        ]
+                                    _target_pops = [_clean_population_label(p) for p in _target_pop_source] + ['all']
+                                    _chrom_info_path = _broadcast_population_info(_chrom_info_path, _target_pops, 'chrom')
+                                    if _gene_info_path:
+                                        _gene_info_path = _broadcast_population_info(_gene_info_path, _target_pops, 'gene')
+                                    _log(f"[circos] Broadcast target populations: {_target_pops} | "
+                                         f"broadcast chrom file: {_chrom_info_path} | "
+                                         f"broadcast gene file: {_gene_info_path}")
+                                circos_plot(effect_for_plots, interactions, cfg['MARKER_INFO'], _chrom_info_path,
+                                            _gene_info_path, population, phenotype, cfg['CIRCOS_CONFIG'],
+                                            cfg['END_ADJUST'], cfg['WINDOW'], cfg['CYTOBAND_COLORMAP'],
+                                            cfg['RESULT_NAME'], attention, cfg['SCENARIO'], cfg['ASCENDING'],
+                                            gene_adjust=cfg.get('GENE_ADJUST', 0), plot_dpi=cfg['CIRCOS_PLOT_DPI'],
+                                            # Performance (multi-CPU circos-plot
+                                            # rendering): deliberately NOT wired
+                                            # to CIRCOS_PLOT_WORKERS here, unlike
+                                            # run_sequential.py/run_step2_
+                                            # assemble.py's identical call -
+                                            # this is 'Option B: run now
+                                            # (local)', executing in-process
+                                            # inside the Streamlit app itself.
+                                            # circos_plot()'s worker fan-out
+                                            # always spawns (never forks - see
+                                            # circos_plot.py::_MP_CONTEXT), and
+                                            # a `spawn`-started child re-imports
+                                            # this process's own __main__ -
+                                            # which, for a script launched via
+                                            # `streamlit run main_app.py`, is
+                                            # Streamlit's own bootstrap, not a
+                                            # guarded `if __name__ ==
+                                            # "__main__":` block. Hard-coded to
+                                            # 1 (today's behaviour) rather than
+                                            # risking that interaction for an
+                                            # interactive, highly-visible GUI
+                                            # path - 'Option A: export config,
+                                            # then submit a job' still carries
+                                            # CIRCOS_PLOT_WORKERS through to the
+                                            # headless runners above correctly.
+                                            n_workers=1)
+                                _log(f'Circos plot generated (took {time.time() - _t0:.1f}s).')
+
+                        elif mode == 'Parallel' and step == 'Step 1':
+                            # ---------------------------------------------- #
+                            # Fit the selected models for a single batch of
+                            # prediction scenarios. Nothing gets plotted here -
+                            # that happens once, in Step 2, after all batches
+                            # have completed.
+                            # ---------------------------------------------- #
+                            parallel = dict(cfg['PARALLEL'])
+                            if parallel['batch_id'] is None:
+                                # Slurm/PBS was selected as the batch ID source -
+                                # resolve it now, from this process's own
+                                # environment, only because we're about to run
+                                # a single batch locally for testing. (This is
+                                # never required just to export a config.)
+                                parallel['batch_id'] = resolve_batch_id_from_env()
+
+                            (metrics, predicted_result_train, predicted_result_test, effect,
+                             interactions, population, phenotype, attention) = GP(
+                                cfg['GENOTYPE_FILE_NAME'], cfg['PHENOTYPE_FILE_NAME'], cfg['MODEL'],
+                                cfg['PHENOTYPE'], cfg['RATIO'], cfg['ITER_NUM'], cfg['HPARAMETERS'],
+                                cfg['R_PATH'], cfg['W_OPT'], cfg['RESULT_NAME'], cfg['HYPERPARAMETERS_OPT'],
+                                cfg['SCENARIO'], parallel, LD_prune=cfg['LD_PRUNE'], RF_filter=cfg['RF_FILTER'],
+                                GENOTYPE_FORMAT=cfg['GENOTYPE_FORMAT'], GENOTYPE_PLINK_PATH=cfg['GENOTYPE_PLINK_PATH'],
+                                OTHER_MODELS_MARKER_SOURCE=cfg['OTHER_MODELS_MARKER_SOURCE'],
+                                HP_TUNE=cfg.get('HP_TUNE'), HP_TUNE_ENSEMBLE_MODE=cfg.get('HP_TUNE_ENSEMBLE_MODE', 'per_method'),
+                                MIN_DATA_POINTS=cfg.get('MIN_DATA_POINTS', 100),
+                                # ver4-4 Stage 5 completion: this in-process
+                                # Step-1-local call site is a SEPARATE, simpler
+                                # code path from run_step1_batch.py's own
+                                # three-way N_MODEL_WORKERS/N_CPU_WORKERS route
+                                # (it always calls GP() directly, with no
+                                # intra_batch_parallel/intra_task_parallel
+                                # fan-out at all - this is a single local batch
+                                # run for testing, per the comment above) - so
+                                # it did NOT inherit run_step1_batch.py's own
+                                # gp_kwargs forwarding and had the SAME full gap
+                                # as the Sequential-local block above. Same full
+                                # key set, same per-key defaults (I11), for the
+                                # same reasons - see that block's own comment.
+                                USE_GPU_SKLEARN=cfg.get('USE_GPU_SKLEARN', False), N_JOBS=cfg.get('N_JOBS', -1),
+                                PLINK_THREADS=cfg.get('PLINK_THREADS', 1), R_BLAS_THREADS=cfg.get('R_BLAS_THREADS'),
+                                TORCH_DEVICE=cfg.get('TORCH_DEVICE'), CUDNN_BENCHMARK=cfg.get('CUDNN_BENCHMARK', True),
+                                USE_AMP=cfg.get('USE_AMP', False), N_CPU_WORKERS=cfg.get('N_CPU_WORKERS', 1),
+                                N_GPU_SLOTS=cfg.get('N_GPU_SLOTS'), GPU_SLOTS_PER_DEVICE=cfg.get('GPU_SLOTS_PER_DEVICE', 1),
+                                R_BLAS_FOLLOWS_N_JOBS=cfg.get('R_BLAS_FOLLOWS_N_JOBS', True),
+                                TORCH_NUM_THREADS=cfg.get('TORCH_NUM_THREADS'),
+                                TORCH_DATALOADER_WORKERS=cfg.get('TORCH_DATALOADER_WORKERS', 0),
+                                GPU_EVAL_BATCH=cfg.get('GPU_EVAL_BATCH', 32),
+                                GPU_LD_R2=cfg.get('GPU_LD_R2', True),
+                                GPU_KERNEL_PRECOMPUTE=cfg.get('GPU_KERNEL_PRECOMPUTE', True),
+                                # ver4-4 Stage 6: same forwarding gap, same fix,
+                                # for this call site's own newest compute-
+                                # resource key - see the Sequential-local
+                                # block's own identical comment above.
+                                HP_TUNE_PARALLEL_TRIALS=cfg.get('HP_TUNE_PARALLEL_TRIALS', True),
+                                # ver4-5 R1 (blueprint §3.6) - same forward-every-new-key
+                                # discipline as the line above, same legacy-preserving defaults.
+                                HP_TUNE_BAYES_BATCH=cfg.get('HP_TUNE_BAYES_BATCH', True),
+                                HP_TUNE_BAYES_BATCH_MAX=cfg.get('HP_TUNE_BAYES_BATCH_MAX', 8),
+                                HP_TUNE_BAYES_LIAR=cfg.get('HP_TUNE_BAYES_LIAR', 'max'),
+                                HP_TUNE_PARALLEL_RESTARTS=cfg.get('HP_TUNE_PARALLEL_RESTARTS', True),
+                                # Update ID ver4-6 (blueprint §4/§10) - eight further keys,
+                                # same forward-every-new-key discipline, same legacy-preserving
+                                # (or, where §4 documents a deliberate default flip, §4's own
+                                # documented new-default) values.
+                                HP_TUNE_BAYES_DOMAIN_REDUCTION=cfg.get('HP_TUNE_BAYES_DOMAIN_REDUCTION', 'auto'),
+                                HP_TUNE_WARM_START=cfg.get('HP_TUNE_WARM_START', False),
+                                HP_TUNE_SELECTION_MARGIN=cfg.get('HP_TUNE_SELECTION_MARGIN', 0.02),
+                                HP_TUNE_VALID_REPEATS=cfg.get('HP_TUNE_VALID_REPEATS', 1),
+                                HP_TUNE_SCOPE=cfg.get('HP_TUNE_SCOPE', 'per_task'),
+                                W_OPT_ANALYTIC_SEED=cfg.get('W_OPT_ANALYTIC_SEED', False),
+                                W_OPT_VALIDATION_FLOOR=cfg.get('W_OPT_VALIDATION_FLOOR', False),
+                                W_OPT_SIMPLEX_SEARCH=cfg.get('W_OPT_SIMPLEX_SEARCH', True),
+                                MODEL_AVAILABILITY_STRICT=cfg.get('MODEL_AVAILABILITY_STRICT', True),
+                                # Update ID ver4-9, R7.
+                                RESULT_COMPRESSION=cfg.get('RESULT_COMPRESSION', 'gzip'),
+                                **gp_progress_kwargs
+                            )
+                            print(f"Genomic prediction finished for batch_id={parallel['batch_id']} "
+                                  f"(batch_size={parallel['batch_size']}).")
+
+                        elif mode == 'Parallel' and step == 'Step 2':
+                            # ---------------------------------------------- #
+                            # Assemble the results from all previously-run
+                            # Step 1 batches (or, if requested, reload a
+                            # previous assembly instead), then generate the
+                            # plots. There's no GP() call here to seed the
+                            # progress bar's total, so it's computed directly:
+                            # one unit for assemble/load, plus one per plot
+                            # phase that will actually run.
+                            # ---------------------------------------------- #
+                            # Declare the phases known up front (assemble/load, metric?,
+                            # scatter?, circos?); attention's applicability isn't known
+                            # until after assemble/load returns, so it's added below.
+                            _set_post_phase_count(
+                                1 + (1 if cfg['METRIC_PLOT_CREATE'] else 0)
+                                + (1 if cfg['SCATTER_CREATE'] else 0) + (1 if cfg['CIRCOS_CREATE'] else 0)
+                            )
+
+                            # Patch 3, Requirement 1: the single shared entry
+                            # point resolving cfg['ASSEMBLE_MODE'] - see
+                            # assemble.load_for_step2()'s own docstring for
+                            # the full decision table (including the legacy
+                            # SKIP_ASSEMBLE-only fallback for any config
+                            # written before ASSEMBLE_MODE existed). Exactly
+                            # the same function run_step2_assemble.py's own
+                            # main() calls, so the headless and in-process
+                            # paths can never disagree about what a given
+                            # config means.
+                            _advance_progress(
+                                'Reloading previously assembled results...'
+                                if cfg.get('ASSEMBLE_MODE') in ('use_preassembled', 'no_assemble')
+                                or (cfg.get('ASSEMBLE_MODE') is None and cfg.get('SKIP_ASSEMBLE'))
+                                else 'Assembling results from all batches...'
+                            )
+                            result, _assemble_message = load_for_step2(cfg['RESULT_NAME'], cfg)
+                            missing_batches, incomplete_batches = result.missing_batches, result.incomplete_batches
+                            _log(_assemble_message)
                             if missing_batches:
                                 _log(f'WARNING: missing batch ID(s) (never produced any output): '
                                      f'{format_batch_id_list(missing_batches)}')
-                            if not assembled_model:
+                            if not result.models:
                                 raise RuntimeError(
                                     'No usable batch output was found to assemble - see the '
                                     'missing-batch warning above for which batch(es) to re-run.'
                                 )
-                        # Requirement: make it easy to notice, at a glance, which
-                        # batch(es) started but did not finish - logged right after
-                        # whichever of the two branches above ran, so it's never
-                        # buried further down (see the st.warning surfacing this
-                        # again, more prominently, after the run finishes below).
-                        if incomplete_batches:
-                            _log(f'{len(incomplete_batches)} batch(es) did NOT finish (excluded from the '
-                                 f'results above):')
-                            for _b in incomplete_batches:
-                                _log(f'  - {describe_incomplete_batch(_b)}')
-                            _log(f'  Incomplete batch ID list: '
-                                 f'{format_batch_id_list([_b["batch_id"] for _b in incomplete_batches])}')
+                            # Requirement: make it easy to notice, at a glance, which
+                            # batch(es) started but did not finish - logged right after
+                            # whichever of the two branches above ran, so it's never
+                            # buried further down (see the st.warning surfacing this
+                            # again, more prominently, after the run finishes below).
+                            if incomplete_batches:
+                                _log(f'{len(incomplete_batches)} batch(es) did NOT finish (excluded from the '
+                                     f'results above):')
+                                for _b in incomplete_batches:
+                                    _log(f'  - {describe_incomplete_batch(_b)}')
+                                _log(f'  Incomplete batch ID list: '
+                                     f'{format_batch_id_list([_b["batch_id"] for _b in incomplete_batches])}')
 
-                        has_attention = 'GAT_fully_connected' in assembled_model or 'GAT_prior_knowledge' in assembled_model or any(m.startswith('GAT_biological_prior_knowledge') for m in assembled_model)
-                        if has_attention:
-                            _set_post_phase_count(post_phase_state['total_phases'] + 1)
-
-                        # Requirement 6, Parallel path: Step 2 never sees Step 1's
-                        # LD_PRUNE config (see gather_config()'s is_step2 skip), so
-                        # detect whether the feature was used by checking whether
-                        # any per-scenario LD decay data actually exists on disk -
-                        # each Step 1 batch's own GP() call would have already
-                        # written it directly into this same shared Result folder.
-                        has_ld_decay = ld_decay_data_exists(cfg['RESULT_NAME'])
-                        if has_ld_decay:
-                            _set_post_phase_count(post_phase_state['total_phases'] + 1)
-
-                        if has_attention:
-                            _advance_progress('Generating attention distribution plots...')
-                            _t0 = time.time()
-                            attention_distribution(attention, cfg['RESULT_NAME'], 10)
-                            _log(f'Attention distribution plots generated (took {time.time() - _t0:.1f}s).')
-
-                        if has_ld_decay:
-                            _advance_progress('Generating average LD decay plots...')
-                            _t0 = time.time()
-                            _n_ld_decay_plots = average_and_plot_ld_decay(cfg['RESULT_NAME'])
-                            _log(f'{_n_ld_decay_plots} average LD decay plot(s) generated '
-                                 f'(took {time.time() - _t0:.1f}s).')
-
-                        if cfg['METRIC_PLOT_CREATE']:
+                            # Update ID 3, R3: the Metric_summary.xlsx workbook
+                            # (or its CSV degrade), written immediately once the
+                            # results become available and before the first
+                            # plot - same position in every one of R3's four
+                            # call sites (blueprint §R3.9).
+                            #
+                            # Requirements.md item 8: model_labels computed
+                            # here (moved up from just before metric_plot()
+                            # below) and reused there, so the metric summary's
+                            # own model column order always matches the violin
+                            # plots' own model order exactly.
                             model_labels = (
-                                assembled_model + cfg['W_OPT'] if cfg['W_OPT'] is not None else assembled_model
+                                result.models + cfg['W_OPT'] if cfg['W_OPT'] is not None else result.models
                             )
-                            _advance_progress('Generating metric plots...')
                             _t0 = time.time()
-                            metric_plot(metrics.copy(), model_labels, cfg['RESULT_NAME'], cfg['SCENARIO'], cfg['METRIC_PLOT_CONFIG'])
-                            _log(f'Metric plots generated (took {time.time() - _t0:.1f}s).')
+                            _summary_paths = write_metric_summary(
+                                result.metric, cfg['RESULT_NAME'], create=cfg.get('METRIC_SUMMARY_CREATE', True),
+                                model_order=model_labels,
+                            )
+                            if _summary_paths:
+                                _log(f"Metric summary written: {', '.join(_summary_paths)} "
+                                     f"(took {time.time() - _t0:.1f}s).")
 
-                        if cfg['SCATTER_CREATE']:
-                            _advance_progress('Generating scatter plot matrix...')
+                            # Update ID ver4-9, R5: same position as the metric
+                            # summary just above, reusing the already-assembled
+                            # `result` (source='combined' or 'batches',
+                            # whichever load_for_step2() chose above) rather
+                            # than re-reading anything from a hardcoded path.
                             _t0 = time.time()
-                            scatter_plot(assembled_model, phenotype, predicted_result_test, effect,
-                                         cfg['QTL'], cfg['SCATTER_CONFIG'], cfg['RESULT_NAME'])
-                            _log(f'Scatter plot matrix generated (took {time.time() - _t0:.1f}s).')
+                            _dpt_terms = build_dpt_terms(result.prediction('test'), result.weight(), result.metric)
+                            _dpt_paths = write_dpt_summary(
+                                _dpt_terms, cfg['RESULT_NAME'], create=cfg.get('DPT_SUMMARY_CREATE', True),
+                                # Requirements.md item 1: ensemble labels
+                                # only - see diversity_summary.dpt_model_
+                                # order()'s own docstring for why the full
+                                # model_labels list (as used for the metric
+                                # summary/violin plots) would otherwise
+                                # reintroduce a permanently-blank column per
+                                # single-prediction model.
+                                model_order=dpt_model_order(model_labels),
+                            )
+                            if _dpt_paths:
+                                _log(f"Diversity Prediction Theorem summary written: "
+                                     f"{', '.join(_dpt_paths)} (took {time.time() - _t0:.1f}s).")
 
-                        if cfg['CIRCOS_CREATE']:
-                            _advance_progress('Generating circos plot...')
-                            _t0 = time.time()
-                            _chrom_info_path, _gene_info_path = cfg['CHROMOSOME_INFO'], cfg['GENE_INFO']
-                            # Requirement (diagnostic): logs exactly what
-                            # the broadcast step actually sees/does, so a
-                            # 'gene ring missing for a real population'
-                            # report can be diagnosed directly from the
-                            # person's own log output, rather than
-                            # guessing blind at what their specific
-                            # session/config produced - whether the
-                            # checkbox was actually on, what population
-                            # list it broadcast across, and whether a
-                            # gene info path was even set.
-                            _log(f"[circos] Broadcast checkbox: {cfg.get('CIRCOS_BROADCAST_POPULATION')} | "
-                                 f"population from results: {list(population)} | "
-                                 f"gene info path set: {bool(_gene_info_path)}")
-                            if cfg.get('CIRCOS_BROADCAST_POPULATION'):
-                                # Requirement (bugfix): normalize each population value to its
-                                # clean string form before it becomes the broadcast
-                                # file's own 'population' column - see
-                                # _clean_population_label()'s own docstring (circos_plot.py)
-                                # for why (a float-promoted 1.0 must broadcast under the SAME
-                                # label '1' that circos_plot()'s own now-normalized loop will
-                                # later look for, not '1.0'). For SCENARIO='between', 'population'
-                                # values are combined train->test labels (e.g.
-                                # 'Historical->2014') - split to the test-population half FIRST,
-                                # matching circos_plot()'s own identical split of its POPULATION
-                                # parameter, so the broadcast file's labels and what
-                                # circos_plot()'s loop later looks for are the SAME clean value
-                                # ('2014'), not one arrow-combined and the other not.
-                                _target_pop_source = population
-                                if cfg['SCENARIO'] == 'between':
-                                    _target_pop_source = [
-                                        p.split('->')[-1] if isinstance(p, str) and '->' in p else p
-                                        for p in population
-                                    ]
-                                _target_pops = [_clean_population_label(p) for p in _target_pop_source] + ['all']
-                                _chrom_info_path = _broadcast_population_info(_chrom_info_path, _target_pops, 'chrom')
-                                if _gene_info_path:
-                                    _gene_info_path = _broadcast_population_info(_gene_info_path, _target_pops, 'gene')
-                                _log(f"[circos] Broadcast target populations: {_target_pops} | "
-                                     f"broadcast chrom file: {_chrom_info_path} | "
-                                     f"broadcast gene file: {_gene_info_path}")
-                            circos_plot(effect, interactions, cfg['MARKER_INFO'], _chrom_info_path,
-                                        _gene_info_path, population, phenotype, cfg['CIRCOS_CONFIG'],
-                                        cfg['END_ADJUST'], cfg['WINDOW'], cfg['CYTOBAND_COLORMAP'],
-                                        cfg['RESULT_NAME'], attention, cfg['SCENARIO'], cfg['ASCENDING'],
-                                        gene_adjust=cfg.get('GENE_ADJUST', 0))
-                            _log(f'Circos plot generated (took {time.time() - _t0:.1f}s).')
+                            has_attention = 'GAT_fully_connected' in result.models or 'GAT_prior_knowledge' in result.models or any(m.startswith('GAT_biological_prior_knowledge') for m in result.models)
+                            if has_attention:
+                                _set_post_phase_count(post_phase_state['total_phases'] + 1)
 
-            except Exception:
-                tb_text = traceback.format_exc()
-                st.error('Pipeline failed - see the traceback below.')
-                st.code(tb_text, language='text')
-                try:
-                    with open(log_file_path, 'a', encoding='utf-8') as log_file:
-                        log_file.write(f'\n[{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}] Pipeline failed:\n')
-                        log_file.write(tb_text)
+                            # Requirement 6, Parallel path: Step 2 never sees Step 1's
+                            # LD_PRUNE config (see gather_config()'s is_step2 skip), so
+                            # detect whether the feature was used by checking whether
+                            # any per-scenario LD decay data actually exists on disk -
+                            # each Step 1 batch's own GP() call would have already
+                            # written it directly into this same shared Result folder.
+                            has_ld_decay = ld_decay_data_exists(cfg['RESULT_NAME'])
+                            if has_ld_decay:
+                                _set_post_phase_count(post_phase_state['total_phases'] + 1)
+
+                            # Update ID ver4-9, R6: tracked as its own
+                            # post-phase, matching the design blueprint's
+                            # explicit SS2.3.7 instruction (symmetric with
+                            # the Sequential in-process block above).
+                            has_weight_plot = bool(cfg.get('WEIGHT_PLOT_CREATE', False))
+                            if has_weight_plot:
+                                _set_post_phase_count(post_phase_state['total_phases'] + 1)
+
+                            if has_attention:
+                                _advance_progress('Generating attention distribution plots...')
+                                _t0 = time.time()
+                                attention_distribution(result.attention(), cfg['RESULT_NAME'], 10)
+                                _log(f'Attention distribution plots generated (took {time.time() - _t0:.1f}s).')
+                                # Update ID 3, R1: free the cached attention frame
+                                # before the next stage - circos_plot() below
+                                # re-reads it fresh if it needs it (R1.4's fix for
+                                # allocation A3: the Step-2 peak is one stage's
+                                # working set, not the sum of every stage's).
+                                result.release('attention')
+
+                            if has_ld_decay:
+                                _advance_progress('Generating average LD decay plots...')
+                                _t0 = time.time()
+                                _n_ld_decay_plots = average_and_plot_ld_decay(cfg['RESULT_NAME'])
+                                _log(f'{_n_ld_decay_plots} average LD decay plot(s) generated '
+                                     f'(took {time.time() - _t0:.1f}s).')
+
+                            if cfg['METRIC_PLOT_CREATE']:
+                                _advance_progress('Generating metric plots...')
+                                _t0 = time.time()
+                                metric_plot(result.metric.copy(), model_labels, cfg['RESULT_NAME'], cfg['SCENARIO'], cfg['METRIC_PLOT_CONFIG'], PLOT_DPI=cfg['METRIC_PLOT_DPI'])
+                                _log(f'Metric plots generated (took {time.time() - _t0:.1f}s).')
+
+                            if has_weight_plot:
+                                _advance_progress('Generating weight plots...')
+                                _t0 = time.time()
+                                _members_for_plot = resolve_ensemble_members(
+                                    result.metric, result.prediction('test'), result.weight(),
+                                )
+                                _naive_for_plot = next(
+                                    (info['models'] for info in _members_for_plot.values() if info['is_naive']),
+                                    None,
+                                )
+                                _weight_plot_paths = weight_plot(
+                                    result.weight(), model_labels, cfg['RESULT_NAME'], cfg['SCENARIO'],
+                                    cfg['WEIGHT_PLOT_CONFIG'], PLOT_DPI=cfg['WEIGHT_PLOT_DPI'],
+                                    naive_models=_naive_for_plot,
+                                )
+                                if _weight_plot_paths:
+                                    _log(f"Weight plot(s) generated: {', '.join(_weight_plot_paths)} "
+                                         f"(took {time.time() - _t0:.1f}s).")
+
+                            if cfg['SCATTER_CREATE']:
+                                _advance_progress('Generating scatter plot matrix...')
+                                _t0 = time.time()
+                                # ver4-4 R6: see the Sequential in-process block's
+                                # identical note above - cfg[...] direct read is
+                                # safe here (freshly built by gather_config() in
+                                # this same session).
+                                scatter_plot(result.models, result.phenotype, result.prediction('test'), result.effect(float32=cfg['PLOT_EFFECT_FLOAT32']),
+                                             cfg['QTL'], cfg['SCATTER_CONFIG'], cfg['RESULT_NAME'],
+                                             MARKER_INFO=cfg['MARKER_INFO'],
+                                             QTL_WINDOW=cfg['QTL_WINDOW'],
+                                             QTL_WINDOW_MODE=cfg['QTL_WINDOW_MODE'],
+                                             PLOT_DPI=cfg['SCATTER_PLOT_DPI'])
+                                _log(f'Scatter plot matrix generated (took {time.time() - _t0:.1f}s).')
+                                # Update ID 3, R1: the test-prediction frame isn't
+                                # needed again; `effect` IS (circos_plot below),
+                                # so it's kept resident.
+                                result.release('prediction_test')
+
+                            if cfg['CIRCOS_CREATE']:
+                                _advance_progress('Generating circos plot...')
+                                _t0 = time.time()
+                                _chrom_info_path, _gene_info_path = cfg['CHROMOSOME_INFO'], cfg['GENE_INFO']
+                                # Requirement (diagnostic): logs exactly what
+                                # the broadcast step actually sees/does, so a
+                                # 'gene ring missing for a real population'
+                                # report can be diagnosed directly from the
+                                # person's own log output, rather than
+                                # guessing blind at what their specific
+                                # session/config produced - whether the
+                                # checkbox was actually on, what population
+                                # list it broadcast across, and whether a
+                                # gene info path was even set.
+                                _log(f"[circos] Broadcast checkbox: {cfg.get('CIRCOS_BROADCAST_POPULATION')} | "
+                                     f"population from results: {list(result.population)} | "
+                                     f"gene info path set: {bool(_gene_info_path)}")
+                                if cfg.get('CIRCOS_BROADCAST_POPULATION'):
+                                    # Requirement (bugfix): normalize each population value to its
+                                    # clean string form before it becomes the broadcast
+                                    # file's own 'population' column - see
+                                    # _clean_population_label()'s own docstring (circos_plot.py)
+                                    # for why (a float-promoted 1.0 must broadcast under the SAME
+                                    # label '1' that circos_plot()'s own now-normalized loop will
+                                    # later look for, not '1.0'). For SCENARIO='between', 'population'
+                                    # values are combined train->test labels (e.g.
+                                    # 'Historical->2014') - split to the test-population half FIRST,
+                                    # matching circos_plot()'s own identical split of its POPULATION
+                                    # parameter, so the broadcast file's labels and what
+                                    # circos_plot()'s loop later looks for are the SAME clean value
+                                    # ('2014'), not one arrow-combined and the other not.
+                                    _target_pop_source = result.population
+                                    if cfg['SCENARIO'] == 'between':
+                                        _target_pop_source = [
+                                            p.split('->')[-1] if isinstance(p, str) and '->' in p else p
+                                            for p in result.population
+                                        ]
+                                    _target_pops = [_clean_population_label(p) for p in _target_pop_source] + ['all']
+                                    _chrom_info_path = _broadcast_population_info(_chrom_info_path, _target_pops, 'chrom')
+                                    if _gene_info_path:
+                                        _gene_info_path = _broadcast_population_info(_gene_info_path, _target_pops, 'gene')
+                                    _log(f"[circos] Broadcast target populations: {_target_pops} | "
+                                         f"broadcast chrom file: {_chrom_info_path} | "
+                                         f"broadcast gene file: {_gene_info_path}")
+                                # OOM fix (large Interaction.csv/Attention.csv
+                                # files): same rationale as
+                                # run_step2_assemble.py's identical call site -
+                                # circos_plot()'s interaction()/attention
+                                # handling has always reduced these two tables
+                                # down to one row per (population, model,
+                                # phenotype, marker1, marker2) combination
+                                # before doing anything else, so reading the
+                                # FULL raw tables here just to immediately
+                                # average them away is what could exhaust
+                                # memory on a large assembled result opened
+                                # in-process from the GUI. See batch_reader.
+                                # aggregate_marker_pair_sums()/ResultSet.
+                                # interactions_grouped()/attention_grouped()
+                                # for why this is the identical final numbers,
+                                # not an approximation.
+                                circos_plot(result.effect(float32=cfg['PLOT_EFFECT_FLOAT32']), result.interactions_grouped(), cfg['MARKER_INFO'], _chrom_info_path,
+                                            _gene_info_path, result.population, result.phenotype, cfg['CIRCOS_CONFIG'],
+                                            cfg['END_ADJUST'], cfg['WINDOW'], cfg['CYTOBAND_COLORMAP'],
+                                            cfg['RESULT_NAME'], result.attention_grouped(), cfg['SCENARIO'], cfg['ASCENDING'],
+                                            gene_adjust=cfg.get('GENE_ADJUST', 0), plot_dpi=cfg['CIRCOS_PLOT_DPI'],
+                                            # Performance (multi-CPU circos-plot
+                                            # rendering): see the Sequential
+                                            # in-process call site above for why
+                                            # this stays hard-coded to 1 here
+                                            # rather than reading
+                                            # CIRCOS_PLOT_WORKERS - same
+                                            # Streamlit-process/`spawn` concern
+                                            # applies identically to this
+                                            # in-process 'Option B' Parallel
+                                            # Step 2 path.
+                                            n_workers=1)
+                                _log(f'Circos plot generated (took {time.time() - _t0:.1f}s).')
+                                result.release()
+
                 except Exception:
-                    pass  # best-effort - a logging failure shouldn't mask the real error
+                    tb_text = traceback.format_exc()
+                    st.error('Pipeline failed - see the traceback below.')
+                    st.code(tb_text, language='text')
+                    try:
+                        with open(log_file_path, 'a', encoding='utf-8') as log_file:
+                            log_file.write(f'\n[{datetime.now().strftime("%Y-%m-%d %H:%M:%S")}] Pipeline failed:\n')
+                            log_file.write(tb_text)
+                    except Exception:
+                        pass  # best-effort - a logging failure shouldn't mask the real error
 
-                # Requirement: make it easy to notice that partial progress
-                # was saved and exactly how to resume - checked generically
-                # (rather than branching on which mode was running) since
-                # only the relevant checkpoint file(s) will actually exist
-                # for whatever just failed (Sequential: a single
-                # '.checkpoint.json'; Parallel/Step 1 run locally: that
-                # batch's own '.checkpoint_<id>.json').
-                _seq_status = sequential_run_status(cfg['RESULT_NAME'])
-                _incomplete = find_incomplete_batches(cfg['RESULT_NAME'])
-                if _seq_status is not None:
-                    st.warning(
-                        f"Partial progress was saved: {_seq_status['completed']}/"
-                        f"{_seq_status['total_tasks']} task(s) completed before this failure. "
-                        f"Fix the error above and re-run the same job - EasiGP will "
-                        f"automatically resume from task {_seq_status['resume_from_task']}/"
-                        f"{_seq_status['total_tasks']} instead of starting over."
-                    )
-                if _incomplete:
-                    st.warning(
-                        f"{len(_incomplete)} Parallel batch(es) have partial progress saved - "
-                        f"re-submit these (same config, same batch_id) to resume automatically:"
-                    )
-                    st.code('\n'.join(describe_incomplete_batch(b) for b in _incomplete), language='text')
-                    st.write("**Incomplete batch ID list:**")
-                    st.code(format_batch_id_list([b['batch_id'] for b in _incomplete]), language='text')
-            else:
-                st.success('Pipeline completed successfully.')
+                    # Requirement: make it easy to notice that partial progress
+                    # was saved and exactly how to resume - checked generically
+                    # (rather than branching on which mode was running) since
+                    # only the relevant checkpoint file(s) will actually exist
+                    # for whatever just failed (Sequential: a single
+                    # '.checkpoint.json'; Parallel/Step 1 run locally: that
+                    # batch's own '.checkpoint_<id>.json').
+                    _seq_status = sequential_run_status(cfg['RESULT_NAME'])
+                    _incomplete = find_incomplete_batches(cfg['RESULT_NAME'])
+                    if _seq_status is not None:
+                        st.warning(
+                            f"Partial progress was saved: {_seq_status['completed']}/"
+                            f"{_seq_status['total_tasks']} task(s) completed before this failure. "
+                            f"Fix the error above and re-run the same job - EasiGP will "
+                            f"automatically resume from task {_seq_status['resume_from_task']}/"
+                            f"{_seq_status['total_tasks']} instead of starting over."
+                        )
+                    if _incomplete:
+                        st.warning(
+                            f"{len(_incomplete)} Parallel batch(es) have partial progress saved - "
+                            f"re-submit these (same config, same batch_id) to resume automatically:"
+                        )
+                        st.code('\n'.join(describe_incomplete_batch(b) for b in _incomplete), language='text')
+                        st.write("**Incomplete batch ID list:**")
+                        st.code(format_batch_id_list([b['batch_id'] for b in _incomplete]), language='text')
+                else:
+                    st.success('Pipeline completed successfully.')
 
-        # Requirement: report any missing Step 2 batches somewhere more
-        # visible/copy-pasteable than the pipeline log alone (which already
-        # has the same information via the '[assemble] WARNING:' line
-        # above, from assemble()'s own print()).
-        if missing_batches:
-            st.warning(
-                f"{len(missing_batches)} batch(es) produced no output and appear to be "
-                f"missing. Re-run Step 1 for exactly these batch ID(s) once the "
-                f"underlying problem is fixed, then re-run Step 2:"
-            )
-            st.code(format_batch_id_list(missing_batches), language='text')
+            # Requirement: report any missing Step 2 batches somewhere more
+            # visible/copy-pasteable than the pipeline log alone (which already
+            # has the same information via the '[assemble] WARNING:' line
+            # above, from assemble()'s own print()).
+            if missing_batches:
+                st.warning(
+                    f"{len(missing_batches)} batch(es) produced no output and appear to be "
+                    f"missing. Re-run Step 1 for exactly these batch ID(s) once the "
+                    f"underlying problem is fixed, then re-run Step 2:"
+                )
+                st.code(format_batch_id_list(missing_batches), language='text')
 
-        # Requirement: make it easy to notice, at a glance, which Parallel
-        # batch(es) STARTED but did NOT finish - distinct from
-        # missing_batches above (which never produced any output at all).
-        # These have partial results on disk (see checkpoint_utils.py) that
-        # were deliberately excluded from the assembled results, each with
-        # a known resume point.
-        if incomplete_batches:
-            st.warning(
-                f"{len(incomplete_batches)} batch(es) started but did NOT finish - they hit an "
-                f"error partway through, and their partial results were excluded from the "
-                f"assembled output above. Re-submit each one below (same config, same batch_id) "
-                f"to resume it automatically from where it stopped:"
-            )
-            st.code('\n'.join(describe_incomplete_batch(b) for b in incomplete_batches), language='text')
+            # Requirement: make it easy to notice, at a glance, which Parallel
+            # batch(es) STARTED but did NOT finish - distinct from
+            # missing_batches above (which never produced any output at all).
+            # These have partial results on disk (see checkpoint_utils.py) that
+            # were deliberately excluded from the assembled results, each with
+            # a known resume point.
+            if incomplete_batches:
+                st.warning(
+                    f"{len(incomplete_batches)} batch(es) started but did NOT finish - they hit an "
+                    f"error partway through, and their partial results were excluded from the "
+                    f"assembled output above. Re-submit each one below (same config, same batch_id) "
+                    f"to resume it automatically from where it stopped:"
+                )
+                st.code('\n'.join(describe_incomplete_batch(b) for b in incomplete_batches), language='text')
 
-        if log_buffer.getvalue().strip():
-            with st.expander('Pipeline log', expanded=True):
-                st.caption(f'Also saved to: {log_file_path}')
-                st.code(log_buffer.getvalue(), language='text')
+            if log_buffer.getvalue().strip():
+                with st.expander('Pipeline log', expanded=True):
+                    st.caption(f'Also saved to: {log_file_path}')
+                    st.code(log_buffer.getvalue(), language='text')
 
 save_gui_state()

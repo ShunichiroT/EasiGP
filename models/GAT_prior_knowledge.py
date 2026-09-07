@@ -5,7 +5,6 @@ import torch.nn.functional as F
 import torch_geometric.transforms as T
 import os
 import shap
-from itertools import product
 from scipy.stats import pearsonr
 from sklearn.metrics import mean_squared_error
 from sklearn.ensemble import RandomForestRegressor
@@ -13,6 +12,22 @@ from torch_geometric.data import Data
 from torch_geometric.nn import GATv2Conv, global_mean_pool
 from torch_geometric.loader import DataLoader
 from torch_geometric.explain import Explainer, CaptumExplainer
+
+from pipeline_utils import (
+    get_active_compute_resources, apply_torch_compute_settings, gpu_slot,
+    dataloader_num_workers, torch_eval_batch_size, split_batched_edge_attention,
+)
+from models.interaction_extraction import tree_shap_interactions
+
+# ver4-4 R3.a (blueprint §2.3.2, root-cause finding R3.a): n_estimators and
+# the SHAP-interaction sample count below used to be inline literals. Lifted
+# into named module constants purely to make the divergence from
+# Preprocess/data_driven_prior_network.py (which takes both of these values
+# from config, not a hard-coded literal) at least VISIBLE here - R3 does not
+# require making these configurable (that would be a HPARAM_SPECS/I5 change
+# and is out of scope for this requirement).
+_RF_N_ESTIMATORS = 500
+_SHAP_INTERACTION_SAMPLE_SIZE = 50
 
 
 def GAT_prior_knowledge(data_train, data_valid, data_test, params):
@@ -34,27 +49,86 @@ def GAT_prior_knowledge(data_train, data_valid, data_test, params):
     top_rate = params[7]
     marker_effect = params[8]
     samples = params[9]
+    # Update ID ver4-5, R2 (blueprint §4.2/§4.4): appended, not inserted -
+    # I5. Read defensively (a ver4-4 config's shorter params list keeps
+    # working, exactly as it did the day this field didn't exist).
+    # Default False preserves ver4-4 behaviour: no run writes rows to
+    # Interaction.csv for this model unless this is explicitly turned on.
+    emit_interaction = params[10] if len(params) > 10 else False
 
-    
     ## Train RF & extract interactions
 
     train_x, train_y = data_train.iloc[:,:-1], data_train.iloc[:,-1]
 
-    rf = RandomForestRegressor(n_estimators = 500, random_state = 40)
+    # ver4-4 R3.a: sklearn defaults n_jobs to 1 (one core) when not passed
+    # explicitly - this RandomForestRegressor fits on the FULL marker set
+    # and its SHAP interactions define this model's entire graph topology
+    # (architecture doc §9.3), making it one of the most expensive
+    # single-threaded steps in the tree despite every OTHER RF in the
+    # codebase already being threaded (root-cause finding R3.a).
+    _resources = get_active_compute_resources()
+    rf = RandomForestRegressor(
+        n_estimators=_RF_N_ESTIMATORS, random_state=40,
+        n_jobs=_resources['n_jobs'],
+    )
     rf.fit(train_x, train_y)
-    
-    explainer = shap.TreeExplainer(rf)
-    f_imp_inter_train = abs(explainer.shap_interaction_values(shap.sample(train_x,50)).sum(axis=0))
-    np.fill_diagonal(f_imp_inter_train, 0)
-    mask = np.ones(f_imp_inter_train.shape,dtype='bool')
-    mask[np.triu_indices(len(f_imp_inter_train))] = False
-    f_imp_inter_train[mask == False] = 0
-    f_imp_inter_train = pd.DataFrame(f_imp_inter_train).fillna(0)
-    
-    pair = pd.DataFrame(product(list(f_imp_inter_train.columns), list(f_imp_inter_train.columns)))
-    pair = pd.concat([pair,f_imp_inter_train.melt().iloc[:,1]],axis=1)
-    pair = pair[pair['value'] > 0].reset_index(drop=True)
-    pair = pair[(pair['value'] >= np.quantile(pair['value'].to_numpy().flatten(), 1-(top_rate/100)))]
+
+    # Update ID ver4-5, R2 (blueprint §4.4): the pairwise-SHAP matrix this
+    # model has ALWAYS computed here (purely to decide its own graph
+    # topology - see module docstring) now goes through the SAME shared
+    # extractor models/RF.py and Preprocess/data_driven_prior_network.py
+    # use, instead of a third private copy of the same abs()/sum()/
+    # triangle/melt arithmetic. reduce='sum_then_abs' is this file's OWN
+    # pre-existing reduction order (deliberately different from RF.py's
+    # abs-then-sum order - see interaction_extraction.tree_shap_
+    # interactions()'s own docstring), passed explicitly so this call is a
+    # numeric no-op for the topology this model builds below. marker1/
+    # marker2 in the returned frame are real marker NAMES (verified
+    # equivalent, up to a harmless marker1<->marker2 swap a symmetric
+    # matrix's two triangles produce, to this function's own previous
+    # positional-pair implementation - see the Change Summary).
+    _pair_named = tree_shap_interactions(
+        rf, shap.sample(train_x, _SHAP_INTERACTION_SAMPLE_SIZE), train_x.columns,
+        n_jobs=_resources['n_jobs'], reduce='sum_then_abs',
+    )
+    # Same top-`top_rate`% edge-selection threshold this model has always
+    # applied to decide which marker pairs become graph edges - unchanged
+    # (this governs the model's own PREDICTIONS, not just what gets
+    # reported, so it is deliberately kept byte-for-byte identical to
+    # before: same quantile, same '>=' operator - only the matrix this
+    # threshold is applied to now comes from the shared extractor above).
+    _pair_named = _pair_named[
+        _pair_named['value'] >= np.quantile(_pair_named['value'].to_numpy(), 1 - (top_rate / 100))
+    ].reset_index(drop=True)
+
+    # Requirement 2 (near-zero marginal cost, blueprint §1): when this
+    # model is asked to EMIT its interaction pairs, this IS that same,
+    # already-computed, already-filtered pair set above - no second
+    # computation, no second threshold - with real marker names, ready to
+    # write straight to Interaction.csv (see genomic_prediction.py's
+    # accumulation step, gated by model_registry.emits_interactions()).
+    sample_interaction = _pair_named.copy() if emit_interaction else pd.DataFrame()
+
+    # The torch graph-construction code below needs POSITIONAL indices
+    # (edge_index must be integer node positions, not names) - map back
+    # via this task's own column order, which is exactly the same
+    # `marker_names` tree_shap_interactions() was given above, so this
+    # mapping is guaranteed complete (every name in _pair_named came from
+    # train_x.columns in the first place). `pair` keeps its historical
+    # shape (an unnamed 2-column-plus-value frame, columns 0/1 read
+    # positionally by edges_from/edges_to below) so nothing downstream of
+    # this point needs to change.
+    _col_pos = {name: pos for pos, name in enumerate(train_x.columns)}
+    # .astype(np.int64) is a defensive dtype fix, not a behaviour change:
+    # an EMPTY _pair_named (no pair survived the top_rate threshold above)
+    # would otherwise map to a float64 (pandas' own empty-Series default),
+    # not the integer dtype torch.from_numpy()/edges_from/edges_to below
+    # expect - guarding this edge case explicitly rather than relying on
+    # torch to tolerate it.
+    pair = pd.DataFrame({
+        0: _pair_named['marker1'].map(_col_pos),
+        1: _pair_named['marker2'].map(_col_pos),
+    }).astype(np.int64)
     
     ## Preprocess the data so that it can be converted into a graph format    
     if VALID:
@@ -155,126 +229,159 @@ def GAT_prior_knowledge(data_train, data_valid, data_test, params):
                 return x
                 
     model = GAT(hidden_channels=neuron, out_channels=1, dpout=dropout)
-    
+
+    # ver4-4 R4.b/c/d/e: device/AMP/loader-hygiene settings resolved
+    # BEFORE the loaders (moved up from their original position) - see
+    # GAT_fully_connected.py's identical note for the full rationale.
+    _resources = get_active_compute_resources()
+    device = torch.device(_resources['device'])
+    apply_torch_compute_settings(_resources)
+    use_amp = bool(_resources['use_amp']) and device.type == 'cuda'
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    _num_workers = dataloader_num_workers(_resources)
+    _pin_memory = device.type == 'cuda'
+    _eval_batch = torch_eval_batch_size(_resources, _resources.get('gpu_eval_batch'))
+
     train_loader = DataLoader(data_train, 
                              shuffle=True,
-                             batch_size=bsize)
+                             batch_size=bsize,
+                             num_workers=_num_workers, pin_memory=_pin_memory)
     if VALID:
         valid_loader = DataLoader(data_valid, 
-                                 batch_size=bsize)
+                                 batch_size=bsize,
+                                 num_workers=_num_workers, pin_memory=_pin_memory)
     test_loader = DataLoader(data_test, 
-                             batch_size=1)
-    
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    
-    ## Train GAT
-    model.train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lrate, weight_decay=decay)
-    
-    for epoch in range(epoch): 
-        loss_train_sum = 0
-        batch_size = len(train_loader)
-        
-        for batch in train_loader:
-            batch = batch.to(device)
-            optimizer.zero_grad()
-            out = model(batch.x,batch.edge_index,batch.batch,None)
-            loss = F.mse_loss(torch.squeeze(out), batch.y)                            
-            loss.backward()
-            optimizer.step()
-            loss_train_sum += loss 
-        
-        print(f'Epoch {epoch:>3} | Train Loss: {loss_train_sum/batch_size:.5f}')
-    
-    ## Predict phenotypes for the test data
-    model.eval()
-        
-    predicted_test = []
-    actual_test = []
-    attention = []
-    for test in test_loader:
-        result, att = model(test.x,test.edge_index,test.batch,True)
-        predicted_test += result.tolist()
-        actual_test += test.y.tolist()
-        attention += [att[1].detach().flatten().tolist()]
-               
-    predicted_test = [item for sublist in predicted_test for item in sublist]     
-    
-    ## Calculate the metrics
-    mse = mean_squared_error(actual_test,predicted_test)
-    r = pearsonr(actual_test, predicted_test)[0]
-    
-    ## Predict phenotypes for the validation data
-    predicted_valid = []
-    actual_valid = []
-    if VALID:
-        for valid in valid_loader:
-            result = model(valid.x,valid.edge_index,valid.batch,None)
-            predicted_valid += result.tolist()
-            actual_valid += valid.y.tolist()
-                   
-        predicted_valid = [item for sublist in predicted_valid for item in sublist]   
-    
-    ## Predict phenotypes for the train data
-    train_loader = DataLoader(data_train, 
-                             shuffle=False,
-                             batch_size=bsize)
-    predicted_train = []
-    #actual_train = []
-    for train in train_loader:
-        result = model(train.x,train.edge_index,train.batch,None)
-        predicted_train += result.tolist()
-        #actual_train += train.y.tolist()
-    
-    predicted_train = [k for i in predicted_train for k in i]
+                             batch_size=_eval_batch,
+                             num_workers=_num_workers, pin_memory=_pin_memory)
 
-    ## Extract genomic marker effects
-    if marker_effect == True:
-        explainer = Explainer(
-            model = model,
-            algorithm=CaptumExplainer('IntegratedGradients'),
-            explanation_type='model',
-            node_mask_type='attributes',
-            edge_mask_type=None, # do not change here
-            model_config = dict(
-                mode='regression',
-                task_level='node',
-                return_type='raw',
-                ),
-        )
-        
-        test_loader = DataLoader(data_test, 
-                                shuffle=True,
-                                batch_size=1)
-        
-        explanation = pd.DataFrame()
-        cnt = 0
-        for batch in test_loader:
-            t = explainer(
-                batch.x,
-                batch.edge_index,
-                batch=batch.batch,
-                return_attention=None
+    with gpu_slot():
+        model.to(device)
+
+        ## Train GAT
+        model.train()
+        optimizer = torch.optim.Adam(model.parameters(), lr=lrate, weight_decay=decay)
+
+        for epoch in range(epoch): 
+            loss_train_sum = 0
+            batch_size = len(train_loader)
+
+            for batch in train_loader:
+                batch = batch.to(device)
+                optimizer.zero_grad()
+                with torch.autocast(device_type=device.type, enabled=use_amp):
+                    out = model(batch.x,batch.edge_index,batch.batch,None)
+                    loss = F.mse_loss(torch.squeeze(out), batch.y)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                loss_train_sum += loss.detach()
+
+            print(f'Epoch {epoch:>3} | Train Loss: {loss_train_sum/batch_size:.5f}')
+
+        ## Predict phenotypes for the test data
+        model.eval()
+
+        predicted_test = []
+        actual_test = []
+        attention = []
+        with torch.no_grad():
+            for test in test_loader:
+                test = test.to(device)
+                result, att = model(test.x,test.edge_index,test.batch,True)
+                predicted_test += result.cpu().tolist()
+                actual_test += test.y.cpu().tolist()
+                # ver4-4 R4.b - see GAT_fully_connected.py's identical note.
+                for alpha_g in split_batched_edge_attention(att[1], test.num_graphs):
+                    attention += [alpha_g.flatten().tolist()]
+
+        predicted_test = [item for sublist in predicted_test for item in sublist]     
+
+        ## Calculate the metrics
+        mse = mean_squared_error(actual_test,predicted_test)
+        r = pearsonr(actual_test, predicted_test)[0]
+
+        ## Predict phenotypes for the validation data
+        predicted_valid = []
+        actual_valid = []
+        if VALID:
+            with torch.no_grad():
+                for valid in valid_loader:
+                    valid = valid.to(device)
+                    result = model(valid.x,valid.edge_index,valid.batch,None)
+                    predicted_valid += result.cpu().tolist()
+                    actual_valid += valid.y.cpu().tolist()
+
+            predicted_valid = [item for sublist in predicted_valid for item in sublist]   
+
+        ## Predict phenotypes for the train data
+        train_loader = DataLoader(data_train, 
+                                 shuffle=False,
+                                 batch_size=bsize,
+                                 num_workers=_num_workers, pin_memory=_pin_memory)
+        predicted_train = []
+        #actual_train = []
+        with torch.no_grad():
+            for train in train_loader:
+                train = train.to(device)
+                result = model(train.x,train.edge_index,train.batch,None)
+                predicted_train += result.cpu().tolist()
+                #actual_train += train.y.tolist()
+
+        predicted_train = [k for i in predicted_train for k in i]
+
+        ## Extract genomic marker effects
+        if marker_effect == True:
+            explainer = Explainer(
+                model = model,
+                algorithm=CaptumExplainer('IntegratedGradients'),
+                explanation_type='model',
+                node_mask_type='attributes',
+                edge_mask_type=None, # do not change here
+                model_config = dict(
+                    mode='regression',
+                    task_level='node',
+                    return_type='raw',
+                    ),
             )
-            t = pd.DataFrame(t['node_mask'].squeeze().detach()).sum(axis=1)
-            if explanation.shape[0] == 0:
-                explanation = t
-            else:
-                explanation += t
-            cnt += 1
-            
-            if cnt == samples:
-                break
-        
-        effect = pd.DataFrame(explanation/cnt).T
-        effect.columns = list(data_QTL_test.columns)
-    else:
-        effect = pd.DataFrame()
-    
-    attention = pd.concat([pd.DataFrame(edge_name_from),
-                           pd.DataFrame(edge_name_to),
-                           pd.DataFrame(attention).mean().T
-                           ],axis=1)
 
-    return r, mse, effect, predicted_test, predicted_valid, predicted_train, attention
+            test_loader = DataLoader(data_test, 
+                                    shuffle=True,
+                                    batch_size=1,
+                                    num_workers=_num_workers, pin_memory=_pin_memory)
+
+            explanation = pd.DataFrame()
+            cnt = 0
+            for batch in test_loader:
+                batch = batch.to(device)
+                t = explainer(
+                    batch.x,
+                    batch.edge_index,
+                    batch=batch.batch,
+                    return_attention=None
+                )
+                t = pd.DataFrame(t['node_mask'].squeeze().detach().cpu()).sum(axis=1)
+                if explanation.shape[0] == 0:
+                    explanation = t
+                else:
+                    explanation += t
+                cnt += 1
+
+                if cnt == samples:
+                    break
+
+            effect = pd.DataFrame(explanation/cnt).T
+            effect.columns = list(data_QTL_test.columns)
+        else:
+            effect = pd.DataFrame()
+
+        attention = pd.concat([pd.DataFrame(edge_name_from),
+                               pd.DataFrame(edge_name_to),
+                               pd.DataFrame(attention).mean().T
+                               ],axis=1)
+
+    # Update ID ver4-5, R2: sample_interaction (empty unless
+    # emit_interaction is True - see params unpacking above) is appended
+    # as an 8th return value. Every caller (_call_model() and the main
+    # per-task dispatch loop in genomic_prediction.py) was updated in
+    # lockstep (I3) to unpack it.
+    return r, mse, effect, predicted_test, predicted_valid, predicted_train, attention, sample_interaction

@@ -49,10 +49,12 @@ preview logic - see OTHER_MODELS_MARKER_SOURCE == 'gene_network_plus_rf').
 import numpy as np
 import pandas as pd
 import shap
-from itertools import product
 from sklearn.ensemble import RandomForestRegressor
 
 from Preprocess.RF_marker_filtering import select_rf_markers
+from Preprocess.LD_pruning import LD_pruning
+from pipeline_utils import get_active_compute_resources
+from models.interaction_extraction import tree_shap_interactions
 
 
 def select_markers_for_data_driven_network(train_x, train_y, rf_config):
@@ -156,6 +158,21 @@ def compute_data_driven_interactions(train_x_selected, train_y, base_rf_config, 
     if len(marker_names) < 2:
         return pd.DataFrame(columns=['marker_1', 'marker_2', 'value'])
 
+    # Patch 3, Requirement 3: this forest is deliberately ALWAYS
+    # scikit-learn/CPU, even when USE_GPU_SKLEARN is set and the marker-
+    # SELECTION forest just above (select_markers_for_data_driven_network()
+    # -> Preprocess.RF_marker_filtering.select_rf_markers()) used cuML/GPU
+    # for that step. shap.TreeExplainer (used a few lines below) requires
+    # a scikit-learn-compatible tree structure that cuML's GPU forest does
+    # not expose - the exact same reason models/RF.py's own SHAP-
+    # interaction refit always forces a CPU forest regardless of whether
+    # its main fit was GPU-backed (see that file's own comment). n_jobs is
+    # still resolved from the run's shared compute-resource settings
+    # (rather than hardcoded -1) so this CPU fit itself is at least
+    # correctly threaded - see _resolve_n_jobs()'s docstring in
+    # Preprocess/RF_marker_filtering.py for why that matters on a
+    # GPU allocation.
+    _resources = get_active_compute_resources()
     n_estimators = n_estimators_override if n_estimators_override is not None else base_rf_config.get('n_estimators', 500)
     rf = RandomForestRegressor(
         n_estimators=int(n_estimators),
@@ -163,25 +180,36 @@ def compute_data_driven_interactions(train_x_selected, train_y, base_rf_config, 
         max_features=base_rf_config.get('max_features', 'sqrt'),
         min_samples_leaf=base_rf_config.get('min_samples_leaf', 1),
         random_state=random_state,
-        n_jobs=-1,
+        # Was hardcoded -1 ("every core") - not cgroup-aware, so it
+        # oversubscribes/thrashes on a lean CPU allocation (e.g. a GPU
+        # job) exactly like RF_marker_filtering.py's own forest did; see
+        # Preprocess.RF_marker_filtering._resolve_n_jobs()'s docstring.
+        n_jobs=base_rf_config.get('n_jobs') if base_rf_config.get('n_jobs') is not None
+        else _resources['n_jobs'],
     )
     rf.fit(train_x_selected, train_y)
 
-    # From here on, byte-for-byte the same recipe as
-    # models/GAT_prior_knowledge.py's own interaction search, just indexed
-    # by marker NAME afterwards instead of staying purely positional.
-    explainer = shap.TreeExplainer(rf)
+    # Update ID ver4-5, R2 (blueprint §4.4): from here on, this used to be
+    # a private, byte-for-byte copy of models/GAT_prior_knowledge.py's own
+    # interaction search (indexed by marker NAME afterwards instead of
+    # staying purely positional) - both now call the SAME shared
+    # implementation, models.interaction_extraction.tree_shap_interactions(),
+    # with reduce='sum_then_abs' passed explicitly (this file's own,
+    # pre-existing reduction order - see that function's own docstring for
+    # why this redirection is a numeric no-op, including for the triangle-
+    # selection mechanism this file used to implement inline via
+    # itertools.product() + a lower-triangle mask). Only marker_1/marker_2's
+    # column NAMES differ from the shared function's own canonical
+    # marker1/marker2 (renamed immediately below), to keep this function's
+    # own public return-column contract (merge_biological_and_data_driven_
+    # networks and every other caller already expect 'marker_1'/'marker_2')
+    # completely unchanged.
     sample_n = min(sample_size, train_x_selected.shape[0])
-    f_imp_inter = abs(explainer.shap_interaction_values(shap.sample(train_x_selected, sample_n)).sum(axis=0))
-    np.fill_diagonal(f_imp_inter, 0)
-    mask = np.ones(f_imp_inter.shape, dtype='bool')
-    mask[np.triu_indices(len(f_imp_inter))] = False
-    f_imp_inter[mask == False] = 0
-    f_imp_inter = pd.DataFrame(f_imp_inter, index=marker_names, columns=marker_names).fillna(0)
-
-    pair = pd.DataFrame(product(marker_names, marker_names), columns=['marker_1', 'marker_2'])
-    pair = pd.concat([pair, f_imp_inter.melt().iloc[:, 1]], axis=1)
-    pair.columns = ['marker_1', 'marker_2', 'value']
+    pair = tree_shap_interactions(
+        rf, shap.sample(train_x_selected, sample_n), marker_names,
+        n_jobs=_resources['n_jobs'], reduce='sum_then_abs',
+    )
+    pair = pair.rename(columns={'marker1': 'marker_1', 'marker2': 'marker_2'})
     pair = pair[pair['value'] > 0].reset_index(drop=True)
     n_candidate_pairs = pair.shape[0]
     # Note for anyone eyeballing this against a manual "n choose 2" sanity
@@ -199,8 +227,191 @@ def compute_data_driven_interactions(train_x_selected, train_y, base_rf_config, 
           f"of these by interaction strength.")
     if pair.shape[0] == 0:
         return pair
-    pair = pair[pair['value'] >= np.quantile(pair['value'].to_numpy().flatten(), 1 - (top_rate / 100))]
+    # Bug fix (rank-based top-N%, not a quantile threshold): see
+    # models.interaction_extraction.top_select()'s own "Bug fix" note for
+    # the full reproduction of why a quantile-threshold comparison
+    # collapses whenever a large share of the ranked column is tied at
+    # the computed cutoff. `pair` is already restricted to `value > 0`
+    # just above, which is exactly what keeps this call site far less
+    # exposed than top_select()'s/circos_plot._select_top_interactions()'s
+    # own (which rank the FULL, still zero-inflated candidate table) -
+    # but the underlying quantile-comparison mechanism is the identical
+    # fragile pattern, so it is corrected here too rather than left to
+    # drift from the one shared, hardened implementation.
+    keep_n = int(round(n_candidate_pairs * (top_rate / 100)))
+    keep_n = max(0, min(keep_n, pair.shape[0]))
+    pair = pair.nlargest(keep_n, 'value')
     return pair.reset_index(drop=True)
+
+
+def ensure_bio_prior_merge_cache(model_name, merge_train, merge_valid, merge_test,
+                                  data_driven_merge, network_cache):
+    """Requirement 11 (efficiency) - PERFORMANCE FIX: this is the one
+    piece of logic that decides whether the data-driven merge's two
+    expensive steps (LD-pruning-then-RF-filtering, and the pairwise-
+    Shapley-interaction search) actually run, or are reused from
+    `network_cache`. It is a straight EXTRACTION of the caching logic
+    models/GAT_biological_prior_knowledge.py used to run inline (no
+    behaviour change for that call site - see it now simply calling this
+    function instead) - pulled out into its own, standalone function
+    specifically so genomic_prediction.py's GP() can ALSO call it
+    directly, up front in the MAIN process, before dispatching this
+    instance's hyperparameter-tuning trials.
+
+    WHY THAT SECOND CALL SITE IS NECESSARY (the actual bug this function
+    fixes)
+    --------------------------------------------------------------------
+    `network_cache` (GP()'s own `_bio_prior_merge_cache`, one fresh dict
+    per prediction task) is a plain, in-memory Python dict, mutated in
+    place by whichever call happens to find it empty first. That works
+    perfectly when every call for a given task runs in the SAME process
+    (the default, n_jobs<=1): the first call computes and caches, every
+    later call in that process reuses it - exactly the "one search per
+    task, not one per trial" cost this cache exists to guarantee (see
+    models/GAT_biological_prior_knowledge.py's own `network_cache`
+    docstring entry).
+
+    It stops working the moment hyperparameter-tuning trials for this
+    model are evaluated in SEPARATE WORKER PROCESSES - which
+    HP_TUNE_PARALLEL_TRIALS=True (the default) plus N_JOBS>1 (needed for
+    any real speed-up) requests for exactly this kind of expensive,
+    CPU-bound model. `genomic_prediction.py::ModelTrialRunner` (the
+    picklable stand-in for the model dispatch, used as
+    `tune_model_hyperparameters()`'s `run_model_fn`) is pickled and sent
+    to a `joblib.Parallel(backend='loky')` worker PROCESS for every
+    trial (Grid/Random batches, and Bayesian's own batched, constant-liar
+    rounds - see models/hyperparameter_tuning.py::_evaluate_batch()). A
+    worker process's own writes to its (deserialised, PER-PROCESS COPY
+    of) `network_cache` are entirely local to that process and are lost
+    the instant it returns - only the trial's numeric score comes back,
+    never the mutated dict. So a `network_cache` that is still cold at
+    the moment trials are first dispatched gets recomputed independently
+    by EVERY trial's own worker (potentially dozens of times per task,
+    for a Bayesian search's `1 + init_points + n_iter` evaluations) -
+    silently multiplying wall-clock time by however many trials actually
+    ran, even though every one of them needed the byte-identical result
+    (the merge config, `params[13]`, is deliberately never a tunable
+    field - see hparam_specs.py's own module docstring - so nothing about
+    it ever differs between trials).
+
+    The fix is not to make worker-to-parent cache propagation work (that
+    would need real inter-process synchronisation for something that's
+    only ever read, never written, after this point) - it's simpler than
+    that: call this function ONCE, here, in the driving/parent process,
+    BEFORE `tune_model_hyperparameters()` is ever invoked for this
+    instance this task. Because `network_cache` is captured BY VALUE
+    every time a `ModelTrialRunner` gets pickled for submission to a
+    worker, a `network_cache` that is already fully populated at that
+    point is pickled whole, complete, into every worker - which then
+    takes the (already-existing) cache-HIT branch inside
+    `GAT_biological_prior_knowledge()` itself, doing zero recomputation,
+    regardless of how many trials run or how many separate processes
+    they run in. See genomic_prediction.py's own pre-warming call site
+    (searched for by this function's own name) for exactly where this is
+    invoked.
+
+    Parameters
+    ----------
+    model_name : str
+        This bio-prior instance's own name (e.g.
+        'GAT_biological_prior_knowledge', or '..._2' for a second
+        instance) - the SAME cache key
+        models/GAT_biological_prior_knowledge.py's own `MODEL_NAME`
+        parameter uses, so a call from here and a call from that
+        function's own inline logic address the exact same
+        `network_cache` entry.
+    merge_train, merge_valid, merge_test : pd.DataFrame
+        The TRUE, full/unrestricted-marker genotype pool for this task -
+        exactly what would be passed as `GAT_biological_prior_knowledge()`'s
+        own `merge_source_data` (or `data_train`/`data_valid`/`data_test`
+        when that's `None`). `merge_valid` is accepted only for interface
+        symmetry with that data - it is never actually read, exactly as
+        the model file's own inline version never read `_merge_valid`
+        either (the side pipeline only ever fits on train and narrows
+        LD_pruning's own test argument, never touching validation).
+    data_driven_merge : dict
+        `params[13]` - e.g. `{'enabled': False}` (no-op), or the full
+        merge config when enabled - see
+        `models.GAT_biological_prior_knowledge.GAT_biological_prior_knowledge`'s
+        own docstring for the required shape.
+    network_cache : dict or None
+        The task-owned cache dict (GP()'s own `_bio_prior_merge_cache`).
+        `None` disables caching entirely - this function still computes
+        and returns the correct result, it just never stores or reuses
+        anything (byte-identical to how the model file's own inline
+        version already handled `network_cache=None`).
+
+    Returns
+    -------
+    (rf_selected_markers, pair_df) : (list of str, pd.DataFrame)
+        `(None, None)` when `data_driven_merge['enabled']` is falsy (the
+        merge feature is off) - nothing to compute or cache.
+    """
+    if not isinstance(data_driven_merge, dict):
+        raise ValueError(
+            f"data_driven_merge must be a dict, e.g. {{'enabled': False}}, got "
+            f"{data_driven_merge!r} - see GAT_biological_prior_knowledge()'s own docstring."
+        )
+    if not data_driven_merge.get('enabled', False):
+        return None, None
+
+    rf_filter_cfg = data_driven_merge.get('rf_filter')
+    if rf_filter_cfg is None:
+        raise ValueError(
+            "data_driven_merge['rf_filter'] is required when data_driven_merge['enabled'] "
+            "is True - see GAT_biological_prior_knowledge()'s own docstring."
+        )
+    top_rate = data_driven_merge.get('top_rate')
+    if top_rate is None:
+        raise ValueError(
+            "data_driven_merge['top_rate'] is required when data_driven_merge['enabled'] "
+            "is True - see GAT_biological_prior_knowledge()'s own docstring."
+        )
+
+    _cache_entry = network_cache.setdefault(model_name, {}) if network_cache is not None else None
+    merge_train_y = merge_train.iloc[:, -1]
+
+    if _cache_entry is not None and 'rf_selected_markers' in _cache_entry:
+        rf_selected_markers = _cache_entry['rf_selected_markers']
+        print(f"[{model_name}] Data-driven merge: reusing {len(rf_selected_markers)} "
+              f"RF-selected marker(s) already computed earlier this task (LD pruning/RF "
+              f"filtering skipped).")
+    else:
+        merge_train_x = merge_train.iloc[:, :-1]
+        if data_driven_merge.get('ld_prune') is not None:
+            merge_train_x, _, _ = LD_pruning(
+                merge_train_x, pd.DataFrame(), merge_test.iloc[:, :-1], data_driven_merge['ld_prune']
+            )
+        rf_selected_markers, _fitted_rf = select_markers_for_data_driven_network(
+            merge_train_x, merge_train_y, rf_filter_cfg
+        )
+        print(f"[{model_name}] Data-driven merge: {len(rf_selected_markers)} marker(s) "
+              f"selected by RF filtering (out of {merge_train_x.shape[1]} candidate(s)).")
+        if _cache_entry is not None:
+            _cache_entry['rf_selected_markers'] = rf_selected_markers
+
+    if _cache_entry is not None and 'pair_df' in _cache_entry:
+        pair_df = _cache_entry['pair_df']
+        print(f"[{model_name}] Data-driven merge: reusing {pair_df.shape[0]} pairwise "
+              f"interaction(s) already computed earlier this task.")
+    else:
+        # merge_train (not merge_train_x, which may not even exist in the
+        # cache-hit branch above) sliced directly by rf_selected_markers -
+        # selecting marker COLUMNS by name is always valid regardless of
+        # whether pruning happened in this call or was reused from the
+        # cache, since pruning only ever narrows which columns exist,
+        # never renames/transforms them.
+        pair_df = compute_data_driven_interactions(
+            merge_train.loc[:, rf_selected_markers], merge_train_y, rf_filter_cfg, top_rate,
+            n_estimators_override=data_driven_merge.get('shap_n_estimators_override'),
+        )
+        print(f"[{model_name}] Data-driven merge: {pair_df.shape[0]} unique pairwise "
+              f"interaction(s) kept (top {top_rate}% - see the data_driven_prior_network log "
+              f"line just above for the full candidate-pool count this percentage was taken of).")
+        if _cache_entry is not None:
+            _cache_entry['pair_df'] = pair_df
+
+    return rf_selected_markers, pair_df
 
 
 def merge_biological_and_data_driven_networks(gene_to_markers, pair_df, rf_selected_markers, marker_info):

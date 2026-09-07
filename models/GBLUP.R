@@ -36,7 +36,7 @@ library(iml)
 # than an exact-vs-approximate change in kind - increase max_shap_features
 # and/or the Shapley nIter/burnIn towards the main model's values for a
 # closer (but slower) match to the original behaviour.
-GBLUP <- function(train, valid, test, params, RESULT_NAME){
+GBLUP <- function(train, valid, test, params, RESULT_NAME, K_precomputed=NULL){
   
   params <- unlist(params)
   nIter <- as.numeric(params[1])
@@ -46,6 +46,24 @@ GBLUP <- function(train, valid, test, params, RESULT_NAME){
   max_shap_features <- params[5]
   Shapley_nIter <- as.numeric(params[6])
   Shapley_burnIn <- as.numeric(params[7])
+  # ver4-4 R3.d (blueprint §2.3.2): appended, never inserted (I5). Both
+  # default to today's exact behaviour when absent - either because an
+  # older, shorter HPARAMETERS['GBLUP'] list was padded with these
+  # defaults on the Python side (genomic_prediction.py, RK-8), or because
+  # R's own out-of-bounds vector indexing returns NA here, which the
+  # is.na() guards below catch identically either way.
+  #   params[8] shap_row_offset : first row (0-based) of the len-row
+  #     Shapley block below to explain in THIS call - lets Python split
+  #     that block's rows across worker PROCESSES (never threads - BGLR's
+  #     PID-based saveAt prefix depends on distinct PIDs, invariant I10).
+  #   params[9] shap_row_count  : how many rows, starting at
+  #     shap_row_offset, THIS call explains. -1 (default) means "every
+  #     row of the len-row block", reproducing today's single-process
+  #     1:len loop exactly.
+  shap_row_offset <- suppressWarnings(as.numeric(params[8]))
+  if (is.na(shap_row_offset)) shap_row_offset <- 0
+  shap_row_count <- suppressWarnings(as.numeric(params[9]))
+  if (is.na(shap_row_count)) shap_row_count <- -1
 
   # A process- and call-unique id for BGLR's saveAt path - see RKHS.R for the
   # full explanation. In short: the same './Result/<RESULT_NAME>/GBLUP_'
@@ -73,8 +91,21 @@ GBLUP <- function(train, valid, test, params, RESULT_NAME){
   data_qtl <- data.frame(lapply(data[,1:(ncol(data)-1)], as.numeric))
   data_pheno <- data[,ncol(data):ncol(data)]
   
-  X <- scale(data_qtl, center = T, scale = T)
-  G <- as.matrix((X %*% t(X)) / ncol(data_qtl))  # same as tcrossprod(X) / p
+  # ver4-4 R4.h (blueprint §2.4.2): an optional precomputed genomic
+  # relationship matrix - built in Python, optionally on GPU, over
+  # train+valid+test in the SAME row order rbind(train,valid,test)
+  # produces here - skips this function's own O(N^2*M) scale()+tcrossprod
+  # build entirely. Symmetry/finiteness are the CALLER's own
+  # responsibility (genomic_prediction.py validates before ever passing
+  # K_precomputed - see that module's own R4.h wiring); this function
+  # trusts a given K_precomputed exactly as it already trusted a self-
+  # built G, with no additional validation here.
+  if (!is.null(K_precomputed)) {
+    G <- as.matrix(K_precomputed)
+  } else {
+    X <- scale(data_qtl, center = T, scale = T)
+    G <- as.matrix((X %*% t(X)) / ncol(data_qtl))  # same as tcrossprod(X) / p
+  }
 
   #X <- scale(data_qtl)/sqrt(ncol(data_qtl))
   #X <- X[ , colSums(is.na(X)) == 0]
@@ -168,19 +199,46 @@ GBLUP <- function(train, valid, test, params, RESULT_NAME){
     
     effect <- data.frame()
     if(nrow(test) < Shapley_num){len <- nrow(test)}else{len <- Shapley_num}
-    for(j in 1:len){
-      shapley <- Shapley$new(predictor, x.interest = data_qtl_shap[j+nrow(train)+nrow(valid), ], sample.size = 1)
-      tmp <- data.frame(t(shapley$results[,1:2]))
-      # Label these columns by POSITION within top_positions (1, 2, 3, ...)
-      # rather than by marker name - avoids relying on iml::Shapley's
-      # internal feature-name handling matching data_qtl_shap's names
-      # exactly, which is itself subject to the same R renaming risk.
-      colnames(tmp) <- as.character(seq_along(top_positions))
-      effect <- dplyr::bind_rows(effect, tmp[2,])
+    # ver4-4 R3.d: row-range fan-out. shap_row_count=-1 (default) explains
+    # every row 1:len exactly as before - a positive shap_row_count
+    # restricts this call to a contiguous sub-range [shap_row_offset+1,
+    # shap_row_offset+shap_row_count] of that SAME len-row block, so N
+    # worker processes can each explain a different slice in parallel.
+    # colSums(abs(...)) below is then computed over ONLY this call's own
+    # row subset - genomic_prediction.py sums each worker's own partial
+    # colSums(abs(...)) vector together to reconstruct the SAME total a
+    # single, unsplit 1:len call would have produced (colSums(abs(x)) is
+    # linear/associative across ROW-disjoint partitions of x - verified
+    # in the ver4-4 Stage 5 design record).
+    effective_row_count <- if (shap_row_count < 0) len else max(0, min(shap_row_count, len - shap_row_offset))
+    row_start <- shap_row_offset + 1
+    row_end <- shap_row_offset + effective_row_count
+    if (effective_row_count > 0) {
+      for(j in row_start:row_end){
+        shapley <- Shapley$new(predictor, x.interest = data_qtl_shap[j+nrow(train)+nrow(valid), ], sample.size = 1)
+        tmp <- data.frame(t(shapley$results[,1:2]))
+        # Label these columns by POSITION within top_positions (1, 2, 3, ...)
+        # rather than by marker name - avoids relying on iml::Shapley's
+        # internal feature-name handling matching data_qtl_shap's names
+        # exactly, which is itself subject to the same R renaming risk.
+        colnames(tmp) <- as.character(seq_along(top_positions))
+        effect <- dplyr::bind_rows(effect, tmp[2,])
+      }
     }
     
-    effect <- effect %>% mutate_all(as.numeric)
-    effect <- colSums(abs(effect))
+    if (nrow(effect) == 0) {
+      # ver4-4 R3.d: this call's own row range explained zero rows (e.g.
+      # a defensive shap_row_offset/shap_row_count combination that
+      # doesn't overlap [1, len] at all) - report an all-zero contribution
+      # for every top_positions column, rather than letting colSums() on
+      # a genuinely EMPTY (0-column) data.frame collapse to a zero-length
+      # vector, which would silently break the effect_full[top_positions]
+      # <- effect assignment below.
+      effect <- setNames(rep(0, length(top_positions)), as.character(seq_along(top_positions)))
+    } else {
+      effect <- effect %>% mutate_all(as.numeric)
+      effect <- colSums(abs(effect))
+    }
     # effect is now a plain numeric vector indexed 1..length(top_positions),
     # in the SAME order as top_positions (colnames(tmp) was set to
     # seq_along(top_positions) every iteration, so column j always

@@ -140,7 +140,8 @@ import re
 import numpy as np
 import pandas as pd
 
-from pipeline_utils import unify_columns_by_position
+from pipeline_utils import unify_columns_by_position, get_active_compute_resources
+from Preprocess import ld_kernels
 
 # NOTE: deliberately no `logging` module usage anywhere in this file. This
 # codebase never calls logging.basicConfig() (or attaches any handler)
@@ -188,6 +189,25 @@ _AXIS_LABEL = {
 # way).
 _VECTORIZED_MAX_GROUP_MARKERS = 4000
 
+# ver4-4 R4.g: a CUDA device can comfortably hold (and matrix-multiply) a
+# considerably larger dense correlation matrix than a CPU process wants to
+# allocate in plain NumPy - this multiplier only ever WIDENS the fast path
+# on a CUDA device (never narrows it on CPU, where the multiplier is
+# exactly 1, reproducing _VECTORIZED_MAX_GROUP_MARKERS unchanged), so a
+# group that would have needed the slow per-pair fallback on CPU can stay
+# on the fast, vectorised path when GPU_LD_R2 resolved a CUDA device.
+_CUDA_VECTORIZED_GROUP_MULTIPLIER = 5
+
+
+def _vectorized_max_group_markers(device: str) -> int:
+    """Device-aware ceiling for `_decay_pairs_for_group`'s vectorised fast
+    path (ver4-4 R4.g) - `_VECTORIZED_MAX_GROUP_MARKERS` unchanged on CPU
+    (today's exact behaviour), widened on a CUDA device (see
+    `_CUDA_VECTORIZED_GROUP_MULTIPLIER` above)."""
+    if str(device).startswith('cuda'):
+        return _VECTORIZED_MAX_GROUP_MARKERS * _CUDA_VECTORIZED_GROUP_MULTIPLIER
+    return _VECTORIZED_MAX_GROUP_MARKERS
+
 _DECAY_COLUMNS = ['bin_start', 'bin_end', 'bin_mid', 'mean_r2', 'n_pairs']
 # Requirement: LD decay is a property of the genotypes (which individuals
 # end up in a scenario's training set), not of the phenotype being
@@ -218,18 +238,18 @@ def _pairwise_r2(x: np.ndarray, y: np.ndarray) -> float:
     """Unphased hardcall r^2 between two genotype dosage vectors, ignoring
     samples missing in either - the exact same statistic (and the same
     handling of missing/monomorphic markers) as
-    Preprocess.LD_pruning.LD_pruning's own internal _pairwise_r2,
-    duplicated here (rather than imported) so this module has zero
-    dependency on LD_pruning.py's internals and can't be broken by a
-    future refactor there (see module docstring)."""
-    mask = ~(np.isnan(x) | np.isnan(y))
-    if mask.sum() < 3:
-        return np.nan
-    xm, ym = x[mask], y[mask]
-    if xm.std() == 0 or ym.std() == 0:
-        return np.nan
-    r = np.corrcoef(xm, ym)[0, 1]
-    return np.nan if np.isnan(r) else r * r
+    Preprocess.LD_pruning.LD_pruning's own internal _pairwise_r2.
+
+    ver4-4 R4.g: both this function and LD_pruning.py's own now delegate
+    to the shared `ld_kernels.pairwise_r2()` core (previously duplicated
+    verbatim between the two files - see that function's own docstring) -
+    `degenerate=float('nan')` preserves THIS module's own existing
+    sentinel exactly (LD_pruning.py's own thin wrapper uses
+    `degenerate=0.0` instead; the two modules' conventions are
+    deliberately NOT unified, since this module's every caller filters
+    degenerate pairs out via `np.isnan()`, while LD_pruning.py's callers
+    treat a degenerate pair as a real, zero-LD data point)."""
+    return ld_kernels.pairwise_r2(x, y, degenerate=float('nan'))
 
 
 def sanitize_for_filename(value) -> str:
@@ -391,7 +411,8 @@ def ld_decay_data_exists(result_name: str, subfolder: str = DEFAULT_SUBFOLDER,
 # --------------------------------------------------------------------------
 
 def _decay_pairs_for_group(geno_ordered: np.ndarray, metric_sorted: np.ndarray,
-                            max_distance: float, max_pairs: int, rng: np.random.Generator):
+                            max_distance: float, max_pairs: int, rng: np.random.Generator,
+                            *, device: str = 'cpu', n_jobs: int = 1):
     """Shared core for ALL THREE window units: given one group's genotype
     columns already ordered ascending by whatever distance metric applies
     (kb for 'kb', centimorgans for 'cm', or plain marker-index for
@@ -404,6 +425,22 @@ def _decay_pairs_for_group(geno_ordered: np.ndarray, metric_sorted: np.ndarray,
     only the *meaning* of 'distance' changes between calls, never the
     algorithm - so kb/cm/variants get identical performance
     characteristics and the same max_pairs guarantee.
+
+    ver4-4 R4.g/R3.e (both keyword-only, both default to today's exact
+    behaviour): ``device`` routes the fast path's own correlation-matrix
+    computation through the shared, device-aware
+    ``ld_kernels.pairwise_r2_matrix()`` kernel (a CUDA device additionally
+    widens the group-size ceiling this fast path applies at - see
+    `_vectorized_max_group_markers()`); ``n_jobs`` chunks the memory-
+    bounded fallback loop's candidate pairs across worker PROCESSES
+    (``joblib.Parallel``, the same fall-back-to-serial-on-any-exception
+    convention as `pipeline_utils.parallel_shap_values`/
+    `Preprocess.LD_pruning._cm_prune`) - chunk boundaries are contiguous
+    slices of the ALREADY-built `pair_a`/`pair_b`/`pair_dist` arrays, so
+    concatenating each chunk's own (filtered) result in chunk-submission
+    order reproduces the identical final array the serial loop below
+    would have produced, since `joblib.Parallel` always returns results
+    in submission order (never completion order).
     """
     n = len(metric_sorted)
     if n < 2:
@@ -434,7 +471,7 @@ def _decay_pairs_for_group(geno_ordered: np.ndarray, metric_sorted: np.ndarray,
         keep = rng.choice(len(pair_a), size=max_pairs, replace=False)
         pair_a, pair_b, pair_dist = pair_a[keep], pair_b[keep], pair_dist[keep]
 
-    if n <= _VECTORIZED_MAX_GROUP_MARKERS:
+    if n <= _vectorized_max_group_markers(device):
         # Fast path: one correlation-matrix computation for the whole
         # group, instead of one numpy call per candidate pair - this is
         # what keeps compute_ld_decay_data usably fast even for many
@@ -447,24 +484,65 @@ def _decay_pairs_for_group(geno_ordered: np.ndarray, metric_sorted: np.ndarray,
         # never affects prediction results). Monomorphic (zero-variance)
         # markers correctly contribute nothing to the curve rather than
         # corrupting it, exactly like _pairwise_r2's own std==0 guard.
+        # ver4-4 R4.g: routed through the shared, device-aware kernel
+        # (pairwise_complete=False reproduces this exact mean-imputation
+        # approximation - see ld_kernels.pairwise_r2_matrix()'s own
+        # docstring) instead of this file's own inline corrcoef call.
+        # The kernel returns 0.0 (not NaN) for a DEGENERATE pair (by
+        # design - see that function's docstring), which is
+        # indistinguishable from a genuinely, legitimately zero r^2 on
+        # the RETURNED VALUE alone - so validity is decided the same way
+        # the original inline code decided it: independently, from each
+        # marker's OWN (mean-imputed) column standard deviation, never
+        # from whether the resulting r^2 happens to equal 0.0.
+        r2_matrix = ld_kernels.pairwise_r2_matrix(geno_ordered, device=device, pairwise_complete=False)
         col_mean = np.nanmean(geno_ordered, axis=0)
         col_mean = np.where(np.isnan(col_mean), 0.0, col_mean)
         filled = np.where(np.isnan(geno_ordered), col_mean, geno_ordered)
         col_std = filled.std(axis=0)
-
-        with np.errstate(invalid='ignore', divide='ignore'):
-            corr = np.corrcoef(filled, rowvar=False)
-        pair_r2 = np.asarray(corr)[pair_a, pair_b] ** 2
+        pair_r2 = r2_matrix[pair_a, pair_b]
         zero_var = (col_std[pair_a] == 0) | (col_std[pair_b] == 0)
         valid = ~np.isnan(pair_r2) & ~zero_var
         return pair_dist[valid], pair_r2[valid]
 
     # Memory-bounded fallback for a very marker-dense group - exact
     # pairwise-deletion r^2, one pair at a time, capped at max_pairs pairs
-    # (already enforced above).
+    # (already enforced above). ver4-4 R3.e: chunked across n_jobs worker
+    # processes when requested; n_jobs<=1 (default) runs the identical
+    # serial loop this fallback has always used.
+    if n_jobs and n_jobs != 1 and len(pair_a) > 1:
+        try:
+            from joblib import Parallel, delayed
+            # n_jobs may be the sklearn-style "-1 = every core" sentinel,
+            # which is meaningful to joblib.Parallel(n_jobs=...) directly
+            # but not usable as a literal chunk COUNT below - resolve a
+            # separate, always-positive chunk count for that purpose only.
+            _chunk_count = int(n_jobs) if int(n_jobs) > 0 else (os.cpu_count() or 1)
+            n_chunks = min(_chunk_count, len(pair_a))
+            chunk_index_groups = np.array_split(np.arange(len(pair_a)), n_chunks)
+            chunk_results = Parallel(n_jobs=n_jobs)(
+                delayed(_decay_pairs_chunk)(geno_ordered, pair_a[idx], pair_b[idx], pair_dist[idx])
+                for idx in chunk_index_groups
+            )
+            out_dist = np.concatenate([c[0] for c in chunk_results]) if chunk_results else np.array([])
+            out_r2 = np.concatenate([c[1] for c in chunk_results]) if chunk_results else np.array([])
+            return out_dist, out_r2
+        except Exception as exc:
+            print(f"[LD_decay_plot] NOTE: parallel decay-pair fan-out failed ({exc}) - falling "
+                  f"back to serial execution (this is a diagnostic plot only; no prediction "
+                  f"result is affected either way).")
+
+    return _decay_pairs_chunk(geno_ordered, pair_a, pair_b, pair_dist)
+
+
+def _decay_pairs_chunk(geno_ordered: np.ndarray, a_idx: np.ndarray, b_idx: np.ndarray, dist: np.ndarray):
+    """One contiguous chunk of `_decay_pairs_for_group`'s own memory-
+    bounded fallback loop - factored out so it can be dispatched to a
+    worker process by `joblib.Parallel` (ver4-4 R3.e) as well as called
+    directly for the serial (n_jobs<=1, or a fan-out failure) case."""
     out_dist, out_r2 = [], []
-    for a_idx, b_idx, d in zip(pair_a, pair_b, pair_dist):
-        r2 = _pairwise_r2(geno_ordered[:, a_idx], geno_ordered[:, b_idx])
+    for a, b, d in zip(a_idx, b_idx, dist):
+        r2 = _pairwise_r2(geno_ordered[:, a], geno_ordered[:, b])
         if not np.isnan(r2):
             out_dist.append(d)
             out_r2.append(r2)
@@ -479,6 +557,8 @@ def compute_ld_decay_data(
     bin_width: "float | None" = None,
     max_pairs_per_chr: int = DEFAULT_MAX_PAIRS_PER_CHR,
     random_state: int = DEFAULT_RANDOM_STATE,
+    device: "str | None" = None,
+    n_jobs: "int | None" = None,
 ) -> pd.DataFrame:
     """
     Bin SNP-pair LD (r^2) by distance. Supports the same three distance
@@ -518,6 +598,16 @@ def compute_ld_decay_data(
         prediction pipeline.
     random_state : seed for the subsampling above, so a given scenario's
         decay curve is reproducible run to run.
+    device : ver4-4 R4.g - forwarded to `_decay_pairs_for_group()`'s own
+        `device` (which routes its vectorised fast path through the
+        shared, device-aware `ld_kernels.pairwise_r2_matrix()`). `None`
+        (default) resolves from the run's shared compute-resource
+        settings (`get_active_compute_resources()['device']`) - a
+        CPU-only node is completely unaffected either way.
+    n_jobs : ver4-4 R3.e - forwarded to `_decay_pairs_for_group()`'s own
+        `n_jobs` (chunks its memory-bounded fallback loop across worker
+        processes). `None` (default) resolves from the run's shared
+        `N_JOBS` setting; `1` forces today's exact serial loop.
 
     Returns
     -------
@@ -548,6 +638,28 @@ def compute_ld_decay_data(
         max_distance = DEFAULT_MAX_DISTANCE[window_unit]
     if bin_width is None:
         bin_width = DEFAULT_BIN_WIDTH[window_unit]
+    # ver4-4 R4.g/R3.e - resolve from the run's shared compute-resource
+    # settings whenever the caller doesn't pass an explicit override,
+    # exactly like Preprocess.LD_pruning._resolve_plink_threads() does
+    # for plink_threads.
+    #
+    # Stage 5 completion fix (found during the R4.h wiring pass, not in
+    # the original R4.g commit): `_resources['device']` is the run's
+    # OVERALL torch device (resolved from TORCH_DEVICE/CUDA availability
+    # alone) and is NOT itself gated on GPU_LD_R2 - it is the same value
+    # MLP/GAT training would use. Resolving `device` from it unconditionally
+    # meant `GPU_LD_R2: false` never actually disabled the CUDA LD r^2 path
+    # on a CUDA-visible node - the §8 rollback-plan row for GPU_LD_R2 would
+    # have been false advertising, and the flag would have been silently
+    # inert. Gating here (once, at the point `device` is first resolved)
+    # is the minimal fix: `gpu_kernel_precompute`'s own genomic_prediction.py
+    # consumer applies the identical pattern (read the boolean flag, only
+    # THEN decide whether to hand a CUDA device string downstream).
+    _resources = get_active_compute_resources()
+    if device is None:
+        device = _resources['device'] if _resources.get('gpu_ld_r2', True) else 'cpu'
+    if n_jobs is None:
+        n_jobs = _resources['n_jobs']
 
     empty = pd.DataFrame(columns=_DECAY_COLUMNS)
 
@@ -632,7 +744,8 @@ def compute_ld_decay_data(
         metric_sorted = group_sorted['METRIC'].to_numpy(dtype=float)
         geno_group = geno_all[:, col_idx]
 
-        d, r2 = _decay_pairs_for_group(geno_group, metric_sorted, max_distance, max_pairs_per_chr, rng)
+        d, r2 = _decay_pairs_for_group(geno_group, metric_sorted, max_distance, max_pairs_per_chr, rng,
+                                        device=device, n_jobs=n_jobs)
         if d.size:
             distances.append(d)
             r2_values.append(r2)
@@ -667,13 +780,34 @@ def save_ld_decay_data(decay_df: pd.DataFrame, csv_path: str, metadata: "dict | 
     for completeness) when it calls this. Writes a header-only (0-row) CSV
     when decay_df is empty, rather than skipping the file entirely, so the
     'one data file per plot attempt' contract holds even for a scenario
-    with nothing plottable."""
+    with nothing plottable.
+
+    Bugfix: `metadata['ratio']` is genomic_prediction.py's own
+    `sample.loc[i, 'ratio']` value, which - per GP()'s task model (a
+    'within'-scenario RATIO can be a 3-tuple `(train, valid, test)`, not
+    just a float) - is sometimes a tuple/list rather than a scalar.
+    Assigning a tuple/list directly via `out[key] = value` makes pandas
+    treat it as one-value-per-ROW array-like data to align against
+    decay_df's own index, raising
+    "ValueError: Length of values (3) does not match length of index (N)"
+    for any decay curve that doesn't happen to have EXACTLY as many bins
+    as the tuple has elements (i.e. almost always) - previously visible
+    only by chance, whenever a scenario's decay curve happened to bin
+    into a row count that didn't match the ratio tuple's length. Every
+    metadata value is meant to be a single CONSTANT attached to every row
+    (a scenario has exactly one ratio, one population, etc.) - never
+    itself a per-row value - so any non-scalar value (tuple/list; a dict
+    would hit the same problem) is stringified first, guaranteeing a
+    correct constant-column broadcast regardless of decay_df's row count,
+    including the 0-row case."""
     out_dir = os.path.dirname(csv_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
     out = decay_df.copy()
     if metadata:
         for key, value in metadata.items():
+            if isinstance(value, (tuple, list, dict, set)):
+                value = str(value)
             out[key] = value
     out.to_csv(csv_path, index=False)
 

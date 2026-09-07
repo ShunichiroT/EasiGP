@@ -38,6 +38,80 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 
+from pipeline_utils import get_active_compute_resources
+
+
+def _random_forest_regressor_cls(use_gpu):
+    """Return (RandomForestRegressor class, is_gpu) - cuML's GPU-backed
+    RandomForestRegressor when `use_gpu` is True AND cuML is importable,
+    else scikit-learn's own CPU implementation. Never raises: any failure
+    importing cuML (not installed, no compatible GPU/driver, etc.) falls
+    back to CPU silently, so a CPU-only node (or a config that never sets
+    USE_GPU_SKLEARN) behaves exactly as before this option existed.
+
+    This is an EXACT mirror of models/RF.py's own
+    `_random_forest_regressor_cls()` (Phase 2, Requirement 6) - kept as an
+    independent per-module copy rather than a shared import, matching this
+    codebase's established pattern for small, self-contained helpers (e.g.
+    Preprocess/LD_pruning.py's own `_resolve_plink_threads()` docstring:
+    "kept as a local copy rather than imported, since the two modules have
+    no other dependency on each other").
+
+    Patch 3, Requirement 3 ("GPU+CPU combined should be significantly
+    faster than CPU alone, especially when combining filtering with the
+    GAT biological prior knowledge model"): this RF fit
+    (`select_rf_markers()` below) is exactly the "RF importance filtering"
+    step named in the reported slow run - it drives BOTH the general
+    RF_marker_filtering() preprocessing step AND (via
+    Preprocess/data_driven_prior_network.py's
+    select_markers_for_data_driven_network(), which calls
+    select_rf_markers() directly) GAT_biological_prior_knowledge's own
+    data-driven-merge side pipeline. Before this fix, only models/RF.py's
+    own model-fitting RF (a DIFFERENT RandomForestRegressor instance -
+    the one that produces predictions/marker effects, not the one that
+    picks which markers survive filtering) could use cuML at all; this
+    preprocessing-layer RF was hardcoded to scikit-learn/CPU regardless of
+    USE_GPU_SKLEARN. Wiring it into the SAME, already-proven mechanism
+    (rather than a new one) is the safer fix: it reuses a code path this
+    codebase already ships, tests, and falls back from safely.
+    """
+    if use_gpu:
+        try:
+            from cuml.ensemble import RandomForestRegressor as CumlRF
+            return CumlRF, True
+        except Exception as exc:
+            print(f"[RF_marker_filtering] USE_GPU_SKLEARN requested but cuML is unavailable "
+                  f"({exc}) - falling back to scikit-learn's CPU RandomForestRegressor.")
+    return RandomForestRegressor, False
+
+
+def _resolve_n_jobs(rf_config):
+    """Resolve the `n_jobs` value the Random Forest fit below should use.
+
+    An explicit `rf_config['n_jobs']` always wins; otherwise falls back to
+    the run's shared compute-resource settings (`N_JOBS` config key, via
+    `get_active_compute_resources()`) - the same source
+    `Preprocess/plink_io.py` and `Preprocess/LD_pruning.py` already use for
+    their own thread counts.
+
+    Previously this was hardcoded to `-1` ("use every core"), regardless
+    of how many CPUs were actually reserved for the job. `n_jobs=-1`
+    resolves the core count via the OS (`os.cpu_count()` under the hood),
+    which - like plink2's own hardware auto-detection - is not cgroup-
+    aware: on a node where only a handful of CPUs were reserved (e.g. a
+    GPU job, which typically requests far fewer CPUs than a CPU-only job
+    of the same size), joblib would still spawn worker processes/threads
+    sized to the whole node, causing heavy oversubscription/context-switch
+    thrashing rather than a genuine speed-up. This is the RF-filtering
+    half of the same root cause that made LD pruning slow under GPU
+    allocations (see Preprocess/LD_pruning.py's own docstring for the
+    PLINK2 side of it).
+    """
+    n_jobs = rf_config.get('n_jobs')
+    if n_jobs is not None:
+        return int(n_jobs)
+    return get_active_compute_resources()['n_jobs']
+
 
 def _resolve_n_keep(rf_config, n_markers):
     """How many markers `rf_config` says to keep, out of `n_markers` total.
@@ -99,8 +173,20 @@ def select_rf_markers(train_x, train_y, rf_config):
     (top_markers, fitted_rf, n_keep) :
         top_markers : list of str, in ORIGINAL column order (not sorted by
             importance) - a stable, position-based subset.
-        fitted_rf : sklearn.ensemble.RandomForestRegressor, fit on
-            (train_x, train_y) with every marker as a feature.
+        fitted_rf : sklearn.ensemble.RandomForestRegressor (or, when
+            USE_GPU_SKLEARN resolves True and cuML is available,
+            cuml.ensemble.RandomForestRegressor - see
+            _random_forest_regressor_cls() above), fit on (train_x,
+            train_y) with every marker as a feature. Every caller in this
+            codebase currently uses this only for its hyperparameters
+            (never for scikit-learn-specific attributes/methods such as
+            passing it into shap.TreeExplainer, which cuML's forest does
+            not support - see Preprocess/data_driven_prior_network.py's
+            compute_data_driven_interactions(), which always fits its OWN,
+            separate, CPU-only forest for exactly this reason), so this
+            substitution is safe; a caller with a NEW use that genuinely
+            needs scikit-learn-specific internals should fit its own
+            forest rather than assume this one's type.
         n_keep : int, how many markers were kept (== len(top_markers)).
     """
     n_markers = train_x.shape[1]
@@ -108,17 +194,43 @@ def select_rf_markers(train_x, train_y, rf_config):
         raise ValueError("select_rf_markers: train_x has no marker columns.")
     n_keep = _resolve_n_keep(rf_config, n_markers)
 
-    rf = RandomForestRegressor(
-        n_estimators=rf_config.get('n_estimators', 200),
-        max_depth=rf_config.get('max_depth', None),
-        max_features=rf_config.get('max_features', 'sqrt'),
-        min_samples_leaf=rf_config.get('min_samples_leaf', 1),
-        random_state=rf_config.get('random_state', 0),
-        n_jobs=-1,
-    )
+    # Patch 3, Requirement 3: an optional cuML GPU backend, resolved from
+    # the run's shared compute-resource settings - the SAME
+    # USE_GPU_SKLEARN switch models/RF.py's own model-fitting forest
+    # already uses (see _random_forest_regressor_cls()'s docstring above).
+    # A run that never sets USE_GPU_SKLEARN (or has no GPU/no cuML)
+    # resolves use_gpu=False here and gets EXACTLY today's scikit-learn
+    # CPU behaviour - no change for that case.
+    _resources = get_active_compute_resources()
+    _rf_cls, _is_gpu = _random_forest_regressor_cls(_resources.get('use_gpu_sklearn', False))
+
+    if _is_gpu:
+        # cuML's RandomForestRegressor has a narrower constructor surface
+        # than scikit-learn's (no n_jobs - it's GPU-resident, not
+        # thread-parallel) - mirrors models/RF.py's own GPU branch exactly.
+        rf = _rf_cls(
+            n_estimators=rf_config.get('n_estimators', 200),
+            max_depth=rf_config.get('max_depth', None),
+            max_features=rf_config.get('max_features', 'sqrt'),
+            min_samples_leaf=rf_config.get('min_samples_leaf', 1),
+            random_state=rf_config.get('random_state', 0),
+        )
+    else:
+        rf = _rf_cls(
+            n_estimators=rf_config.get('n_estimators', 200),
+            max_depth=rf_config.get('max_depth', None),
+            max_features=rf_config.get('max_features', 'sqrt'),
+            min_samples_leaf=rf_config.get('min_samples_leaf', 1),
+            random_state=rf_config.get('random_state', 0),
+            n_jobs=_resolve_n_jobs(rf_config),
+        )
     rf.fit(train_x, train_y)
 
-    top_idx = np.argsort(rf.feature_importances_)[::-1][:n_keep]
+    # cuML's `.feature_importances_` returns a cuDF/cupy array rather than
+    # a plain numpy one - np.argsort/np.asarray both coerce it correctly
+    # via cuML's own __array__ interop, so this line is unchanged for
+    # either backend.
+    top_idx = np.argsort(np.asarray(rf.feature_importances_))[::-1][:n_keep]
     top_marker_set = set(train_x.columns[top_idx])
     # Preserve original column order among the kept markers (see docstring).
     top_markers = [c for c in train_x.columns if c in top_marker_set]
@@ -146,6 +258,10 @@ def RF_marker_filtering(train, valid, test, rf_config, return_model=False):
           (default 'sqrt')
         - 'min_samples_leaf' : int (default 1)
         - 'random_state' : int, for reproducibility (default 0)
+        - 'n_jobs' : int, optional. Forwarded to RandomForestRegressor's
+          own `n_jobs`. Defaults to the run's shared compute-resource
+          setting (`N_JOBS` config key) rather than unconditionally `-1` -
+          see `_resolve_n_jobs()`'s own docstring for why.
     return_model : bool, default False
         If True, additionally return the fitted RandomForestRegressor and
         the list of kept marker names as a 5-tuple, instead of the plain

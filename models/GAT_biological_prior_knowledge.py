@@ -15,11 +15,12 @@ from torch_geometric.explain import Explainer, CaptumExplainer
 from Preprocess.gene_network_prior import (
     load_network_json, extract_candidate_genes, build_gene_list, build_gene_adjacency,
 )
-from Preprocess.LD_pruning import LD_pruning
-from pipeline_utils import unify_columns_by_position
+from pipeline_utils import (
+    unify_columns_by_position, get_active_compute_resources, apply_torch_compute_settings, gpu_slot,
+    result_dir_path, dataloader_num_workers, torch_eval_batch_size, split_batched_edge_attention,
+)
 from Preprocess.data_driven_prior_network import (
-    select_markers_for_data_driven_network, compute_data_driven_interactions,
-    merge_biological_and_data_driven_networks,
+    merge_biological_and_data_driven_networks, ensure_bio_prior_merge_cache,
 )
 
 
@@ -472,7 +473,7 @@ def GAT_biological_prior_knowledge(data_train, data_valid, data_test, params, RE
     # already discovers these by filename pattern
     # ('*_gene_coordinates_<phenotype>.csv'), not by a hardcoded model name.
     if RESULT_NAME is not None and PHENOTYPE_NAME is not None:
-        coord_dir = os.path.join('.', 'Result', RESULT_NAME)
+        coord_dir = result_dir_path(RESULT_NAME)
         os.makedirs(coord_dir, exist_ok=True)
         coord_path = os.path.join(
             coord_dir, f'{MODEL_NAME}_gene_coordinates_{PHENOTYPE_NAME}.csv'
@@ -521,75 +522,25 @@ def GAT_biological_prior_knowledge(data_train, data_valid, data_test, params, RE
                   f"(data_driven_merge enabled) - which of them actually do depends on RF "
                   f"selection + surviving pairwise-Shapley interactions below.")
 
-        rf_filter_cfg = data_driven_merge.get('rf_filter')
-        if rf_filter_cfg is None:
-            raise ValueError(
-                "data_driven_merge['rf_filter'] is required when data_driven_merge['enabled'] "
-                "is True - see this function's own docstring."
-            )
-        top_rate = data_driven_merge.get('top_rate')
-        if top_rate is None:
-            raise ValueError(
-                "data_driven_merge['top_rate'] is required when data_driven_merge['enabled'] "
-                "is True - see this function's own docstring."
-            )
-
         _merge_source = merge_source_data if merge_source_data is not None else (data_train, data_valid, data_test)
         _merge_train, _merge_valid, _merge_test = _merge_source
-        _merge_train_y = _merge_train.iloc[:, -1]
 
-        # Requirement 11 (efficiency): reuse whatever this task has
-        # already computed for this instance - see this function's own
-        # network_cache docstring entry - instead of unconditionally
-        # redoing LD pruning / RF filtering / the Shapley interaction
-        # search every single call. Each of the two expensive steps below
-        # is skipped independently if its own result is already cached,
-        # so a partially-primed cache (e.g. GP() already computed
-        # rf_selected_markers via OTHER_MODELS_MARKER_SOURCE=
-        # 'gene_network_plus_rf', but this is still the first time THIS
-        # function itself has run this task) still saves whatever it can.
-        _cache_entry = network_cache.setdefault(MODEL_NAME, {}) if network_cache is not None else None
-
-        if _cache_entry is not None and 'rf_selected_markers' in _cache_entry:
-            rf_selected_markers = _cache_entry['rf_selected_markers']
-            print(f"[GAT_biological_prior_knowledge] Data-driven merge: reusing "
-                  f"{len(rf_selected_markers)} RF-selected marker(s) already computed earlier "
-                  f"this task (LD pruning/RF filtering skipped).")
-        else:
-            _merge_train_x = _merge_train.iloc[:, :-1]
-            if data_driven_merge.get('ld_prune') is not None:
-                _merge_train_x, _, _ = LD_pruning(
-                    _merge_train_x, pd.DataFrame(), _merge_test.iloc[:, :-1], data_driven_merge['ld_prune']
-                )
-            rf_selected_markers, _fitted_rf = select_markers_for_data_driven_network(
-                _merge_train_x, _merge_train_y, rf_filter_cfg
-            )
-            print(f"[GAT_biological_prior_knowledge] Data-driven merge: {len(rf_selected_markers)} "
-                  f"marker(s) selected by RF filtering (out of {_merge_train_x.shape[1]} candidate(s)).")
-            if _cache_entry is not None:
-                _cache_entry['rf_selected_markers'] = rf_selected_markers
-
-        if _cache_entry is not None and 'pair_df' in _cache_entry:
-            pair_df = _cache_entry['pair_df']
-            print(f"[GAT_biological_prior_knowledge] Data-driven merge: reusing "
-                  f"{pair_df.shape[0]} pairwise interaction(s) already computed earlier this task.")
-        else:
-            # _merge_train (not _merge_train_x, which may not even exist in
-            # the cache-hit branch above) sliced directly by
-            # rf_selected_markers - selecting marker COLUMNS by name is
-            # always valid regardless of whether pruning happened in this
-            # call or was reused from the cache, since pruning only ever
-            # narrows which columns exist, never renames/transforms them.
-            pair_df = compute_data_driven_interactions(
-                _merge_train.loc[:, rf_selected_markers], _merge_train_y, rf_filter_cfg, top_rate,
-                n_estimators_override=data_driven_merge.get('shap_n_estimators_override'),
-            )
-            print(f"[GAT_biological_prior_knowledge] Data-driven merge: {pair_df.shape[0]} unique "
-                  f"pairwise interaction(s) kept (top {top_rate}% - see the "
-                  f"data_driven_prior_network log line just above for the full candidate-pool count "
-                  f"this percentage was taken of).")
-            if _cache_entry is not None:
-                _cache_entry['pair_df'] = pair_df
+        # Requirement 11 (efficiency) / PERFORMANCE FIX: reuse whatever
+        # this task has already computed for this instance - see this
+        # function's own network_cache docstring entry above - instead of
+        # unconditionally redoing LD pruning / RF filtering / the Shapley
+        # interaction search every single call. This used to be inlined
+        # here; it is now
+        # Preprocess.data_driven_prior_network.ensure_bio_prior_merge_cache()
+        # (byte-identical logic, just pulled out into its own function) so
+        # genomic_prediction.py's GP() can ALSO call it directly, up
+        # front in the MAIN process, before dispatching this instance's
+        # hyperparameter-tuning trials - see that function's own
+        # docstring for exactly why a call from here alone is not enough
+        # once trials run in separate worker processes.
+        rf_selected_markers, pair_df = ensure_bio_prior_merge_cache(
+            MODEL_NAME, _merge_train, _merge_valid, _merge_test, data_driven_merge, network_cache,
+        )
 
         bare_marker_names, bare_rows, bare_gene_to_markers, extra_edges = merge_biological_and_data_driven_networks(
             gene_to_markers, pair_df, rf_selected_markers, marker_info
@@ -729,6 +680,25 @@ def GAT_biological_prior_knowledge(data_train, data_valid, data_test, params, RE
     data_train_edge_index = torch.stack([torch.from_numpy(edges_from).to(torch.long),
                                           torch.from_numpy(edges_to).to(torch.long)], dim=0)
 
+    # ver4-4 R8 (blueprint §2.8): T.ToUndirected() only ever depends on
+    # edge_index (and edge_attr, which this graph never has) - never on
+    # x/y - and, per the comment above, every individual in every split
+    # shares the exact SAME edge_index. The ORIGINAL code called
+    # `T.ToUndirected()(tmp)` inside each per-individual loop below,
+    # re-deriving and re-deduplicating the identical set of reverse edges
+    # from scratch once per individual for no reason - N-1 wasted,
+    # identical transform calls per split. Applying it ONCE here, to a
+    # throwaway Data holding just this shared edge_index, and re-using
+    # the resulting undirected edge_index for every individual removes
+    # that redundant work without changing a single edge value (verified
+    # against the R8 design record's acceptance criteria: identical
+    # edge_name_from/edge_name_to and Attention.csv content). `.clone()`
+    # per individual is kept - see the module-level R8 note in
+    # GAT_fully_connected.py for why outright tensor SHARING across Data
+    # instances is deferred pending the ver4-4 blueprint's PC-4 pre-check
+    # (not executable in this build environment; see the Change Summary).
+    _undirected_edge_index = T.ToUndirected()(Data(edge_index=data_train_edge_index)).edge_index
+
     data_train = []
     for kk in range(data_pheno_train.shape[0]):
         tmp = Data()
@@ -736,8 +706,7 @@ def GAT_biological_prior_knowledge(data_train, data_valid, data_test, params, RE
         data_pheno_train_tmp = np.expand_dims(np.array(data_pheno_train[kk]), axis=0)
         tmp.x = torch.from_numpy(node_features_tmp).to(torch.float)
         tmp.y = torch.from_numpy(data_pheno_train_tmp).to(torch.float)
-        tmp.edge_index = data_train_edge_index.clone()
-        tmp = T.ToUndirected()(tmp)
+        tmp.edge_index = _undirected_edge_index.clone()
         data_train += [tmp]
 
     if VALID:
@@ -748,8 +717,7 @@ def GAT_biological_prior_knowledge(data_train, data_valid, data_test, params, RE
             data_pheno_valid_tmp = np.expand_dims(np.array(data_pheno_valid[kk]), axis=0)
             tmp.x = torch.from_numpy(node_features_tmp).to(torch.float)
             tmp.y = torch.from_numpy(data_pheno_valid_tmp).to(torch.float)
-            tmp.edge_index = data_train_edge_index.clone()
-            tmp = T.ToUndirected()(tmp)
+            tmp.edge_index = _undirected_edge_index.clone()
             data_valid += [tmp]
 
     data_test = []
@@ -759,8 +727,7 @@ def GAT_biological_prior_knowledge(data_train, data_valid, data_test, params, RE
         data_pheno_test_tmp = np.expand_dims(np.array(data_pheno_test[kk]), axis=0)
         tmp.x = torch.from_numpy(node_features_tmp).to(torch.float)
         tmp.y = torch.from_numpy(data_pheno_test_tmp).to(torch.float)
-        tmp.edge_index = data_train_edge_index.clone()
-        tmp = T.ToUndirected()(tmp)
+        tmp.edge_index = _undirected_edge_index.clone()
         data_test += [tmp]
 
     # edge_name_from/to (for the attention output below) use gene names, the
@@ -810,140 +777,173 @@ def GAT_biological_prior_knowledge(data_train, data_valid, data_test, params, RE
 
     model = GAT(hidden_channels=neuron, out_channels=1, dpout=dropout)
 
+    # ver4-4 R4.b/c/d/e: device/AMP/loader-hygiene settings resolved
+    # BEFORE the loaders (moved up from their original position) - see
+    # GAT_fully_connected.py's identical note for the full rationale.
+    _resources = get_active_compute_resources()
+    device = torch.device(_resources['device'])
+    apply_torch_compute_settings(_resources)
+    use_amp = bool(_resources['use_amp']) and device.type == 'cuda'
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    _num_workers = dataloader_num_workers(_resources)
+    _pin_memory = device.type == 'cuda'
+    _eval_batch = torch_eval_batch_size(_resources, _resources.get('gpu_eval_batch'))
+
     train_loader = DataLoader(data_train,
                              shuffle=True,
-                             batch_size=bsize)
+                             batch_size=bsize,
+                             num_workers=_num_workers, pin_memory=_pin_memory)
     if VALID:
         valid_loader = DataLoader(data_valid,
-                                 batch_size=bsize)
+                                 batch_size=bsize,
+                                 num_workers=_num_workers, pin_memory=_pin_memory)
     test_loader = DataLoader(data_test,
-                             batch_size=1)
+                             batch_size=_eval_batch,
+                             num_workers=_num_workers, pin_memory=_pin_memory)
 
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    model.to(device)
+    with gpu_slot():
+        model.to(device)
 
-    ## Train GAT
-    model.train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lrate, weight_decay=decay)
+        ## Train GAT
+        model.train()
+        optimizer = torch.optim.Adam(model.parameters(), lr=lrate, weight_decay=decay)
 
-    for epoch in range(epoch):
-        loss_train_sum = 0
-        batch_size = len(train_loader)
+        for epoch in range(epoch):
+            loss_train_sum = 0
+            batch_size = len(train_loader)
 
-        for batch in train_loader:
-            batch = batch.to(device)
-            optimizer.zero_grad()
-            out = model(batch.x, batch.edge_index, batch.batch, None)
-            loss = F.mse_loss(torch.squeeze(out), batch.y)
-            loss.backward()
-            optimizer.step()
-            loss_train_sum += loss
+            for batch in train_loader:
+                batch = batch.to(device)
+                optimizer.zero_grad()
+                with torch.autocast(device_type=device.type, enabled=use_amp):
+                    out = model(batch.x, batch.edge_index, batch.batch, None)
+                    loss = F.mse_loss(torch.squeeze(out), batch.y)
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+                loss_train_sum += loss.detach()
 
-        print(f'Epoch {epoch:>3} | Train Loss: {loss_train_sum/batch_size:.5f}')
+            print(f'Epoch {epoch:>3} | Train Loss: {loss_train_sum/batch_size:.5f}')
 
-    ## Predict phenotypes for the test data
-    model.eval()
+        ## Predict phenotypes for the test data
+        model.eval()
 
-    predicted_test = []
-    actual_test = []
-    attention = []
-    for test in test_loader:
-        result, att = model(test.x, test.edge_index, test.batch, True)
-        predicted_test += result.tolist()
-        actual_test += test.y.tolist()
-        # att[1] (alpha) has shape (num_edges, heads); GAT_prior_knowledge.py's
-        # own ".flatten()" only matches edge_name_from/to's length (num_edges)
-        # when heads == 1 - for heads > 1 it interleaves per-head values into
-        # a num_edges*heads-long vector, silently misaligning every
-        # downstream name<->value pairing once averaged across individuals.
-        # Averaging across heads per edge first keeps this always exactly
-        # num_edges long, matching edge_name_from/to for any heads value.
-        attention += [att[1].detach().mean(dim=1).tolist()]
+        predicted_test = []
+        actual_test = []
+        attention = []
+        with torch.no_grad():
+            for test in test_loader:
+                test = test.to(device)
+                result, att = model(test.x, test.edge_index, test.batch, True)
+                predicted_test += result.cpu().tolist()
+                actual_test += test.y.cpu().tolist()
+                # att[1] (alpha) has shape (num_edges_in_this_batch, heads);
+                # ver4-4 R4.b first splits the BATCHED alpha back into one
+                # (num_edges_per_graph, heads) slice per graph (see
+                # pipeline_utils.split_batched_edge_attention's own
+                # docstring) - unchanged from that point on: GAT_prior_
+                # knowledge.py's own ".flatten()" only matches edge_name_
+                # from/to's length (num_edges) when heads == 1 - for
+                # heads > 1 it interleaves per-head values into a
+                # num_edges*heads-long vector, silently misaligning every
+                # downstream name<->value pairing once averaged across
+                # individuals. Averaging across heads per edge first keeps
+                # this always exactly num_edges long, matching
+                # edge_name_from/to for any heads value.
+                for alpha_g in split_batched_edge_attention(att[1], test.num_graphs):
+                    attention += [alpha_g.mean(dim=1).tolist()]
 
-    predicted_test = [item for sublist in predicted_test for item in sublist]
+        predicted_test = [item for sublist in predicted_test for item in sublist]
 
-    ## Calculate the metrics
-    mse = mean_squared_error(actual_test, predicted_test)
-    r = pearsonr(actual_test, predicted_test)[0]
+        ## Calculate the metrics
+        mse = mean_squared_error(actual_test, predicted_test)
+        r = pearsonr(actual_test, predicted_test)[0]
 
-    ## Predict phenotypes for the validation data
-    predicted_valid = []
-    actual_valid = []
-    if VALID:
-        for valid in valid_loader:
-            result = model(valid.x, valid.edge_index, valid.batch, None)
-            predicted_valid += result.tolist()
-            actual_valid += valid.y.tolist()
+        ## Predict phenotypes for the validation data
+        predicted_valid = []
+        actual_valid = []
+        if VALID:
+            with torch.no_grad():
+                for valid in valid_loader:
+                    valid = valid.to(device)
+                    result = model(valid.x, valid.edge_index, valid.batch, None)
+                    predicted_valid += result.cpu().tolist()
+                    actual_valid += valid.y.cpu().tolist()
 
-        predicted_valid = [item for sublist in predicted_valid for item in sublist]
+            predicted_valid = [item for sublist in predicted_valid for item in sublist]
 
-    ## Predict phenotypes for the train data
-    train_loader = DataLoader(data_train,
-                             shuffle=False,
-                             batch_size=bsize)
-    predicted_train = []
-    for train in train_loader:
-        result = model(train.x, train.edge_index, train.batch, None)
-        predicted_train += result.tolist()
+        ## Predict phenotypes for the train data
+        train_loader = DataLoader(data_train,
+                                 shuffle=False,
+                                 batch_size=bsize,
+                                 num_workers=_num_workers, pin_memory=_pin_memory)
+        predicted_train = []
+        with torch.no_grad():
+            for train in train_loader:
+                train = train.to(device)
+                result = model(train.x, train.edge_index, train.batch, None)
+                predicted_train += result.cpu().tolist()
 
-    predicted_train = [k for i in predicted_train for k in i]
+        predicted_train = [k for i in predicted_train for k in i]
 
-    ## Extract genomic marker effects
-    if marker_effect == True:
-        explainer = Explainer(
-            model=model,
-            algorithm=CaptumExplainer('IntegratedGradients'),
-            explanation_type='model',
-            node_mask_type='attributes',
-            edge_mask_type=None,  # do not change here
-            model_config=dict(
-                mode='regression',
-                task_level='node',
-                return_type='raw',
-                ),
-        )
-
-        test_loader = DataLoader(data_test,
-                                shuffle=True,
-                                batch_size=1)
-
-        explanation = pd.DataFrame()
-        cnt = 0
-        for batch in test_loader:
-            t = explainer(
-                batch.x,
-                batch.edge_index,
-                batch=batch.batch,
-                return_attention=None
+        ## Extract genomic marker effects
+        if marker_effect == True:
+            explainer = Explainer(
+                model=model,
+                algorithm=CaptumExplainer('IntegratedGradients'),
+                explanation_type='model',
+                node_mask_type='attributes',
+                edge_mask_type=None,  # do not change here
+                model_config=dict(
+                    mode='regression',
+                    task_level='node',
+                    return_type='raw',
+                    ),
             )
-            t = pd.DataFrame(t['node_mask'].squeeze().detach()).sum(axis=1)
-            if explanation.shape[0] == 0:
-                explanation = t
-            else:
-                explanation += t
-            cnt += 1
 
-            if cnt == samples:
-                break
+            test_loader = DataLoader(data_test,
+                                    shuffle=True,
+                                    batch_size=1,
+                                    num_workers=_num_workers, pin_memory=_pin_memory)
 
-        gene_effect = (explanation / cnt).to_numpy().flatten()  # one IG score per active gene node
+            explanation = pd.DataFrame()
+            cnt = 0
+            for batch in test_loader:
+                batch = batch.to(device)
+                t = explainer(
+                    batch.x,
+                    batch.edge_index,
+                    batch=batch.batch,
+                    return_attention=None
+                )
+                t = pd.DataFrame(t['node_mask'].squeeze().detach().cpu()).sum(axis=1)
+                if explanation.shape[0] == 0:
+                    explanation = t
+                else:
+                    explanation += t
+                cnt += 1
 
-        # genomic_prediction.py requires `effect` to have exactly one column
-        # per *original* SNP marker (data_QTL_test.columns, unfiltered), in
-        # that order (see this function's docstring). Every gene's
-        # Integrated-Gradients attribution is broadcast onto every SNP that
-        # was aggregated into that gene's node; SNPs outside every gene in
-        # the network get exactly 0, since the model never saw them.
-        effect = pd.DataFrame(0.0, index=[0], columns=data_QTL_test.columns)
-        for g in range(n_genes):
-            for marker in gene_to_markers[g]:
-                effect.loc[0, marker] = gene_effect[g]
-    else:
-        effect = pd.DataFrame()
+                if cnt == samples:
+                    break
 
-    attention = pd.concat([pd.DataFrame(edge_name_from),
-                           pd.DataFrame(edge_name_to),
-                           pd.DataFrame(attention).mean().T
-                           ], axis=1)
+            gene_effect = (explanation / cnt).to_numpy().flatten()  # one IG score per active gene node
+
+            # genomic_prediction.py requires `effect` to have exactly one column
+            # per *original* SNP marker (data_QTL_test.columns, unfiltered), in
+            # that order (see this function's docstring). Every gene's
+            # Integrated-Gradients attribution is broadcast onto every SNP that
+            # was aggregated into that gene's node; SNPs outside every gene in
+            # the network get exactly 0, since the model never saw them.
+            effect = pd.DataFrame(0.0, index=[0], columns=data_QTL_test.columns)
+            for g in range(n_genes):
+                for marker in gene_to_markers[g]:
+                    effect.loc[0, marker] = gene_effect[g]
+        else:
+            effect = pd.DataFrame()
+
+        attention = pd.concat([pd.DataFrame(edge_name_from),
+                               pd.DataFrame(edge_name_to),
+                               pd.DataFrame(attention).mean().T
+                               ], axis=1)
 
     return r, mse, effect, predicted_test, predicted_valid, predicted_train, attention

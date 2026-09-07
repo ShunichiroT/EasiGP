@@ -90,7 +90,38 @@ HPARAM_SPECS = {'rrBLUP': [{'label': 'Iteration number',
                      'Higher R2 = less shrinkage (bigger effects allowed); lower R2 = more '
                      "shrinkage (effects pulled closer to zero). 0.5 is BGLR's own default and a "
                      'reasonable starting point if unsure.',
-             'tunable': {'low': 0.1, 'high': 0.9}}],
+             'tunable': {'low': 0.1, 'high': 0.9}},
+            {'label': 'Return marker-pair interactions?',
+             'type': 'bool',
+             'default': False,
+             'help': 'If checked, also searches for pairs of markers that interact with each '
+                     'other. rrBLUP is an additive model with no native pairwise-interaction '
+                     "computation, so this fits a lightweight surrogate model to rrBLUP's OWN "
+                     'predictions and searches THAT for interactions - a useful hint, but an '
+                     'APPROXIMATION of rrBLUP itself, not an exact computation. The settings '
+                     'below only apply when this is checked.'},
+            {'label': 'Max markers considered for interaction search ("all" for every marker)',
+             'type': 'int_or_all',
+             'default': 500,
+             'depends_on': (4, True),
+             'help': 'Only the top markers (ranked by correlation with the trait) are checked for '
+                     "pairwise interactions; every other marker pair is left out. 'all' checks "
+                     'every possible pair but can take a very long time on datasets with '
+                     'thousands of markers.'},
+            {'label': 'Number of individuals used to explain the surrogate model',
+             'type': 'int',
+             'default': 50,
+             'depends_on': (4, True),
+             'help': 'How many training individuals the surrogate model is explained on, when '
+                     'estimating each pair\'s interaction strength. More individuals give a more '
+                     'representative picture, but take longer.'},
+            {'label': 'Output only the top N% of interactions ("all" for everything)',
+             'type': 'top_pct',
+             'default': 'all',
+             'depends_on': (4, True),
+             'help': 'Only keep the strongest interactions found, as a percentage of all pairs '
+                     "tested - e.g. 0.01 keeps only the top 0.01%. 'all' keeps every pair tested, "
+                     'which can be a very large table for datasets with many markers.'}],
  'BayesB': [{'label': 'Iteration number',
              'type': 'int',
              'default': 12000,
@@ -120,7 +151,37 @@ HPARAM_SPECS = {'rrBLUP': [{'label': 'Iteration number',
              'help': "How strongly the 'probIn' belief above is held before seeing the data - "
                      'higher values make BGLR trust that prior more strongly; lower values let the '
                      "data override it more easily. 10 is BGLR's own default.",
-             'tunable': {'low': 2, 'high': 100, 'step': 2}}],
+             'tunable': {'low': 2, 'high': 100, 'step': 2}},
+            {'label': 'Return marker-pair interactions?',
+             'type': 'bool',
+             'default': False,
+             'help': 'If checked, also searches for pairs of markers that interact with each '
+                     'other, via a surrogate model fitted to this model\'s OWN predictions - see '
+                     "rrBLUP's identical field for the full explanation of why this is an "
+                     'APPROXIMATION, not an exact computation. The settings below only apply when '
+                     'this is checked.'},
+            {'label': 'Max markers considered for interaction search ("all" for every marker)',
+             'type': 'int_or_all',
+             'default': 500,
+             'depends_on': (4, True),
+             'help': 'Only the top markers (ranked by correlation with the trait) are checked for '
+                     "pairwise interactions; every other marker pair is left out. 'all' checks "
+                     'every possible pair but can take a very long time on datasets with '
+                     'thousands of markers.'},
+            {'label': 'Number of individuals used to explain the surrogate model',
+             'type': 'int',
+             'default': 50,
+             'depends_on': (4, True),
+             'help': 'How many training individuals the surrogate model is explained on, when '
+                     'estimating each pair\'s interaction strength. More individuals give a more '
+                     'representative picture, but take longer.'},
+            {'label': 'Output only the top N% of interactions ("all" for everything)',
+             'type': 'top_pct',
+             'default': 'all',
+             'depends_on': (4, True),
+             'help': 'Only keep the strongest interactions found, as a percentage of all pairs '
+                     "tested - e.g. 0.01 keeps only the top 0.01%. 'all' keeps every pair tested, "
+                     'which can be a very large table for datasets with many markers.'}],
  'GBLUP': [{'label': 'Iteration number',
             'type': 'int',
             'default': 12000,
@@ -171,7 +232,53 @@ HPARAM_SPECS = {'rrBLUP': [{'label': 'Iteration number',
             'depends_on': (2, True),
             'help': "How many of the Shapley re-fit's MCMC iterations (above) are discarded as "
                     "'warm-up' before averaging - must be smaller than that value. Separate from, "
-                    "and much smaller than, the main 'Burn-in' above."}],
+                    "and much smaller than, the main 'Burn-in' above."},
+           {'label': 'Shapley row offset (advanced - internal parallel fan-out)',
+            'type': 'int',
+            'default': 0,
+            'depends_on': (2, True),
+            'help': "Internal/advanced setting, not something you normally need to "
+                    "change. EasiGP itself uses this to split one task's Shapley computation "
+                    "across several worker processes, each explaining a different row range. "
+                    "Leave at 0 for a single, ordinary run."},
+           {'label': 'Shapley row count (advanced - internal parallel fan-out; -1 = every row)',
+            'type': 'int',
+            'default': -1,
+            'depends_on': (2, True),
+            'help': "Internal/advanced setting, paired with the row offset above. "
+                    "-1 (default) explains every row exactly as if this setting didn't exist. "
+                    "Leave at -1 unless you are deliberately restricting this call to a sub-range "
+                    "of test individuals."},
+           {'label': 'Return marker-pair interactions?',
+            'type': 'bool',
+            'default': False,
+            'help': 'If checked, also searches for pairs of markers that interact with each '
+                    'other, via a surrogate model fitted to this model\'s OWN predictions - GBLUP '
+                    'is a kernel model with no native pairwise-interaction computation, so this '
+                    'is an APPROXIMATION, not an exact computation. The settings below only apply '
+                    'when this is checked.'},
+           {'label': 'Max markers considered for interaction search ("all" for every marker)',
+            'type': 'int_or_all',
+            'default': 500,
+            'depends_on': (9, True),
+            'help': 'Only the top markers (ranked by correlation with the trait) are checked for '
+                    "pairwise interactions; every other marker pair is left out. 'all' checks "
+                    'every possible pair but can take a very long time on datasets with '
+                    'thousands of markers.'},
+           {'label': 'Number of individuals used to explain the surrogate model',
+            'type': 'int',
+            'default': 50,
+            'depends_on': (9, True),
+            'help': 'How many training individuals the surrogate model is explained on, when '
+                    'estimating each pair\'s interaction strength. More individuals give a more '
+                    'representative picture, but take longer.'},
+           {'label': 'Output only the top N% of interactions ("all" for everything)',
+            'type': 'top_pct',
+            'default': 'all',
+            'depends_on': (9, True),
+            'help': 'Only keep the strongest interactions found, as a percentage of all pairs '
+                    "tested - e.g. 0.01 keeps only the top 0.01%. 'all' keeps every pair tested, "
+                    'which can be a very large table for datasets with many markers.'}],
  'RKHS': [{'label': 'Iteration number',
            'type': 'int',
            'default': 12000,
@@ -193,7 +300,12 @@ HPARAM_SPECS = {'rrBLUP': [{'label': 'Iteration number',
                    'distance. Higher h = only very close samples are treated as similar (more '
                    'locally-focused); lower h = more distant samples are still treated as somewhat '
                    'similar (smoother). 1 is often used as the midpoint.',
-           'tunable': {'low': 0.1, 'high': 5.0}},
+           # Update ID ver4-6, R1.2(b): log-scaled - see this update's
+           # Change Summary §4 for the full rationale (held-out surrogate
+           # rank correlation on a raw-unit, multi-order-of-magnitude
+           # tunable box was measured at -0.059; unit-cube + log scaling
+           # on the affected fields restores it to +0.905, blueprint E1).
+           'tunable': {'low': 0.1, 'high': 5.0, 'scale': 'log'}},
           {'label': 'Return marker effect?',
            'type': 'bool',
            'default': False,
@@ -229,10 +341,111 @@ HPARAM_SPECS = {'rrBLUP': [{'label': 'Iteration number',
            'depends_on': (3, True),
            'help': "How many of the Shapley re-fit's MCMC iterations (above) are discarded as "
                    "'warm-up' before averaging - must be smaller than that value. Separate from, "
-                   "and much smaller than, the main 'Burn-in' above."}],
+                   "and much smaller than, the main 'Burn-in' above."},
+          {'label': 'Shapley row offset (advanced - internal parallel fan-out)',
+           'type': 'int',
+           'default': 0,
+           'depends_on': (3, True),
+           'help': "Internal/advanced setting, not something you normally need to "
+                   "change. EasiGP itself uses this to split one task's Shapley computation "
+                   "across several worker processes, each explaining a different row range. "
+                   "Leave at 0 for a single, ordinary run."},
+          {'label': 'Shapley row count (advanced - internal parallel fan-out; -1 = every row)',
+           'type': 'int',
+           'default': -1,
+           'depends_on': (3, True),
+           'help': "Internal/advanced setting, paired with the row offset above. "
+                   "-1 (default) explains every row exactly as if this setting didn't exist. "
+                   "Leave at -1 unless you are deliberately restricting this call to a sub-range "
+                   "of test individuals."},
+          {'label': 'Return marker-pair interactions?',
+           'type': 'bool',
+           'default': False,
+           'help': 'If checked, also searches for pairs of markers that interact with each '
+                   'other, via a surrogate model fitted to this model\'s OWN predictions and '
+                   'analysed with Friedman\'s H-statistic. Runs across multiple CPU cores automatically (and a '
+                   'GPU, if this run has GPU acceleration enabled) to speed this up. The '
+                   'settings below only apply when this is checked.'},
+          {'label': 'Max markers considered for interaction search ("all" for every marker)',
+           'type': 'int_or_all',
+           'default': 500,
+           'depends_on': (10, True),
+           'help': 'Only the top markers (ranked by correlation with the trait) are checked for '
+                   "pairwise interactions; every other marker pair is left out. 'all' checks "
+                   'every possible pair but can take a very long time on datasets with '
+                   'thousands of markers.'},
+          {'label': 'Number of individuals used to explain the model',
+           'type': 'int',
+           'default': 50,
+           'depends_on': (10, True),
+           'help': 'How many training individuals the surrogate model\'s predictions are '
+                   'averaged over, when estimating each pair\'s interaction strength. More '
+                   'individuals give a more representative picture, but take longer.'},
+          {'label': 'Output only the top N% of interactions ("all" for everything)',
+           'type': 'top_pct',
+           'default': 'all',
+           'depends_on': (10, True),
+           'help': 'Only keep the strongest interactions found, as a percentage of all pairs '
+                   "tested - e.g. 0.01 keeps only the top 0.01%. 'all' keeps every pair tested, "
+                   'which can be a very large table for datasets with many markers.'},
+          # Update ID ver4-6, R1/R1b (blueprint §5.2/§2.10.4): appended,
+          # never inserted (I5) - verified against this list's own
+          # length (14 before this edit, so 14/15/16 are genuinely the
+          # next free indices, not assumed). Both R1 fields gate an
+          # explainability side-computation (the interaction search
+          # itself), so neither is 'tunable' - hyperparameter_tuning.
+          # _disable_explainability() already forces the controlling
+          # 'Return marker-pair interactions?' toggle off during search
+          # regardless. `genomic_prediction.py::_r_model_interaction_
+          # fields()`/`_r_model_surrogate_interaction()` read these three
+          # and populate `surrogate_h_statistic_interactions()`'s own
+          # `surrogate_cfg['screen']`/`['screen_keep']`/`['grid_resolution']`.
+          # Update ID ver4-8: 'surrogate_shap' removed from 'choices' below
+          # (and from every other model's identical field - RF's
+          # friedman_h-only variant, SVR, KNN) together with the help text
+          # describing it. It remains fully implemented in
+          # models/interaction_extraction.py (_VALID_SCREEN_MODES still
+          # includes it) - only the GUI-offered choice is gone, so a
+          # headless config that sets this positionally to 'surrogate_shap'
+          # still works exactly as before. render_field()'s selectbox
+          # branch in main_app.py now self-heals any session_state value
+          # left over from an older saved GUI state that still points at
+          # the removed choice, so this change is safe against stale state
+          # files too.
+          {'label': 'Interaction pre-screen (speed vs. completeness)',
+           'type': 'str',
+           'default': 'off',
+           'choices': ['off', 'marginal_pd'],
+           'combo_state': 'readonly',
+           'depends_on': (10, True),
+           'help': "'off' (default) evaluates every candidate marker pair exactly - correct, but "
+                   "slow when many markers are shortlisted. 'marginal_pd' (cheap) ranks pairs by "
+                   "how much each marker's own effect varies on its own, then only computes the "
+                   "full, exact interaction score for the strongest-ranked pairs - much faster, "
+                   "but can miss a pair where BOTH markers look unremarkable alone yet interact "
+                   "strongly together (a 'pure epistasis' pair). This means the result is an "
+                   "APPROXIMATION - unselected pairs are reported as having no interaction, which "
+                   "may not be true, they simply were not checked exactly."},
+          {'label': 'Fraction of pairs scored exactly when pre-screening (%)',
+           'type': 'top_pct',
+           'default': 'all',
+           'depends_on': (10, True),
+           'help': "Only used when the pre-screen above is not 'off'. What fraction of candidate "
+                   "pairs the pre-screen shortlists for an exact interaction score - e.g. 2 means "
+                   "the top 2% of pairs by the pre-screen's own cheap ranking. Lower = faster but "
+                   "more likely to miss a real interaction; higher = slower but more thorough."},
+          {'label': 'Interaction grid points per marker (3 = genotype classes)',
+           'type': 'int',
+           'default': 3,
+           'depends_on': (10, True),
+           'help': "How many representative values each marker's own interaction grid uses - 3 "
+                   "matches this tool's usual 0/1/2 genotype coding exactly and is the right "
+                   "choice for ordinary hard-called data. Raising this can help on fractional/"
+                   "dosage-coded marker data (e.g. RIL/NAM populations, or PLINK data with some "
+                   "missing calls) at higher cost (cost grows with the SQUARE of this number)."}],
  'RF': [{'label': 'Tree number',
          'type': 'int',
-         'default': 1000,
+         'default': 100,
          'help': 'How many individual decision trees to average together. More trees usually give '
                  'steadier, more reliable predictions, at the cost of longer runtime - returns '
                  'diminish well before 1000 for most datasets.',
@@ -298,7 +511,390 @@ HPARAM_SPECS = {'rrBLUP': [{'label': 'Iteration number',
          'help': 'Only the top markers (ranked by importance) are checked for pairwise '
                  'interactions; every other marker pair is left out. Fewer markers = much faster. '
                  "'all' checks every possible pair but can take a very long time on datasets with "
+                 'thousands of markers.'},
+        {'label': 'Marker interaction method',
+         'type': 'str',
+         'default': 'pairwise_shap',
+         'choices': ['pairwise_shap', 'friedman_h'],
+         'depends_on': (5, True),
+         'help': "How pairs of markers are scored for interaction strength. 'pairwise_shap' "
+                 '(default) uses exact pairwise SHAP interaction values from the fitted forest '
+                 "- fast and exact for a tree model, but only available for tree-based models. "
+                 "'friedman_h' uses Friedman's H-statistic instead - a model-agnostic measure "
+                 "(the same one used for SVR/KNN elsewhere in this pipeline) based on how much "
+                 "a pair's joint effect on the prediction departs from the two markers acting "
+                 'independently. Both use the same top-importance marker shortlist and top-N% '
+                 'output filtering configured above.'},
+        # Update ID ver4-6, R1/R1b (blueprint §5.2): appended, never
+        # inserted (I5) - this list's own length was 10 (terminal index
+        # 9) before this edit, verified rather than assumed. Read
+        # defensively by RF.py, and only actually FORWARDED in the
+        # 'friedman_h' branch (see that file's own comment) - these three
+        # settings have no effect on the exact 'pairwise_shap' route,
+        # which never calls h_statistic_interactions() at all. Neither
+        # new field is 'tunable' for the same reason as every other
+        # interaction-search setting in this schema (an explainability
+        # side-computation, forced off during a hyperparameter search).
+        #
+        # Update ID ver4-7: added 'visible_when' (9, 'friedman_h') to all
+        # three fields below - unlike 'depends_on' (which only greys a
+        # field out), 'visible_when' makes render_hparam_panel() skip
+        # rendering the field's widget(s) entirely whenever the field at
+        # index 9 ('Marker interaction method') isn't currently
+        # 'friedman_h'. These three are meaningless for the default
+        # 'pairwise_shap' route (see the comment above), so there is
+        # nothing useful to show or grey out in that case - the
+        # field simply doesn't appear. 'depends_on': (5, True) is left in
+        # place unchanged, so once 'friedman_h' IS selected these still
+        # grey out correctly if 'Return marker effect for interactions?'
+        # is unchecked. resolve_hparams() is unaffected: a field that was
+        # never rendered this run simply falls back to its own
+        # HPARAM_SPECS default via resolve_field()'s existing
+        # st.session_state.get(key, default), exactly as already happens
+        # for any field whose widget hasn't been drawn yet - and since
+        # RF.py never forwards these outside the 'friedman_h' branch
+        # anyway, a stale/default value sitting unused behind a hidden
+        # widget has no effect. Any value a user previously entered while
+        # 'friedman_h' was selected is preserved in st.session_state and
+        # reappears unchanged if they switch back to it later.
+        # Update ID ver4-8: 'surrogate_shap' removed from 'choices' - see
+        # the identical note on RKHS's own copy of this field for the full
+        # rationale (applies uniformly to RKHS/RF/SVR/KNN).
+        {'label': 'Interaction pre-screen (speed vs. completeness, "friedman_h" method only)',
+         'type': 'str',
+         'default': 'off',
+         'choices': ['off', 'marginal_pd'],
+         'combo_state': 'readonly',
+         'depends_on': (5, True),
+         'visible_when': (9, 'friedman_h'),
+         'help': "Only used when 'Marker interaction method' above is 'friedman_h' - has no "
+                 "effect for the default 'pairwise_shap' method, which is already exact. 'off' "
+                 "(default) evaluates every candidate marker pair exactly - correct, but slow "
+                 "when many markers are shortlisted. 'marginal_pd' (cheap) ranks pairs by how "
+                 "much each marker's own effect varies on its own, then only computes the full, "
+                 "exact interaction score for the strongest-ranked pairs - much faster, but can "
+                 "miss a pair where BOTH markers look unremarkable alone yet interact strongly "
+                 "together (a 'pure epistasis' pair). This means the result is an "
+                 "APPROXIMATION - unselected pairs are reported as having no interaction, which "
+                 "may not be true, they simply were not checked exactly."},
+        {'label': 'Fraction of pairs scored exactly when pre-screening (%)',
+         'type': 'top_pct',
+         'default': 'all',
+         'depends_on': (5, True),
+         'visible_when': (9, 'friedman_h'),
+         'help': "Only used when the pre-screen above is not 'off'. What fraction of candidate "
+                 "pairs the pre-screen shortlists for an exact interaction score - e.g. 2 means "
+                 "the top 2% of pairs by the pre-screen's own cheap ranking. Lower = faster but "
+                 "more likely to miss a real interaction; higher = slower but more thorough."},
+        {'label': 'Interaction grid points per marker (3 = genotype classes, "friedman_h" method only)',
+         'type': 'int',
+         'default': 3,
+         'depends_on': (5, True),
+         'visible_when': (9, 'friedman_h'),
+         'help': "Only used when 'Marker interaction method' above is 'friedman_h'. How many "
+                 "representative values each marker's own interaction grid uses - 3 matches this "
+                 "tool's usual 0/1/2 genotype coding exactly and is the right choice for ordinary "
+                 "hard-called data. Raising this can help on fractional/dosage-coded marker data "
+                 "(e.g. RIL/NAM populations, or PLINK data with some missing calls) at higher "
+                 "cost (cost grows with the SQUARE of this number)."},
+        # Update (Requirements.md item 2 - cross-model H-index result
+        # diversity): appended, never inserted (I5) - this list's own
+        # length was 13 (terminal index 12) before this edit, verified
+        # rather than assumed. 'friedman_h' previously reused field 6
+        # ('Number of samples for marker effect interactions', default
+        # 30) as its OWN background sample size for Friedman's
+        # H-statistic - a field whose default of 30 was tuned for the
+        # 'pairwise_shap' route's exact, per-row TreeSHAP explanation
+        # (cheap enough to explain few rows exactly), not for H^2's own
+        # partial-dependence AVERAGE, which needs a background at least
+        # as large as SVR/KNN/RKHS's own equivalent fields (each
+        # defaulting to 100/100/50) to be comparably stable. A 30-row
+        # background gives a visibly noisier H^2 ranking than the same
+        # statistic computed on a 100-row background for another model -
+        # this was a real, fixable contributor to "the number of
+        # extracted interactions among the prediction models are quite
+        # diverse even under the same configuration when using H-index"
+        # (the shortlist size and top-N% were already reproducible
+        # across models - see top_select()'s own fix - only the
+        # H-statistic's own precision was not). This new field gives
+        # 'friedman_h' its own properly-sized default (100, matching
+        # SVR/KNN), independent of `shapley_num`'s own Shapley-era
+        # value; RF.py reads it defensively (`len(params) > 13`) and
+        # falls back to the OLD `shapley_num`-reuse behaviour for any
+        # config predating this field, so nothing already saved changes
+        # silently. Not 'tunable' for the same reason as every other
+        # interaction-search setting in this schema (an explainability
+        # side-computation, forced off during a hyperparameter search).
+        {'label': 'Background sample size for Friedman H-statistic interactions ("friedman_h" method only)',
+         'type': 'int',
+         'default': 100,
+         'depends_on': (5, True),
+         'visible_when': (9, 'friedman_h'),
+         'help': "Only used when 'Marker interaction method' above is 'friedman_h'. How many test "
+                 "individuals are used to average out every marker other than the pair currently "
+                 "being tested, when estimating each pair's interaction strength - the same role "
+                 "'Background sample size for interaction search' plays for SVR/KNN. Larger = more "
+                 "stable, more comparable H-statistic estimates but slower; too small (e.g. the "
+                 "'pairwise_shap' route's own much smaller sample count) makes the ranking noisier "
+                 "than the equivalent SVR/KNN/RKHS computation on the same data."}],
+ 'ExtraTrees': [{'label': 'Tree number',
+         'type': 'int',
+         'default': 100,
+         'help': 'How many individual decision trees to average together. More trees usually give '
+                 'steadier, more reliable predictions, at the cost of longer runtime.',
+         'tunable': {'low': 100, 'high': 2000, 'step': 100}},
+        {'label': 'Maximum features per tree',
+         'type': 'rf_max_features',
+         'default': '1.0',
+         'choices': ['sqrt', 'log2', 'None'],
+         'combo_state': 'normal',
+         'help': "How many markers each tree is allowed to consider at every split. Extremely "
+                 'Randomised Trees pick the SPLIT THRESHOLD at random rather than searching for '
+                 "the best one, so this setting matters somewhat less here than for RF, but still "
+                 "controls how much randomness each tree sees.",
+         'tunable': {'choices': ['sqrt', 'log2', 0.5, 0.8, 1.0]}},
+        {'label': "Bootstrap sample fraction ('None' = ExtraTrees' own default: no resampling)",
+         'type': 'int_float_or_none',
+         'default': None,
+         'help': "'None' (the default) uses Extremely Randomised Trees in their natural, "
+                 'textbook form: every tree sees the FULL training set, relying only on random '
+                 'split thresholds for diversity between trees - this is what typically makes '
+                 'ExtraTrees a genuinely different, often less overfitted, alternative to RF. '
+                 'Setting a fraction here instead switches on bootstrap resampling at that '
+                 'fraction (like RF does), for anyone who wants that comparison instead.',
+         'tunable': {'choices': [None, 0.5, 0.7, 0.9]}},
+        {'label': 'Maximum tree depth',
+         'type': 'int_float_or_none',
+         'default': None,
+         'help': "Limits how many splits deep each tree can grow. 'None' (the default) lets trees "
+                 'grow until every leaf is pure or too small to split further.',
+         'tunable': {'choices': [None, 5, 10, 15, 25]}},
+        {'label': 'Minimum samples per leaf in each tree',
+         'type': 'int',
+         'default': 1,
+         'help': 'The smallest number of samples allowed in a leaf node. Raising this (e.g. 5-20) '
+                 'smooths predictions and reduces overfitting, especially with noisy phenotypes.',
+         'tunable': {'low': 1, 'high': 20, 'step': 1}},
+        {'label': 'Return marker effect for interactions?',
+         'type': 'bool',
+         'default': False,
+         'help': 'If checked, also searches for pairs of markers that interact with each other '
+                 '(beyond what each marker alone explains), using the same exact TreeSHAP method '
+                 "RF uses. This is slower - the settings below only apply when this is checked. "
+                 "Defaults to unchecked (unlike RF, whose own default is checked) so an existing "
+                 "config that adds this model does not silently pay the extra cost."},
+        {'label': 'Number of samples for marker effect interactions',
+         'type': 'int',
+         'default': 30,
+         'depends_on': (5, True),
+         'help': 'How many test individuals to search for marker-pair interactions in. More '
+                 'individuals give a more representative picture across the population, but take '
+                 'longer.'},
+        {'label': 'Output only the top N% of interactions ("all" for everything)',
+         'type': 'top_pct',
+         'default': 'all',
+         'depends_on': (5, True),
+         'help': 'Only keep the strongest interactions found, as a percentage of all pairs tested '
+                 "- e.g. 0.01 keeps only the top 0.01%. 'all' keeps every pair tested, which can be "
+                 'a very large table for datasets with many markers.'},
+        {'label': 'Max markers considered for interaction search ("all" for every marker)',
+         'type': 'int_or_all',
+         'default': 500,
+         'depends_on': (5, True),
+         'help': 'Only the top markers (ranked by importance) are checked for pairwise '
+                 'interactions; every other marker pair is left out. Fewer markers = much faster. '
+                 "'all' checks every possible pair but can take a very long time on datasets with "
                  'thousands of markers.'}],
+ 'GBDT': [{'label': 'Boosting iterations (max_iter)',
+         'type': 'int',
+         'default': 100,
+         'help': 'How many boosting rounds (trees added one after another, each correcting the '
+                 "previous rounds' errors) to run. More iterations can fit more detail but risk "
+                 'overfitting - usually tuned together with the learning rate below.',
+         'tunable': {'low': 50, 'high': 500, 'step': 50}},
+        {'label': 'Learning rate',
+         'type': 'float',
+         'default': 0.1,
+         'help': 'How much each new tree is allowed to correct the previous rounds. Smaller values '
+                 'need more boosting iterations but often generalise better; larger values fit '
+                 'faster but risk overshooting.',
+         # Update ID ver4-6, R1.2(b): log-scaled (see the RKHS Kernel
+         # bandwidth field's own comment above for the full rationale).
+         'tunable': {'low': 0.01, 'high': 0.3, 'scale': 'log'}},
+        {'label': 'Maximum tree depth',
+         'type': 'int_float_or_none',
+         'default': None,
+         'help': "Limits how many splits deep each tree can grow. 'None' (the default) lets depth "
+                 'be governed only by the maximum leaf nodes setting below.',
+         'tunable': {'choices': [None, 3, 5, 8, 15]}},
+        {'label': 'Maximum leaf nodes per tree',
+         'type': 'int',
+         'default': 30,
+         'help': "How many leaf nodes each individual (shallow, boosted) tree is allowed.",
+         'tunable': {'low': 8, 'high': 64, 'step': 8}},
+        {'label': 'Minimum samples per leaf in each tree',
+         'type': 'int',
+         'default': 20,
+         'help': 'The smallest number of samples allowed in a leaf node. Larger values smooth '
+                 'predictions and reduce overfitting, especially with noisy phenotypes.',
+         'tunable': {'low': 5, 'high': 50, 'step': 5}},
+        {'label': 'L2 regularisation',
+         'type': 'float',
+         'default': 0.0,
+         'help': 'A penalty on large leaf values, discouraging the model from fitting extreme '
+                 'per-leaf corrections. 0 (the default) disables it; larger values regularise more '
+                 'strongly.',
+         'tunable': {'low': 0.0, 'high': 1.0}},
+        {'label': 'Return marker effect for interactions?',
+         'type': 'bool',
+         'default': False,
+         'help': 'If checked, also searches for pairs of markers that interact with each other, '
+                 "using the same exact TreeSHAP method RF uses. This model has no free, "
+                 "already-fitted marker-effect measure the way RF does, so its own marker effect "
+                 '(returned regardless of this setting) is read from permutation importance on a '
+                 'correlation-shortlisted marker set. This is slower - the settings below only '
+                 'apply when this is checked.'},
+        {'label': 'Number of samples for marker effect interactions',
+         'type': 'int',
+         'default': 30,
+         'depends_on': (6, True),
+         'help': 'How many test individuals to search for marker-pair interactions in. More '
+                 'individuals give a more representative picture across the population, but take '
+                 'longer.'},
+        {'label': 'Output only the top N% of interactions ("all" for everything)',
+         'type': 'top_pct',
+         'default': 'all',
+         'depends_on': (6, True),
+         'help': 'Only keep the strongest interactions found, as a percentage of all pairs tested '
+                 "- e.g. 0.01 keeps only the top 0.01%. 'all' keeps every pair tested, which can be "
+                 'a very large table for datasets with many markers.'},
+        {'label': 'Max markers considered for interaction search ("all" for every marker)',
+         'type': 'int_or_all',
+         'default': 500,
+         'depends_on': (6, True),
+         'help': 'Only the top markers are checked for pairwise interactions; every other marker '
+                 "pair is left out. Fewer markers = much faster. 'all' checks every possible pair "
+                 'but can take a very long time on datasets with thousands of markers.'}],
+ 'XGBoost': [{'label': 'Tree number (n_estimators)',
+         'type': 'int',
+         'default': 100,
+         'help': 'How many boosting rounds (trees) to build, one after another, each correcting '
+                 'the previous rounds\' errors.',
+         'tunable': {'low': 50, 'high': 500, 'step': 50}},
+        {'label': 'Maximum tree depth',
+         'type': 'int_float_or_none',
+         'default': 6,
+         'help': "How deep each individual boosted tree is allowed to grow. XGBoost's own "
+                 'default is 6 - deeper trees can capture more complex interactions but overfit '
+                 'more easily.',
+         'tunable': {'choices': [3, 4, 6, 8, 10]}},
+        {'label': 'Learning rate',
+         'type': 'float',
+         'default': 0.1,
+         'help': 'How much each new tree is allowed to correct the previous rounds. Smaller values '
+                 'need more boosting rounds but often generalise better.',
+         # Update ID ver4-6, R1.2(b): log-scaled (see the RKHS Kernel
+         # bandwidth field's own comment for the full rationale).
+         'tunable': {'low': 0.01, 'high': 0.3, 'scale': 'log'}},
+        {'label': 'Row subsample fraction',
+         'type': 'float',
+         'default': 1.0,
+         'help': 'The fraction of training individuals randomly sampled to grow each tree. Values '
+                 'below 1.0 add randomness between trees, which can reduce overfitting.',
+         'tunable': {'low': 0.5, 'high': 1.0}},
+        {'label': 'Column subsample fraction per tree',
+         'type': 'float',
+         'default': 1.0,
+         'help': 'The fraction of markers randomly sampled to grow each tree. Values below 1.0 add '
+                 'randomness between trees, which can reduce overfitting on high-dimensional '
+                 'genotype data.',
+         'tunable': {'low': 0.3, 'high': 1.0}},
+        {'label': 'L2 regularisation (reg_lambda)',
+         'type': 'float',
+         'default': 1.0,
+         'help': "A penalty on large leaf weights. XGBoost's own default is 1.0; larger values "
+                 'regularise more strongly.',
+         'tunable': {'low': 0.0, 'high': 5.0}},
+        {'label': 'Return marker effect for interactions?',
+         'type': 'bool',
+         'default': False,
+         'help': 'If checked, also searches for pairs of markers that interact with each other, '
+                 'using the same exact TreeSHAP method RF uses. This is slower - the settings '
+                 'below only apply when this is checked. Requires the optional "xgboost" package '
+                 'to be installed.'},
+        {'label': 'Number of samples for marker effect interactions',
+         'type': 'int',
+         'default': 30,
+         'depends_on': (6, True),
+         'help': 'How many test individuals to search for marker-pair interactions in. More '
+                 'individuals give a more representative picture across the population, but take '
+                 'longer.'},
+        {'label': 'Output only the top N% of interactions ("all" for everything)',
+         'type': 'top_pct',
+         'default': 'all',
+         'depends_on': (6, True),
+         'help': 'Only keep the strongest interactions found, as a percentage of all pairs tested '
+                 "- e.g. 0.01 keeps only the top 0.01%. 'all' keeps every pair tested, which can be "
+                 'a very large table for datasets with many markers.'},
+        {'label': 'Max markers considered for interaction search ("all" for every marker)',
+         'type': 'int_or_all',
+         'default': 500,
+         'depends_on': (6, True),
+         'help': 'Only the top markers (ranked by importance) are checked for pairwise '
+                 'interactions; every other marker pair is left out. Fewer markers = much faster. '
+                 "'all' checks every possible pair but can take a very long time on datasets with "
+                 'thousands of markers.'}],
+ 'EBM': [{'label': 'Learning rate',
+         'type': 'float',
+         'default': 0.04,
+         'help': "How much each boosting round is allowed to correct the previous rounds. This "
+                 "estimator's own default (0.04) is deliberately small - EBMs are boosted very "
+                 'slowly, over many rounds, to keep each individual feature/pair curve smooth and '
+                 'interpretable.',
+         # Update ID ver4-6, R1.2(b): log-scaled (see the RKHS Kernel
+         # bandwidth field's own comment for the full rationale).
+         'tunable': {'low': 0.01, 'high': 0.2, 'scale': 'log'}},
+        {'label': 'Maximum leaves per tree',
+         'type': 'int',
+         'default': 3,
+         'help': 'How many leaf nodes each individual boosting-round tree is allowed. EBMs use '
+                 'very shallow trees by design, so this is normally left small.',
+         'tunable': {'low': 2, 'high': 6, 'step': 1}},
+        {'label': 'Minimum samples per leaf',
+         'type': 'int',
+         'default': 4,
+         'help': 'The smallest number of samples allowed in a leaf node. Larger values smooth the '
+                 'fitted curves and reduce overfitting.',
+         'tunable': {'low': 2, 'high': 20, 'step': 2}},
+        {'label': 'Outer bags',
+         'type': 'int',
+         'default': 8,
+         'help': 'How many independent copies of the model are bagged together and averaged - '
+                 'more bags give smoother, more stable curves at the cost of longer fitting time.',
+         'tunable': {'low': 2, 'high': 16, 'step': 2}},
+        {'label': 'Search for marker-pair interactions?',
+         'type': 'bool',
+         'default': False,
+         'help': "If checked, this model searches for pairs of markers that interact with each "
+                 "other WHILE FITTING - unlike every other model here, an EBM's pairwise terms "
+                 'ARE part of the model itself, not a separate explanation step computed '
+                 'afterwards, so this setting also affects the FIT, not only what gets reported. '
+                 'Requires the optional "interpret" package to be installed.'},
+        {'label': 'Number of interaction terms to search for ("all" = this model\'s own default)',
+         'type': 'int_or_all',
+         'default': 10,
+         'depends_on': (4, True),
+         'help': 'How many candidate marker pairs this model searches for and fits as pairwise '
+                 "terms while training. This is a COUNT of interaction terms, not a marker "
+                 "shortlist size - unlike every other model's own similarly-named field. 'all' "
+                 "uses this model's own built-in default heuristic instead of a fixed count."},
+        {'label': 'Output only the top N% of interactions ("all" for everything)',
+         'type': 'top_pct',
+         'default': 'all',
+         'depends_on': (4, True),
+         'help': 'Only keep the strongest of the interaction terms this model already found while '
+                 "fitting, as a percentage - e.g. 0.01 keeps only the top 0.01%. 'all' keeps every "
+                 'term this model found.'}],
  'SVR': [{'label': 'Kernel type',
           'type': 'str',
           'default': 'rbf',
@@ -315,14 +911,20 @@ HPARAM_SPECS = {'rrBLUP': [{'label': 'Iteration number',
           'help': 'A margin of error the model is allowed to ignore - predictions within epsilon '
                   "of the true value aren't penalised at all. Larger epsilon gives a simpler, less "
                   'sensitive model; smaller epsilon tries to fit the data more closely.',
-          'tunable': {'low': 0.01, 'high': 2.0}},
+          # Update ID ver4-6, R1.2(b): log-scaled (see the RKHS Kernel
+          # bandwidth field's own comment for the full rationale).
+          'tunable': {'low': 0.001, 'high': 2.0, 'scale': 'log'}},
          {'label': 'Constraint',
           'type': 'float',
           'default': 1.0,
           'help': 'Controls the trade-off between fitting the training data closely and keeping '
                   'the model simple. Higher values fit the training data harder (risk of '
                   'overfitting); lower values favour a smoother, more general model.',
-          'tunable': {'low': 0.01, 'high': 100.0}},
+          # Update ID ver4-6, R1.2(b): log-scaled - this field's own
+          # native range spans FOUR orders of magnitude (0.01-100), the
+          # single worst offender named in the blueprint's own R1.1
+          # "amplifiers" list.
+          'tunable': {'low': 0.01, 'high': 100.0, 'scale': 'log'}},
          {'label': 'Dimension for poly kernel',
           'type': 'int',
           'default': 3,
@@ -380,14 +982,85 @@ HPARAM_SPECS = {'rrBLUP': [{'label': 'Iteration number',
           'depends_on': (6, True),
           'help': "How many random combinations of markers are tried out to estimate each marker's "
                   'contribution to a prediction. Higher = more accurate but slower; lower = faster '
-                  'but noisier scores. 200 is a reasonable balance for large datasets.'}],
+                  'but noisier scores. 200 is a reasonable balance for large datasets.'},
+         {'label': 'Return marker-pair interactions?',
+          'type': 'bool',
+          'default': False,
+          'help': 'If checked, also searches for pairs of markers that interact with each other, '
+                  "using Friedman's H-statistic (SVR has no built-in pairwise-interaction method, "
+                  "so this is a model-agnostic ranking rather than an exact computation like RF's "
+                  'own TreeSHAP interactions). The settings below only apply when this is checked.'},
+         {'label': 'Max markers considered for interaction search ("all" for every marker)',
+          'type': 'int_or_all',
+          'default': 500,
+          'depends_on': (11, True),
+          'help': 'Only the top markers (ranked by correlation with the trait) are checked for '
+                  "pairwise interactions; every other marker pair is left out. Fewer markers = much "
+                  "faster. 'all' checks every possible pair but can take a very long time on "
+                  'datasets with thousands of markers.'},
+         {'label': 'Background sample size for interaction search',
+          'type': 'int',
+          'default': 100,
+          'depends_on': (11, True),
+          'help': 'How many test individuals are used to average out every marker other than '
+                  'the pair currently being tested, when estimating each pair\'s interaction '
+                  'strength. Larger = more stable estimates but slower.'},
+         {'label': 'Output only the top N% of interactions ("all" for everything)',
+          'type': 'top_pct',
+          'default': 'all',
+          'depends_on': (11, True),
+          'help': 'Only keep the strongest interactions found, as a percentage of all pairs tested '
+                  "- e.g. 0.01 keeps only the top 0.01%. 'all' keeps every pair tested, which can be "
+                  'a very large table for datasets with many markers.'},
+         # Update ID ver4-6, R1/R1b (blueprint §5.2): appended, never
+         # inserted (I5) - this list's own length was 15 (terminal index
+         # 14) before this edit, verified rather than assumed.
+         # Update ID ver4-8: 'surrogate_shap' removed from 'choices' - see
+         # the identical note on RKHS's own copy of this field for the full
+         # rationale (applies uniformly to RKHS/RF/SVR/KNN).
+         {'label': 'Interaction pre-screen (speed vs. completeness)',
+          'type': 'str',
+          'default': 'off',
+          'choices': ['off', 'marginal_pd'],
+          'combo_state': 'readonly',
+          'depends_on': (11, True),
+          'help': "'off' (default) evaluates every candidate marker pair exactly - correct, but "
+                  "slow when many markers are shortlisted (SVR has no native pairwise-interaction "
+                  "API, so every pair costs a real prediction call). 'marginal_pd' (cheap) ranks "
+                  "pairs by how much each marker's own effect varies on its own, then only "
+                  "computes the full, exact interaction score for the strongest-ranked pairs - "
+                  "much faster, but can miss a pair where BOTH markers look unremarkable alone "
+                  "yet interact strongly together (a 'pure epistasis' pair). This means the "
+                  "result is an APPROXIMATION - unselected pairs are reported as having no "
+                  "interaction, which may not be true, they simply were not checked exactly."},
+         {'label': 'Fraction of pairs scored exactly when pre-screening (%)',
+          'type': 'top_pct',
+          'default': 'all',
+          'depends_on': (11, True),
+          'help': "Only used when the pre-screen above is not 'off'. What fraction of candidate "
+                  "pairs the pre-screen shortlists for an exact interaction score - e.g. 2 means "
+                  "the top 2% of pairs by the pre-screen's own cheap ranking. Lower = faster but "
+                  "more likely to miss a real interaction; higher = slower but more thorough."},
+         {'label': 'Interaction grid points per marker (3 = genotype classes)',
+          'type': 'int',
+          'default': 3,
+          'depends_on': (11, True),
+          'help': "How many representative values each marker's own interaction grid uses - 3 "
+                  "matches this tool's usual 0/1/2 genotype coding exactly and is the right "
+                  "choice for ordinary hard-called data. Raising this can help on fractional/"
+                  "dosage-coded marker data (e.g. RIL/NAM populations, or PLINK data with some "
+                  "missing calls) at higher cost (cost grows with the SQUARE of this number)."}],
  'KNN': [{'label': 'Number of neighbours',
           'type': 'int',
           'default': 5,
           'help': 'How many of the most genetically similar training individuals are averaged '
                   "together to predict each new individual's trait. Fewer neighbours can pick up "
                   'more local detail but are noisier; more neighbours give a smoother, more stable '
-                  'prediction but can blur out real differences.',
+                  "prediction but can blur out real differences. If 'Return marker-pair "
+                  "interactions?' below is also checked, a small value here (e.g. the default 5) "
+                  'also makes KNN\'s own predictions less smooth from one marker value to the '
+                  'next, which can inflate the H-statistic interaction search broadly rather than '
+                  'just at true interactions - raising this can reduce that effect somewhat.',
           'tunable': {'low': 1, 'high': 30, 'step': 1}},
          {'label': 'Neighbour weighting',
           'type': 'str',
@@ -440,7 +1113,83 @@ HPARAM_SPECS = {'rrBLUP': [{'label': 'Iteration number',
           'depends_on': (3, True),
           'help': "How many random combinations of markers are tried out to estimate each marker's "
                   'contribution to a prediction. Higher = more accurate but slower; lower = faster '
-                  'but noisier scores. 200 is a reasonable balance for large datasets.'}],
+                  'but noisier scores. 200 is a reasonable balance for large datasets.'},
+         {'label': 'Return marker-pair interactions?',
+          'type': 'bool',
+          'default': False,
+          'help': 'If checked, also searches for pairs of markers that interact with each other, '
+                  "using Friedman's H-statistic (KNN has no built-in pairwise-interaction method, "
+                  'so this is a model-agnostic ranking, not an exact computation). The settings '
+                  'below only apply when this is checked. Known limitation: KNN predicts by '
+                  "averaging a fixed set of 'nearest' training individuals, which can change "
+                  'abruptly as a marker value is varied - unlike a smooth model (e.g. SVR), this '
+                  'can make the H-statistic look elevated for MANY marker pairs at once, not just '
+                  "truly interacting ones. If KNN's ring looks like a much denser web of links "
+                  "than another model's under the same settings, treat the RELATIVE ranking "
+                  "within KNN's own results as informative, but be cautious reading its raw "
+                  'magnitudes as directly comparable to another model - a larger neighbour count '
+                  'above and a larger background sample below both help smooth this out, though '
+                  'neither fully removes it.'},
+         {'label': 'Max markers considered for interaction search ("all" for every marker)',
+          'type': 'int_or_all',
+          'default': 500,
+          'depends_on': (8, True),
+          'help': 'Only the top markers (ranked by correlation with the trait) are checked for '
+                  "pairwise interactions; every other marker pair is left out. Fewer markers = much "
+                  "faster. 'all' checks every possible pair but can take a very long time on "
+                  'datasets with thousands of markers.'},
+         {'label': 'Background sample size for interaction search',
+          'type': 'int',
+          'default': 100,
+          'depends_on': (8, True),
+          'help': 'How many test individuals are used to average out every marker other than '
+                  'the pair currently being tested, when estimating each pair\'s interaction '
+                  'strength. Larger = more stable estimates but slower.'},
+         {'label': 'Output only the top N% of interactions ("all" for everything)',
+          'type': 'top_pct',
+          'default': 'all',
+          'depends_on': (8, True),
+          'help': 'Only keep the strongest interactions found, as a percentage of all pairs tested '
+                  "- e.g. 0.01 keeps only the top 0.01%. 'all' keeps every pair tested, which can be "
+                  'a very large table for datasets with many markers.'},
+         # Update ID ver4-6, R1/R1b (blueprint §5.2): appended, never
+         # inserted (I5) - this list's own length was 12 (terminal index
+         # 11) before this edit, verified rather than assumed.
+         # Update ID ver4-8: 'surrogate_shap' removed from 'choices' - see
+         # the identical note on RKHS's own copy of this field for the full
+         # rationale (applies uniformly to RKHS/RF/SVR/KNN).
+         {'label': 'Interaction pre-screen (speed vs. completeness)',
+          'type': 'str',
+          'default': 'off',
+          'choices': ['off', 'marginal_pd'],
+          'combo_state': 'readonly',
+          'depends_on': (8, True),
+          'help': "'off' (default) evaluates every candidate marker pair exactly - correct, but "
+                  "slow when many markers are shortlisted (KNN has no native pairwise-interaction "
+                  "API, so every pair costs a real prediction call). 'marginal_pd' (cheap) ranks "
+                  "pairs by how much each marker's own effect varies on its own, then only "
+                  "computes the full, exact interaction score for the strongest-ranked pairs - "
+                  "much faster, but can miss a pair where BOTH markers look unremarkable alone "
+                  "yet interact strongly together (a 'pure epistasis' pair). This means the "
+                  "result is an APPROXIMATION - unselected pairs are reported as having no "
+                  "interaction, which may not be true, they simply were not checked exactly."},
+         {'label': 'Fraction of pairs scored exactly when pre-screening (%)',
+          'type': 'top_pct',
+          'default': 'all',
+          'depends_on': (8, True),
+          'help': "Only used when the pre-screen above is not 'off'. What fraction of candidate "
+                  "pairs the pre-screen shortlists for an exact interaction score - e.g. 2 means "
+                  "the top 2% of pairs by the pre-screen's own cheap ranking. Lower = faster but "
+                  "more likely to miss a real interaction; higher = slower but more thorough."},
+         {'label': 'Interaction grid points per marker (3 = genotype classes)',
+          'type': 'int',
+          'default': 3,
+          'depends_on': (8, True),
+          'help': "How many representative values each marker's own interaction grid uses - 3 "
+                  "matches this tool's usual 0/1/2 genotype coding exactly and is the right "
+                  "choice for ordinary hard-called data. Raising this can help on fractional/"
+                  "dosage-coded marker data (e.g. RIL/NAM populations, or PLINK data with some "
+                  "missing calls) at higher cost (cost grows with the SQUARE of this number)."}],
  'MLP': [{'label': 'Neuron numbers',
           'type': 'int',
           'default': 30,
@@ -461,14 +1210,14 @@ HPARAM_SPECS = {'rrBLUP': [{'label': 'Iteration number',
           'help': 'How big a step the network takes when updating its weights after each batch. '
                   'Too high can make training unstable or fail to settle down; too low makes '
                   'training very slow to improve.',
-          'tunable': {'low': 0.0001, 'high': 0.1}},
+          'tunable': {'low': 0.0001, 'high': 0.1, 'scale': 'log'}},  # ver4-6 R1.2(b)
          {'label': 'Decay',
           'type': 'float',
           'default': 0.0005,
           'help': "A small penalty that discourages the network's weights from growing too large, "
                   'as another safeguard against overfitting. 0 disables it; larger values '
                   'regularise more strongly.',
-          'tunable': {'low': 0.0, 'high': 0.01}},
+          'tunable': {'low': 1e-6, 'high': 0.01, 'scale': 'log'}},  # ver4-6 R1.2(b): low raised from 0.0 (log needs low>0)
          {'label': 'Epoch',
           'type': 'int',
           'default': 200,
@@ -496,7 +1245,30 @@ HPARAM_SPECS = {'rrBLUP': [{'label': 'Iteration number',
           'default': 30,
           'help': 'How many test individuals to compute marker-effect (Shapley) scores for. More '
                   'individuals give a more representative picture of marker importance across the '
-                  'population, but take longer.'}],
+                  'population, but take longer.'},
+         {'label': 'Return marker-pair interactions?',
+          'type': 'bool',
+          'default': False,
+          'help': 'If checked, also searches for pairs of markers that interact with each other, '
+                  "using Neural Interaction Detection (NID) - read directly from this network's "
+                  'own trained first-layer weights, so it costs virtually nothing extra beyond the '
+                  'training that already happened. The setting below only applies when this is '
+                  'checked.'},
+         {'label': 'Max markers considered for interaction search ("all" for every marker)',
+          'type': 'int_or_all',
+          'default': 500,
+          'depends_on': (8, True),
+          'help': "Only the top markers (ranked by this model's own marker-effect scores) are "
+                  "included in the interaction table; every other marker pair is left out. This "
+                  'only bounds how big the OUTPUT table is - it does not change how long the '
+                  "search itself takes. 'all' includes every marker."},
+         {'label': 'Output only the top N% of interactions ("all" for everything)',
+          'type': 'top_pct',
+          'default': 'all',
+          'depends_on': (8, True),
+          'help': 'Only keep the strongest interactions found, as a percentage of all pairs tested '
+                  "- e.g. 0.01 keeps only the top 0.01%. 'all' keeps every pair tested, which can be "
+                  'a very large table for datasets with many markers.'}],
  'GAT_infinitesimal': [{'label': 'Neuron numbers',
                         'type': 'int',
                         'default': 20,
@@ -518,14 +1290,14 @@ HPARAM_SPECS = {'rrBLUP': [{'label': 'Iteration number',
                         'help': 'How big a step the network takes when updating its weights after '
                                 'each batch. Too high can make training unstable or fail to settle '
                                 'down; too low makes training very slow to improve.',
-                        'tunable': {'low': 0.0001, 'high': 0.1}},
+                        'tunable': {'low': 0.0001, 'high': 0.1, 'scale': 'log'}},  # ver4-6 R1.2(b)
                        {'label': 'Decay',
                         'type': 'float',
                         'default': 0.0005,
                         'help': "A small penalty that discourages the network's weights from "
                                 'growing too large, as another safeguard against overfitting. 0 '
                                 'disables it; larger values regularise more strongly.',
-                        'tunable': {'low': 0.0, 'high': 0.01}},
+                        'tunable': {'low': 1e-6, 'high': 0.01, 'scale': 'log'}},  # ver4-6 R1.2(b): low raised from 0.0 (log needs low>0)
                        {'label': 'Epoch',
                         'type': 'int',
                         'default': 40,
@@ -583,14 +1355,14 @@ HPARAM_SPECS = {'rrBLUP': [{'label': 'Iteration number',
                           'help': 'How big a step the network takes when updating its weights '
                                   'after each batch. Too high can make training unstable or fail '
                                   'to settle down; too low makes training very slow to improve.',
-                          'tunable': {'low': 0.0001, 'high': 0.1}},
+                          'tunable': {'low': 0.0001, 'high': 0.1, 'scale': 'log'}},  # ver4-6 R1.2(b)
                          {'label': 'Decay',
                           'type': 'float',
                           'default': 0.0005,
                           'help': "A small penalty that discourages the network's weights from "
                                   'growing too large, as another safeguard against overfitting. 0 '
                                   'disables it; larger values regularise more strongly.',
-                          'tunable': {'low': 0.0, 'high': 0.01}},
+                          'tunable': {'low': 1e-6, 'high': 0.01, 'scale': 'log'}},  # ver4-6 R1.2(b): low raised from 0.0 (log needs low>0)
                          {'label': 'Epoch',
                           'type': 'int',
                           'default': 40,
@@ -649,14 +1421,14 @@ HPARAM_SPECS = {'rrBLUP': [{'label': 'Iteration number',
                           'help': 'How big a step the network takes when updating its weights '
                                   'after each batch. Too high can make training unstable or fail '
                                   'to settle down; too low makes training very slow to improve.',
-                          'tunable': {'low': 0.0001, 'high': 0.1}},
+                          'tunable': {'low': 0.0001, 'high': 0.1, 'scale': 'log'}},  # ver4-6 R1.2(b)
                          {'label': 'Decay',
                           'type': 'float',
                           'default': 0.0005,
                           'help': "A small penalty that discourages the network's weights from "
                                   'growing too large, as another safeguard against overfitting. 0 '
                                   'disables it; larger values regularise more strongly.',
-                          'tunable': {'low': 0.0, 'high': 0.01}},
+                          'tunable': {'low': 1e-6, 'high': 0.01, 'scale': 'log'}},  # ver4-6 R1.2(b): low raised from 0.0 (log needs low>0)
                          {'label': 'Epoch',
                           'type': 'int',
                           'default': 40,
@@ -703,7 +1475,17 @@ HPARAM_SPECS = {'rrBLUP': [{'label': 'Iteration number',
                           'depends_on': (8, True),
                           'help': 'How many test individuals to compute marker-effect scores for. '
                                   'More individuals give a more representative picture of marker '
-                                  'importance across the population, but take longer.'}],
+                                  'importance across the population, but take longer.'},
+                         {'label': 'Return marker-pair interactions?',
+                          'type': 'bool',
+                          'default': False,
+                          'help': 'If checked, writes this model\'s own marker-pair interaction '
+                                  'strengths to Interaction.csv (one ring per selected model on '
+                                  'the circos plot). This model already computes these values '
+                                  'internally to decide which marker pairs to connect in its own '
+                                  'graph - checking this only changes whether that already-'
+                                  'computed table is also reported, not how the model itself '
+                                  'trains or predicts.'}],
  'GAT_biological_prior_knowledge': [{'label': 'Neuron numbers',
                                      'type': 'int',
                                      'default': 20,
@@ -728,7 +1510,7 @@ HPARAM_SPECS = {'rrBLUP': [{'label': 'Iteration number',
                                              'weights after each batch. Too high can make training '
                                              'unstable or fail to settle down; too low makes '
                                              'training very slow to improve.',
-                                     'tunable': {'low': 0.0001, 'high': 0.1}},
+                                     'tunable': {'low': 0.0001, 'high': 0.1, 'scale': 'log'}},  # ver4-6 R1.2(b)
                                     {'label': 'Decay',
                                      'type': 'float',
                                      'default': 0.0005,
@@ -736,7 +1518,7 @@ HPARAM_SPECS = {'rrBLUP': [{'label': 'Iteration number',
                                              'weights from growing too large, as another safeguard '
                                              'against overfitting. 0 disables it; larger values '
                                              'regularise more strongly.',
-                                     'tunable': {'low': 0.0, 'high': 0.01}},
+                                     'tunable': {'low': 1e-6, 'high': 0.01, 'scale': 'log'}},  # ver4-6 R1.2(b): low raised from 0.0 (log needs low>0)
                                     {'label': 'Epoch',
                                      'type': 'int',
                                      'default': 40,
@@ -861,9 +1643,9 @@ HPARAM_SPECS['GAT_infinitesimal_node_level'] = [
     {'label': 'Dropout', 'type': 'float', 'default': 0,
      'tunable': {'low': 0.0, 'high': 0.6}},
     {'label': 'Learning rate', 'type': 'float', 'default': 0.01,
-     'tunable': {'low': 1e-4, 'high': 0.1}},
+     'tunable': {'low': 1e-4, 'high': 0.1, 'scale': 'log'}},  # ver4-6 R1.2(b)
     {'label': 'Decay', 'type': 'float', 'default': 5e-4,
-     'tunable': {'low': 0.0, 'high': 1e-2}},
+     'tunable': {'low': 1e-6, 'high': 1e-2, 'scale': 'log'}},  # ver4-6 R1.2(b): low raised (log needs low>0)
     {'label': 'Epoch', 'type': 'int', 'default': 40,
      'tunable': {'low': 10, 'high': 200, 'step': 10}},
     {'label': 'Batch size', 'type': 'int', 'default': 8,

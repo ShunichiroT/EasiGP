@@ -10,6 +10,10 @@ from torch_geometric.nn import GATv2Conv, Linear, to_hetero_with_bases, to_heter
 from torch_geometric.loader import HGTLoader
 from torch_geometric.explain import Explainer, CaptumExplainer
 
+from pipeline_utils import (
+    get_active_compute_resources, apply_torch_compute_settings, gpu_slot, dataloader_num_workers,
+)
+
 
 def GAT_infinitesimal_node_level(data_train, data_valid, data_test, params):
     
@@ -115,114 +119,143 @@ def GAT_infinitesimal_node_level(data_train, data_valid, data_test, params):
                 batch = batch.to(device)
                 model.train()
                 optimizer.zero_grad()
-                out = model(batch.x_dict, batch.edge_index_dict)
-                mask = batch['pheno'].train_mask
-                loss = F.mse_loss(out[mask].unsqueeze(-1), batch['pheno'].y[mask])
-                loss_train_sum += loss
-                loss.backward()
-                optimizer.step()
+                # ver4-4 R4.b/c: mirrors MLP.py's own GradScaler/autocast
+                # pattern exactly - a no-op (use_amp resolves False)
+                # whenever the resolved device isn't CUDA, so a CPU-only
+                # run's numerics are completely unaffected.
+                with torch.autocast(device_type=device.type, enabled=use_amp):
+                    out = model(batch.x_dict, batch.edge_index_dict)
+                    mask = batch['pheno'].train_mask
+                    loss = F.mse_loss(out[mask].unsqueeze(-1), batch['pheno'].y[mask])
+                loss_train_sum += loss.detach()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
             print(f'Epoch {ep:>3} | Train Loss: {loss_train_sum/len(train_loader):.5f}')
         
         return model
     
     ## Develop a GAT model
     model = Model(neurons=neuron, out_channels=1, dpout=dropout)
-    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-    model.to(device)
-    
-    with torch.no_grad():
-        out = model(data.x_dict, data.edge_index_dict)
-    
-    ## Convert the data into mini-batches
-    ## Sample enough neighbors per hop to always cover every marker/sample node, rather
-    ## than a fixed count tuned for a specific dataset size (which would silently drop
-    ## markers on larger datasets).
-    max_neighbors = max(data_QTL.shape[1], data_pheno.shape[0])
-    train_loader = HGTLoader(data, 
-                            num_samples={key:[max_neighbors] * 4 for key in data.node_types},
-                            shuffle=True,
-                            batch_size=bsize,
-                            input_nodes=('pheno', data['pheno'].train_mask))
-    if VALID:
-        valid_loader = HGTLoader(data, 
+    _resources = get_active_compute_resources()
+    device = torch.device(_resources['device'])
+    apply_torch_compute_settings(_resources)
+    use_amp = bool(_resources['use_amp']) and device.type == 'cuda'
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+
+    # ver4-4 R4.d/e: num_workers from the shared, config-derived
+    # TORCH_DATALOADER_WORKERS setting (daemon-process-safe - RK-3), and
+    # pin_memory only on a CUDA device. Both default to 0/False,
+    # reproducing today's exact loader behaviour. HGTLoader forwards
+    # **kwargs to the underlying torch DataLoader it wraps, so both
+    # keywords are accepted here exactly as on every other loader in
+    # this codebase (verified directly against the installed
+    # torch_geometric's own HGTLoader.__init__ signature).
+    _num_workers = dataloader_num_workers(_resources)
+    _pin_memory = device.type == 'cuda'
+
+    with gpu_slot():
+        model.to(device)
+
+        with torch.no_grad():
+            out = model(data.x_dict, data.edge_index_dict)
+
+        ## Convert the data into mini-batches
+        ## Sample enough neighbors per hop to always cover every marker/sample node, rather
+        ## than a fixed count tuned for a specific dataset size (which would silently drop
+        ## markers on larger datasets).
+        max_neighbors = max(data_QTL.shape[1], data_pheno.shape[0])
+        train_loader = HGTLoader(data, 
+                                num_samples={key:[max_neighbors] * 4 for key in data.node_types},
+                                shuffle=True,
+                                batch_size=bsize,
+                                input_nodes=('pheno', data['pheno'].train_mask),
+                                num_workers=_num_workers, pin_memory=_pin_memory)
+        if VALID:
+            valid_loader = HGTLoader(data, 
+                                     num_samples={key:[max_neighbors] * 4 for key in data.node_types},
+                                     batch_size=bsize,shuffle=False,
+                                     input_nodes=('pheno', data['pheno'].valid_mask),
+                                     num_workers=_num_workers, pin_memory=_pin_memory)
+        test_loader = HGTLoader(data, 
                                  num_samples={key:[max_neighbors] * 4 for key in data.node_types},
                                  batch_size=bsize,shuffle=False,
-                                 input_nodes=('pheno', data['pheno'].valid_mask))
-    test_loader = HGTLoader(data, 
-                             num_samples={key:[max_neighbors] * 4 for key in data.node_types},
-                             batch_size=bsize,shuffle=False,
-                             input_nodes=('pheno', data['pheno'].test_mask))
-    ## Train a model
-    model = train()
-    
-    ## Predict phenotypes for the test data
-    model.eval()
-    predicted_test = []
-    actual_test = []
-    for test in test_loader:
-        test = test.to(device)
-        result = model(test.x_dict, test.edge_index_dict)
-        predicted_test.append(result[test['pheno'].test_mask].tolist())
-        actual_test.append([item for sublist in test['pheno'].y[test['pheno'].test_mask].tolist() for item in sublist])
-    predicted_test = [item for sublist in predicted_test for item in sublist]
-    actual_test = [item for sublist in actual_test for item in sublist]
-    
-    ## Calculate the metrics
-    mse = mean_squared_error(actual_test,predicted_test)
-    r = pearsonr(actual_test, predicted_test)[0]
-    
-    ## Store prediction result for the validation data
-    predicted_valid = []
-    actual_valid = []
-    if VALID:
-        for valid in valid_loader:
-            valid = valid.to(device)
-            result = model(valid.x_dict, valid.edge_index_dict)
-            predicted_valid.append(result[valid['pheno'].valid_mask].tolist())
-            actual_valid.append([item for sublist in valid['pheno'].y[valid['pheno'].valid_mask].tolist() for item in sublist])
-        predicted_valid = [item for sublist in predicted_valid for item in sublist]
-        actual_valid = [item for sublist in actual_valid for item in sublist] 
-    
-    ## Store prediction result for the train data
-    predicted_train = []
-    actual_train = []
-    result = model(data.x_dict, data.edge_index_dict)
-    predicted_train.append(result[data['pheno'].train_mask].tolist())
-    actual_train.append([item for sublist in data['pheno'].y[data['pheno'].train_mask].tolist() for item in sublist])
-    predicted_train = [k for i in predicted_train for k in i]
-    actual_train = [k for i in actual_train for k in i]
-    
-    ## Extract marker effects
-    if marker_effect == True:
-        explainer = Explainer(
-            model = model,
-            algorithm=CaptumExplainer('IntegratedGradients'),
-            explanation_type='model',
-            node_mask_type='attributes',
-            edge_mask_type=None, # do not change here
-            model_config = dict(
-                mode='regression',
-                task_level='node',
-                return_type='raw',
-                )
-        )
-        
-        hetero_explanation = explainer(
-            data.x_dict,
-            data.edge_index_dict,
-        )
-        
-        effect = pd.DataFrame()
-        for ii in range(1,len(data.x_dict)):
-            effect = pd.concat([effect, pd.DataFrame(hetero_explanation['qtl_'+str(ii)]['node_mask'].squeeze().tolist())],axis=1)
-        effect = effect[mask_test==1]
-        if effect.shape[0] > samples:
-            effect = effect.sample(n=samples, random_state=1)
-        effect = pd.DataFrame(effect.sum()).T/effect.shape[0]
-        effect.columns = list(data_QTL.columns) 
-    
-    else:
-        effect = pd.DataFrame()
+                                 input_nodes=('pheno', data['pheno'].test_mask),
+                                 num_workers=_num_workers, pin_memory=_pin_memory)
+        ## Train a model
+        model = train()
+
+        ## Predict phenotypes for the test data
+        model.eval()
+        predicted_test = []
+        actual_test = []
+        with torch.no_grad():
+            for test in test_loader:
+                test = test.to(device)
+                result = model(test.x_dict, test.edge_index_dict)
+                predicted_test.append(result[test['pheno'].test_mask].cpu().tolist())
+                actual_test.append([item for sublist in test['pheno'].y[test['pheno'].test_mask].cpu().tolist() for item in sublist])
+        predicted_test = [item for sublist in predicted_test for item in sublist]
+        actual_test = [item for sublist in actual_test for item in sublist]
+
+        ## Calculate the metrics
+        mse = mean_squared_error(actual_test,predicted_test)
+        r = pearsonr(actual_test, predicted_test)[0]
+
+        ## Store prediction result for the validation data
+        predicted_valid = []
+        actual_valid = []
+        if VALID:
+            with torch.no_grad():
+                for valid in valid_loader:
+                    valid = valid.to(device)
+                    result = model(valid.x_dict, valid.edge_index_dict)
+                    predicted_valid.append(result[valid['pheno'].valid_mask].cpu().tolist())
+                    actual_valid.append([item for sublist in valid['pheno'].y[valid['pheno'].valid_mask].cpu().tolist() for item in sublist])
+            predicted_valid = [item for sublist in predicted_valid for item in sublist]
+            actual_valid = [item for sublist in actual_valid for item in sublist] 
+
+        ## Store prediction result for the train data
+        predicted_train = []
+        actual_train = []
+        with torch.no_grad():
+            result = model(data.x_dict, data.edge_index_dict)
+        predicted_train.append(result[data['pheno'].train_mask].cpu().tolist())
+        actual_train.append([item for sublist in data['pheno'].y[data['pheno'].train_mask].cpu().tolist() for item in sublist])
+        predicted_train = [k for i in predicted_train for k in i]
+        actual_train = [k for i in actual_train for k in i]
+
+        ## Extract marker effects
+        if marker_effect == True:
+            explainer = Explainer(
+                model = model,
+                algorithm=CaptumExplainer('IntegratedGradients'),
+                explanation_type='model',
+                node_mask_type='attributes',
+                edge_mask_type=None, # do not change here
+                model_config = dict(
+                    mode='regression',
+                    task_level='node',
+                    return_type='raw',
+                    )
+            )
+
+            hetero_explanation = explainer(
+                data.x_dict,
+                data.edge_index_dict,
+            )
+
+            effect = pd.DataFrame()
+            for ii in range(1,len(data.x_dict)):
+                effect = pd.concat([effect, pd.DataFrame(hetero_explanation['qtl_'+str(ii)]['node_mask'].squeeze().cpu().tolist())],axis=1)
+            effect = effect[mask_test==1]
+            if effect.shape[0] > samples:
+                effect = effect.sample(n=samples, random_state=1)
+            effect = pd.DataFrame(effect.sum()).T/effect.shape[0]
+            effect.columns = list(data_QTL.columns) 
+
+        else:
+            effect = pd.DataFrame()
         
     return r, mse, effect, predicted_test, predicted_valid, predicted_train
  

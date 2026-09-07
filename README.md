@@ -6,42 +6,76 @@ Circos plots are then constructed using the effect of each genomic marker region
 With a constructed circos plot, we can visually compare the inferred trait genetic architecture of genomic prediction models to deepen our understanding of their predictive behaviour at the genome level.
 The comparison of the inferred genomic marker effects with known key genome regions also enables the discovery of potential new genome regions that have not been well-investigated in previous studies.
 
+## Table of Contents
+
+- [What's new in this release](#whats-new-in-this-release)
+- [Description](#description)
+- [EasiGP setup procedure](#easigp-setup-procedure)
+  - [Full version or Light version - which do I need?](#full-version-or-light-version---which-do-i-need)
+  - [Ready-made image, or set up from source code - which method do I need?](#ready-made-image-or-set-up-from-source-code---which-method-do-i-need)
+  - [Option A: Using a ready-made image (recommended)](#option-a-using-a-ready-made-image-recommended)
+    - [Getting the image file](#getting-the-image-file)
+    - [Getting a Claude Code access token (Full version only)](#getting-a-claude-code-access-token-full-version-only)
+    - [For a local PC/laptop, using Docker](#for-a-local-pclaptop-using-docker)
+    - [For HPC, using Apptainer](#for-hpc-using-apptainer)
+      - [Bunya (UQ) or Gadi (NCI) users: an easier option using a virtual desktop](#bunya-uq-or-gadi-nci-users-an-easier-option-using-a-virtual-desktop)
+    - [Building the image files yourself](#building-the-image-files-yourself)
+  - [Option B: Setting up manually from source code](#option-b-setting-up-manually-from-source-code)
+    - [For laptop](#for-laptop)
+    - [For HPC](#for-hpc)
+- [References](#references)
+
+---
+
+## What's new in this release
+
+This release roughly doubles the codebase and adds, among other things: three new selectable prediction models (ExtraTrees, XGBoost, EBM) plus a fourth weighted-ensemble method (Analytic least-squares); marker-pair interactions from twelve models instead of Random Forest only, each now drawn as its own ring on the circos plot; two further, independently switchable widths of parallelism (task-level and model-level, on top of the existing array-job batches); optional gzip compression of large result files; a streaming, memory-bounded result-assembly path for large Parallel-mode runs; and two new Excel summary reports (`Metric_summary.xlsx`, `Diversity_prediction_theorem.xlsx`).
+
+See **[RELEASE_NOTES.md](RELEASE_NOTES.md)** for the full, detailed list of changes since the previously published version, including notes on upgrading and known limitations.
+
 ## Description
 EasiGP is a web-based application (no coding required to use it day-to-day) that runs and compares multiple genomic prediction models, then visualises what each model has learned as a circos plot. It also includes several optional add-ons for preparing your data and for building on top of your results.
 
-- **Models**: twelve individual genomic prediction models, plus an ensemble that combines them, are available to select and run from the GUI.
+- **Models**: fifteen individual genomic prediction models, plus an ensemble that combines them, are available to select and run from the GUI.
    - ridge regression best linear unbiased prediction (rrBLUP), genomic best linear unbiased prediction (GBLUP), BayesB and reproducing kernel Hilbert Space (RKHS): BGLR (Pérez and de Los Campos, 2014) in R
-   - Random forest (RF), support vector regression (SVR) and K-nearest neighbours (KNN): Scikit-learn (Pedregosa et al., 2012) in Python
+   - Random forest (RF), Extra Trees, support vector regression (SVR) and K-nearest neighbours (KNN): Scikit-learn (Pedregosa et al., 2012) in Python
+   - XGBoost and Explainable Boosting Machine (EBM): optional add-on models (need the `xgboost` / `interpret` packages respectively). If either package isn't installed, the GUI greys out that model with a note rather than failing silently, and a headless/HPC run stops with an actionable install message before any work starts.
    - Multilayer perceptron (MLP): PyTorch (Paszke et al., 2019) in Python
    - Four graph attention network (GAT) variants - GAT infinitesimal, GAT fully-connected, GAT prior-knowledge, and GAT biological prior-knowledge (which learns over genes rather than individual markers, using a curated or FLASH-P-generated gene-interaction network - see "Biological prior network" below) - all built with PyTorch Geometric (Fey et al., 2019) in Python
-   - **ensemble**: combines the predictions of every other selected model, optionally with a chosen weighting method rather than a plain average
-   - Any model's hyperparameters can either be set manually, or automatically tuned (a choice of search algorithms, e.g. grid, random, or Bayesian search) against a validation set
+   - **ensemble**: combines the predictions, marker effects, and marker-pair interactions of every other selected model, optionally with a chosen weighting method (four are available: Linear transformation, Nelder Mead, Bayesian optimisation, or the closed-form Analytic least-squares) rather than a plain average
+   - Any model's hyperparameters can either be set manually, or automatically tuned (a choice of search algorithms, e.g. grid, random, or Bayesian search, several of which can evaluate candidates in parallel) against a validation set
+
+- **Interpretability**: twelve of the models above can report which pairs of markers they treat as interacting (via TreeSHAP, the Friedman H-statistic, Neural Interaction Detection, EBM's own native pairwise terms, or - for the four BGLR models, disclosed as approximate - a surrogate TreeSHAP/H-statistic route), and four of the GAT variants report their learned attention weights over marker pairs. Each emitting model gets its own ring on the circos plot, so different models' inferred architectures can be compared side by side rather than collapsed into one.
 
 - **Data preprocessing** (optional, all configured from the GUI before running the models):
    - **LD pruning**: removes markers in high linkage disequilibrium, with an optional diagnostic LD-decay plot
    - **RF marker importance filtering**: narrows the marker set further, down to the top markers by Random Forest importance (by percentage or fixed count) - typically run after LD pruning
    - **Biological prior network**: builds the gene-level interaction network the GAT biological prior-knowledge model needs, either from a gene-interaction network file you already have, or generated automatically by [FLASH-P](https://flash-p.com/) (Mitsanis et al., 2026) (which needs access to Claude - see "Setup procedure" below); gene genomic coordinates can likewise be looked up automatically instead of hand-curated
-   - **PLINK support**: genotype data can be supplied either as a CSV file or as a PLINK1 binary fileset (`.bed`/`.bim`/`.fam`), converted automatically
+   - **PLINK support**: genotype data can be supplied either as a CSV file or as a PLINK1 binary fileset (`.bed`/`.bim`/`.fam`), converted automatically. When only the biological prior-knowledge model is selected on a PLINK fileset, EasiGP now avoids materialising the full genotype matrix at all, extracting only the markers each gene actually needs
 
-- **Circos plots** compare the inferred trait genetic architecture across models: each model's marker effects are shown as a ring, alongside marker-pair interactions and (optionally) known key gene regions for comparison. Most of a circos plot's own display settings (label size, tick spacing, seam gap, how much to widen a marker/gene region so it's visible, etc.) are suggested automatically based on your data, and can be overridden manually if needed.
+- **Circos plots** compare the inferred trait genetic architecture across models: each model's marker effects are shown as a ring, alongside a separate marker-pair interaction/attention ring per contributing model and (optionally) known key gene regions for comparison. Most of a circos plot's own display settings (label size, tick spacing, seam gap, how much to widen a marker/gene region so it's visible, etc.) are suggested automatically based on your data, and can be overridden manually if needed. One shared legend is produced per run, rather than one per plot.
 
 - **Two ways to run a pipeline**:
    - **Sequential**: runs every task (population × phenotype × model, etc.) one after another, either directly in the GUI or as a single submitted HPC job
-   - **Parallel**: splits the same work into a batch of independent HPC jobs that run at the same time, then assembles their results together afterwards - much faster for a large number of tasks on a cluster. If any individual task fails partway through (e.g. a bad hyperparameter combination), completed tasks are automatically saved as they finish and a resubmitted job picks up only the unfinished ones, rather than starting over.
+   - **Parallel**: splits the same work into a batch of independent HPC jobs that run at the same time, then assembles their results together afterwards - much faster for a large number of tasks on a cluster. Within that, two further and independently switchable levels of parallelism are available: fanning a batch's individual tasks across worker processes, and fanning a single task's models across worker processes - useful on a single large node even without a full HPC array. If any individual task fails partway through (e.g. a bad hyperparameter combination), completed tasks are automatically saved as they finish (optionally gzip-compressed) and a resubmitted job picks up only the unfinished ones, rather than starting over. A GUI panel suggests CPU/GPU/memory settings and an array layout for your job, based on your configuration - treat this as a starting point and pilot a small batch before committing a large allocation to it.
 
 - **Data**: example data files based on the TeoNAM dataset (Chen et al., 2019), MaizeNAM dataset (Buckler et al., 2009) and Arabidopsis dataset (the 1001 Genomes Consortium, 2016) to run this tool
   - Details are explained in "README.md" in the Data folder
 
-- **Result**: folder used as storage for output files from this tool
+- **Result**: folder used as storage for output files from this tool, including per-model prediction/effect/interaction/attention tables, circos plots (one legend per run, one interaction/attention ring per contributing model), an ensemble-weight bar chart, and two Excel summary reports (`Metric_summary.xlsx` for prediction accuracy, `Diversity_prediction_theorem.xlsx` for the Diversity Prediction Theorem breakdown of each ensemble) - both of which degrade to plain CSV files if `openpyxl` isn't installed
 
 - Key files, for anyone working with the code directly (this isn't needed to use the GUI):
    - `environment_windows.yml` / `environment_linux.yml`: the packages needed to build EasiGP's own environment on Windows / Linux
    - `main_app.py`: the GUI application itself (this is what `streamlit run` launches - see "Setup procedure" below)
-   - `genomic_prediction.py`: the genomic prediction models themselves
-   - `circos_plot.py`: circos plot generation
+   - `genomic_prediction.py`: the genomic prediction pipeline itself (scenario enumeration, data splitting/preprocessing orchestration, model dispatch, checkpointing)
+   - `Preprocess/`: the data preprocessing add-ons described above (LD pruning, RF marker filtering, biological prior network, PLINK conversion)
+   - `models/`: the prediction models, the naive/weighted ensembles, and the hyperparameter-tuning engine
+   - `model_registry.py` / `hparam_specs.py` / `circos_geometry.py`: single-source-of-truth reference modules - respectively, which models can emit interactions/attention and which need an optional package; every model's hyperparameter layout and tunable ranges; and circos ring/label geometry - each imported by several of the files above rather than re-implemented in each one
+   - `checkpoint_utils.py` / `assemble.py` / `batch_reader.py`: result-file durability (checkpointing, optional compression) and, for Parallel mode, merging per-batch results back together (streamed, so large runs don't need to fit in memory at once)
+   - `intra_batch_parallel.py` / `intra_task_parallel.py` / `resource_profiles.py`: the task-level and model-level parallelism described above, and the GUI's compute-resource/array-layout advisor
+   - `circos_plot.py` / `scatter_plot.py` / `metric_plot.py` / `weight_plot.py` / `attention_histogram.py`: the plots described above
+   - `metric_summary.py` / `diversity_summary.py`: the two Excel summary reports described above
    - `run_sequential.py` / `run_step1_batch.py` / `run_step2_assemble.py`: the headless scripts an HPC job actually runs, generated for you by the GUI's own "Generate and save job files" option - you shouldn't need to edit these by hand
-   - `Preprocess/`: the data preprocessing add-ons described above
-   - `models/`: the prediction models and the hyperparameter-tuning engine
 
 ## EasiGP setup procedure
 
@@ -206,6 +240,7 @@ If you're the one preparing/publishing these images (e.g. you have the EasiGP Do
    - If it doesn't open automatically, copy the local URL printed in the terminal (e.g. `http://localhost:8501`) into your browser.
 9. Complete the configuration in the GUI and run the pipeline.
 10. Before using LD pruning: this feature requires `plink2` to be installed and available on your PATH (or point the GUI at its executable path directly).
+11. If you want to select the XGBoost or EBM models, make sure the optional `xgboost` / `interpret` packages are installed in your environment - the provided yml files already pin these, but if you're managing your own environment by hand, add them separately. Neither is required for any other model.
 
 #### For HPC
 
@@ -232,7 +267,7 @@ If you're the one preparing/publishing these images (e.g. you have the EasiGP Do
    ```
    For example, on UQ's Bunya cluster: `ssh -N -L 8501:bun128:8501 USERNAME@bunya.rcc.uq.edu.au`
 10. Open the local URL in your browser (e.g. `http://localhost:8501`).
-11. Complete the configuration in the GUI, then use the "Generate and save job files" option to create the submission script and its config JSON file.
+11. Complete the configuration in the GUI, then use the "Generate and save job files" option to create the submission script and its config JSON file. On this screen the GUI also suggests CPU/GPU/memory and array-layout settings for your job based on your configuration - review these before submitting, especially for a first run on new data.
 12. Log in to the HPC using another terminal (separate from the tunnel in step 9, which must stay open only as long as you're using the GUI).
 13. Change directory to the main EasiGP folder: `cd YOUR PATH TO EasiGP/EasiGP`
 14. Submit the job file created in step 11 (e.g. `sbatch script name.sh` for Slurm).

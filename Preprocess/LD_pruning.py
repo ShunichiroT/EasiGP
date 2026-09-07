@@ -80,18 +80,49 @@ reordering creeping into your data.
 from __future__ import annotations
 
 import logging
+import os
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
 import pandas as pd
 
-from pipeline_utils import unify_columns_by_position
+from pipeline_utils import unify_columns_by_position, get_active_compute_resources
+from Preprocess import ld_kernels
 
 logger = logging.getLogger(__name__)
+
+
+def _resolve_plink_threads(plink_threads):
+    """Resolve the `--threads N` value every plink2 subprocess call below
+    should use - mirrors `Preprocess/plink_io.py::_resolve_plink_threads()`
+    exactly (kept as a local copy rather than imported, since the two
+    modules have no other dependency on each other and this keeps each
+    independently usable).
+
+    An explicit `plink_threads` argument always wins; otherwise falls back
+    to the run's shared compute-resource settings (`PLINK_THREADS` config
+    key via `get_active_compute_resources()`).
+
+    Without this, every plink2 invocation below left `--threads` unset
+    entirely, so plink2 fell back to its own hardware auto-detection -
+    which reads the number of processors VISIBLE to the machine, not the
+    number actually reserved for this job/cgroup. On a node where only a
+    handful of CPUs were reserved (e.g. a GPU job, which typically
+    requests far fewer CPUs than a CPU-only job of the same size), plink2
+    would still try to spawn threads sized to the whole node, causing
+    heavy oversubscription/context-switch thrashing instead of a
+    genuine speed-up - the root cause of LD pruning taking far longer on
+    a GPU allocation than on an equivalently-sized CPU-only one, even
+    though LD pruning itself never touches the GPU.
+    """
+    if plink_threads is not None:
+        return max(1, int(plink_threads))
+    return get_active_compute_resources()['plink_threads']
 
 
 class PlinkError(RuntimeError):
@@ -100,6 +131,194 @@ class PlinkError(RuntimeError):
 
 class LDPruneInputError(ValueError):
     """Raised when genotype_df / snp_info fail validation."""
+
+
+# --------------------------------------------------------------------------
+# PATCH_NOTES (performance fix): pre-flight cost guard for a 'kb'-window
+# --indep-pairwise call, run BEFORE plink2 is ever invoked.
+#
+# WHY THIS EXISTS: --indep-pairwise's own cost scales with how many OTHER
+# markers fall inside each marker's window, not with marker count alone -
+# a "kb" window over a dense, genome-wide marker set can silently imply an
+# enormous per-marker comparison count (a wide window over millions of
+# dense markers can mean hundreds of thousands of neighbours per window),
+# turning what looks like an ordinary LD-pruning config into a
+# multi-hour-to-multi-day plink2 call with NO warning beforehand - the
+# exact failure mode tracked down from a production run whose LD pruning
+# step alone ran for ~12 hours (window=10000kb over ~3.2M dense markers),
+# consuming the run's entire HPC walltime allocation before a single model
+# had finished tuning.
+#
+# This is a closed-form, DENSITY-based estimate (marker count / genomic
+# span, per chromosome) - it costs a fraction of a second (the .bim /
+# snp_info file is already being read for this call regardless) and needs
+# no plink2 subprocess of its own, unlike an actual calibration run. It is
+# deliberately NOT a runtime prediction (marker density varies a lot
+# locally - clustering, centromeres, structural variation - and this
+# codebase has no reliable, hardware/PLINK-version-independent throughput
+# constant to convert a comparison count into a wall-clock estimate without
+# risking a confidently wrong number) - it reports the "average markers
+# per window" figure itself, which is directly, monotonically responsible
+# for the cost, and lets the person judge against typical practice.
+# --------------------------------------------------------------------------
+
+# Typical published LD-pruning configs (array/GWAS-density data) keep the
+# realised "markers per window" figure in the tens to low hundreds - this
+# default trip-wire is set an order of magnitude above that, so it only
+# fires for configurations that are genuinely far outside normal practice
+# (informational only; raise/lower via the warn_avg_markers_per_window
+# parameter, or ld_config['warn_avg_markers_per_window']).
+DEFAULT_WARN_AVG_MARKERS_PER_WINDOW = 5000
+
+
+def estimate_kb_window_marker_load(chrom, pos, window):
+    """Closed-form, density-based estimate of how many OTHER markers fall,
+    on average, inside a `window`-kb --indep-pairwise window, from marker
+    positions alone - no plink2 subprocess involved.
+
+    Parameters
+    ----------
+    chrom : array-like
+        Per-marker chromosome labels (any hashable type - compared as str).
+    pos : array-like
+        Per-marker base-pair positions, same length/order as `chrom`.
+    window : float
+        The 'kb' window size (as passed to --indep-pairwise's own
+        <window>kb argument).
+
+    Returns
+    -------
+    dict, or None if there isn't enough position information to compute a
+    density (fewer than 2 positioned markers on any chromosome - e.g. an
+    all-NaN/placeholder map), with keys:
+        n_markers, n_chromosomes         : int
+        avg_markers_per_window           : float, marker-count-weighted
+                                            mean across chromosomes
+        max_markers_per_window           : float, the single densest
+                                            chromosome's own figure
+        est_total_comparisons            : float, n_markers *
+                                            avg_markers_per_window - an
+                                            ORDER-OF-MAGNITUDE indicator
+                                            of total pairwise work, not a
+                                            literal operation count.
+    Never raises - a caller with degenerate input (e.g. every position
+    identical or missing) just gets None back, same as "nothing to warn
+    about" from this function's point of view.
+    """
+    df = pd.DataFrame({
+        'chrom': pd.Series(chrom).astype(str).reset_index(drop=True),
+        'pos': pd.to_numeric(pd.Series(pos).reset_index(drop=True), errors='coerce'),
+    }).dropna(subset=['pos'])
+    if df.empty:
+        return None
+
+    window_bp = float(window) * 1000.0
+    per_chrom = df.groupby('chrom')['pos'].agg(n='count', lo='min', hi='max')
+    per_chrom = per_chrom[per_chrom['n'] >= 2]
+    if per_chrom.empty:
+        return None
+
+    span_bp = (per_chrom['hi'] - per_chrom['lo']).clip(lower=1.0)
+    density_per_bp = per_chrom['n'] / span_bp
+    markers_per_window = density_per_bp * window_bp
+
+    n_markers = int(df.shape[0])
+    weights = per_chrom['n'] / n_markers
+    avg_markers_per_window = float((markers_per_window * weights).sum())
+
+    return {
+        'n_markers': n_markers,
+        'n_chromosomes': int(per_chrom.shape[0]),
+        'avg_markers_per_window': avg_markers_per_window,
+        'max_markers_per_window': float(markers_per_window.max()),
+        'est_total_comparisons': avg_markers_per_window * n_markers,
+    }
+
+
+def check_kb_window_cost(chrom, pos, window, *, threads=1,
+                          max_avg_markers_per_window=None,
+                          warn_avg_markers_per_window=DEFAULT_WARN_AVG_MARKERS_PER_WINDOW,
+                          context=''):
+    """Print a loud, actionable diagnostic (see this module's own "Diagnostics
+    as a design principle" convention elsewhere in this codebase) - and,
+    if `max_avg_markers_per_window` is set and exceeded, raise BEFORE
+    plink2 is ever invoked - when a 'kb'-window --indep-pairwise call is
+    about to run against a marker density that makes it likely to be
+    extremely slow. See `estimate_kb_window_marker_load()`'s own docstring
+    for exactly what is estimated and why no wall-clock time is quoted.
+
+    A no-op (returns immediately) whenever the load can't be estimated
+    (see `estimate_kb_window_marker_load`) - this is a best-effort safety
+    net, not a required precondition.
+
+    Parameters
+    ----------
+    chrom, pos : see estimate_kb_window_marker_load.
+    window : float, the 'kb' window size in effect.
+    threads : int, purely for the printed message (how many plink2
+        --threads are already in play - multi-threading helps, but does
+        not change the fundamental per-marker workload being reported).
+    max_avg_markers_per_window : float, optional
+        HARD cap (opt-in, default None = no cap, i.e. no behaviour change
+        for any existing config). When set and the estimated average
+        exceeds it, raises `LDPruneInputError`/`PlinkFilesetError`-style
+        (a plain ValueError here - callers with their own exception type,
+        e.g. Preprocess/plink_io.py, catch and re-raise as their own)
+        BEFORE starting plink2, so a misconfigured HPC job fails in
+        seconds rather than after exhausting a walltime allocation.
+    warn_avg_markers_per_window : float
+        Trip-wire for the (non-fatal) warning printout - see
+        DEFAULT_WARN_AVG_MARKERS_PER_WINDOW's own docstring comment.
+    context : str, optional
+        Short caller-identifying string (e.g. " [GAT_biological_prior_knowledge
+        data-driven merge]") inserted into the printed/raised message, so
+        multiple LD-pruning call sites in one run (the 'other models' pool
+        vs. a bio-prior instance's own data-driven-merge pool, say) are
+        distinguishable in the log.
+
+    Returns
+    -------
+    dict or None
+        Whatever `estimate_kb_window_marker_load()` returned (so a caller
+        can log/reuse it further), or None if it couldn't be computed.
+    """
+    load = estimate_kb_window_marker_load(chrom, pos, window)
+    if load is None:
+        return None
+
+    avg = load['avg_markers_per_window']
+    if max_avg_markers_per_window is not None and avg > max_avg_markers_per_window:
+        raise ValueError(
+            f"[LD-prune cost guard]{context} refusing to start --indep-pairwise: a {window}kb "
+            f"window against this marker density implies an estimated average of "
+            f"~{avg:,.0f} OTHER markers inside every marker's window (out of {load['n_markers']:,} "
+            f"markers total across {load['n_chromosomes']} chromosome(s), densest chromosome "
+            f"~{load['max_markers_per_window']:,.0f} markers/window) - on the order of "
+            f"{load['est_total_comparisons']:.2e} pairwise comparisons overall. This exceeds the "
+            f"configured safety cap of {max_avg_markers_per_window:,.0f} average markers/window "
+            f"(ld_config['max_avg_markers_per_window']). Typical LD-pruning windows keep this figure "
+            f"in the tens to low hundreds. Likely fixes: reduce 'window' (e.g. to a few hundred kb "
+            f"or less), switch window_unit to 'variants' (which bounds the per-window cost directly, "
+            f"regardless of physical marker density), or raise/remove max_avg_markers_per_window if "
+            f"this cost is genuinely intended."
+        )
+
+    if avg > warn_avg_markers_per_window:
+        print(
+            f"[LD_pruning] LD-PRUNE COST WARNING{context}: a {window}kb window against this marker "
+            f"density implies an estimated average of ~{avg:,.0f} OTHER markers inside every "
+            f"marker's window (out of {load['n_markers']:,} markers total across "
+            f"{load['n_chromosomes']} chromosome(s), densest chromosome ~{load['max_markers_per_window']:,.0f} "
+            f"markers/window) - on the order of {load['est_total_comparisons']:.2e} pairwise "
+            f"comparisons overall. This is far outside typical LD-pruning practice (usually tens to "
+            f"low hundreds of markers per window) and can take many hours to complete even "
+            f"multi-threaded ('--threads {threads}' is already applied here). If this is not "
+            f"intended: reduce 'window', or switch window_unit to 'variants' (bounds the per-window "
+            f"cost directly, regardless of physical marker density). To turn this into a hard, "
+            f"fail-fast error next time instead of burning compute, set "
+            f"ld_config['max_avg_markers_per_window'] (e.g. 5000-20000)."
+        )
+    return load
 
 
 # --------------------------------------------------------------------------
@@ -279,17 +498,37 @@ def _write_ped_map(
 
     fid = (genotype_df.index.to_numpy() + 1).astype(str)
     iid = fid
-    pat = np.zeros(n_samples, dtype=object)
-    mat = np.zeros(n_samples, dtype=object)
-    sex = np.full(n_samples, -9)
-    pheno = np.full(n_samples, -9)
-    
+    # PERFORMANCE FIX: these four "family-file" columns are always the
+    # same constant values (0/0/-9/-9) for every sample and every call --
+    # write them as the literal PED-format STRINGS directly, rather than
+    # as bare Python ints (0, -9) that then had to be converted to text
+    # later. Doing that conversion here, once, for four narrow columns is
+    # nothing; doing it below, per SAMPLE ROW, for the *entire* row width
+    # (6 + 2*n_snps columns) was pure repeated work -- see the write loop
+    # below for why that mattered.
+    pat = np.full(n_samples, "0", dtype=object)
+    mat = np.full(n_samples, "0", dtype=object)
+    sex = np.full(n_samples, "-9", dtype=object)
+    pheno = np.full(n_samples, "-9", dtype=object)
+
     ped_left = np.column_stack([fid, iid, pat, mat, sex, pheno]).astype(object)
     ped_full = np.hstack([ped_left, geno_block])
 
+    # PERFORMANCE FIX: every element of ped_full is now already a genuine
+    # Python `str` (allele1/allele2/pat/mat/sex/pheno were all built as
+    # strings above; fid/iid via .astype(str)/.astype(object)) -- so the
+    # per-row `row.astype(str)` this loop used to do before joining was
+    # pure wasted work: a full elementwise dtype conversion, repeated for
+    # EVERY sample, over the entire (6 + 2*n_snps)-wide row, that would
+    # have been a no-op even if it had been skipped entirely. Building the
+    # whole text blob once and writing it in a single call (instead of one
+    # `fh.write()` per sample) also cuts the per-row Python/IO overhead
+    # that dominates when n_samples is large. The on-disk content is
+    # byte-for-byte identical to the previous implementation.
     with open(f"{out_prefix}.ped", "w") as fh:
-        for row in ped_full:
-            fh.write(" ".join(row.astype(str)) + "\n")
+        fh.write("\n".join(" ".join(row) for row in ped_full))
+        if n_samples:
+            fh.write("\n")
 
     logger.info("Wrote %s.ped (%d samples x %d SNPs) and %s.map", out_prefix, n_samples, n_snps, out_prefix)
 
@@ -298,15 +537,49 @@ def _write_ped_map(
 # PLINK2 subprocess wrapper
 # --------------------------------------------------------------------------
 
-def _run_plink(cmd: list, log_prefix: Path) -> subprocess.CompletedProcess:
+def _run_plink(cmd: list, log_prefix: Path, heartbeat_seconds: Optional[float] = None,
+               heartbeat_label: Optional[str] = None) -> subprocess.CompletedProcess:
+    """PATCH_NOTES (visibility fix): `heartbeat_seconds`/`heartbeat_label`
+    mirror `Preprocess/plink_io.py::_run_plink()`'s own parameters of the
+    same name (kept as a local copy rather than imported - see
+    `_resolve_plink_threads()`'s own docstring note on why these two
+    modules duplicate small helpers rather than depend on each other) -
+    print a "still running" line every `heartbeat_seconds` while a
+    potentially long, silent `--indep-pairwise` call is in flight, so it
+    reads as "slow but alive" rather than "hung" (see that other
+    `_run_plink()`'s own docstring for the full rationale)."""
     logger.info("Running: %s", " ".join(cmd))
-    try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-    except FileNotFoundError as e:
-        raise PlinkError(
-            f"Could not find/execute {cmd[0]!r}. Make sure plink2 is installed and on "
-            f"PATH, or pass plink_path='/full/path/to/plink2'. ({e})"
-        ) from e
+    if heartbeat_seconds is None:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+        except FileNotFoundError as e:
+            raise PlinkError(
+                f"Could not find/execute {cmd[0]!r}. Make sure plink2 is installed and on "
+                f"PATH, or pass plink_path='/full/path/to/plink2'. ({e})"
+            ) from e
+    else:
+        label = heartbeat_label or os.path.basename(str(cmd[0]))
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        except FileNotFoundError as e:
+            raise PlinkError(
+                f"Could not find/execute {cmd[0]!r}. Make sure plink2 is installed and on "
+                f"PATH, or pass plink_path='/full/path/to/plink2'. ({e})"
+            ) from e
+        start = time.time()
+        while True:
+            try:
+                stdout, stderr = proc.communicate(timeout=heartbeat_seconds)
+                break
+            except subprocess.TimeoutExpired:
+                elapsed_min = (time.time() - start) / 60.0
+                print(
+                    f"[LD_pruning] ... still running {label} (elapsed {elapsed_min:.1f} min, PID "
+                    f"{proc.pid}) - this can be expected for a large window/dense marker set (see "
+                    f"any 'LD-PRUNE COST WARNING' printed above); no action needed unless this "
+                    f"keeps growing far beyond what that warning implied."
+                )
+        result = subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
     with open(f"{log_prefix}.pylog", "w") as fh:
         fh.write("CMD: " + " ".join(cmd) + "\n\nSTDOUT:\n" + result.stdout + "\n\nSTDERR:\n" + result.stderr)
     if result.returncode != 0:
@@ -324,15 +597,17 @@ def _run_plink(cmd: list, log_prefix: Path) -> subprocess.CompletedProcess:
 # --------------------------------------------------------------------------
 
 def _pairwise_r2(x: np.ndarray, y: np.ndarray) -> float:
-    """r^2 between two genotype vectors, ignoring samples missing in either."""
-    mask = ~(np.isnan(x) | np.isnan(y))
-    if mask.sum() < 3:
-        return 0.0
-    xm, ym = x[mask], y[mask]
-    if xm.std() == 0 or ym.std() == 0:
-        return 0.0
-    r = np.corrcoef(xm, ym)[0, 1]
-    return 0.0 if np.isnan(r) else r * r
+    """r^2 between two genotype vectors, ignoring samples missing in either.
+
+    ver4-4 R4.g: delegates to the shared ``ld_kernels.pairwise_r2()`` core
+    (promoted out of this file, and out of
+    ``Preprocess/LD_decay_plot.py``'s own byte-for-byte duplicate of it) -
+    ``degenerate=0.0`` preserves THIS module's own existing sentinel for a
+    degenerate pair exactly (``LD_decay_plot.py``'s own thin wrapper uses
+    ``degenerate=float('nan')`` instead - the two modules' conventions are
+    deliberately NOT unified; see ``ld_kernels.pairwise_r2()``'s own
+    docstring)."""
+    return ld_kernels.pairwise_r2(x, y, degenerate=0.0)
 
 
 def _cm_prune(
@@ -340,6 +615,8 @@ def _cm_prune(
     snp_info: pd.DataFrame,
     window_cm: float,
     r2_threshold: float,
+    n_jobs: Optional[int] = None,
+    device: Optional[str] = None,
 ) -> list:
     """
     Greedy left-to-right pruning within a sliding cM window, per chromosome.
@@ -354,34 +631,152 @@ def _cm_prune(
     --indep-pairwise (greedy, left-to-right, single retained "anchor" wins
     each comparison) but is not bit-identical to PLINK's internal
     implementation.
+
+    ver4-4 R3.e (blueprint §2.3.2, invariant I7 - the closest invariant in
+    this whole update): UNCHANGED semantics from the description above.
+    Two internal changes only:
+
+      1. Per chromosome, WHEN that chromosome's genotype block has no
+         missing (``NaN``) calls at all, the within-window r^2 values are
+         precomputed ONCE as a banded matrix
+         (``ld_kernels.pairwise_r2_matrix(block, pairwise_complete=True)``
+         - the SAME shared kernel R4.g introduces for GPU LD r^2), and the
+         greedy left-to-right decision loop below simply looks values up
+         in it instead of calling ``_pairwise_r2()`` per pair. This is a
+         byte-for-byte-equivalent (verified to float-rounding tolerance,
+         not merely reasoned about - see the ver4-4 Stage 5 design
+         record's own test evidence) substitution: the DECISION SEQUENCE
+         itself - which SNP is compared against which, in which order,
+         and which threshold each comparison is checked against - is
+         completely unchanged; only WHERE each r^2 value comes from
+         changes (a precomputed matrix lookup instead of a fresh
+         ``np.corrcoef`` call).
+      2. WHEN a chromosome's genotype block contains ANY missing call,
+         this falls back to the ORIGINAL, exact per-pair ``_pairwise_r2``
+         path for that one chromosome (option (ii) from the blueprint's
+         own R3.e chosen-approach text: "fall back to today's per-pair
+         path whenever the chromosome block contains any NaN... the
+         recommended first implementation") - a banded PRECOMPUTED matrix
+         would otherwise require reproducing ``_pairwise_r2``'s own
+         pairwise-DELETION missing-data handling per pair, which
+         ``ld_kernels.pairwise_r2_matrix(..., pairwise_complete=True)``
+         DOES support (see that function's own docstring) but at the cost
+         of 4 full (n_markers x n_markers) matrix products per
+         chromosome regardless of how sparse the actual within-window
+         comparisons are - for a real, mostly-complete genotype matrix
+         (the overwhelmingly common case) the no-NaN fast path above
+         already captures the real win; this fallback keeps the NaN case
+         simple and unambiguously correct rather than chasing a marginal
+         extra speed-up on already-imperfect data.
+      3. The ``for chrom, grp in snp_info.groupby("CHR")`` loop fans out
+         across ``n_jobs`` PROCESSES (``joblib.Parallel``, the SAME
+         backend/fallback-on-any-exception convention as
+         ``pipeline_utils.parallel_shap_values`` - falls back to serial
+         execution rather than raising) when ``n_jobs > 1`` and there is
+         more than one chromosome group to fan out across. ``keep_ids``
+         is then concatenated in the SAME chromosome order
+         ``snp_info.groupby("CHR")`` itself produces (each chromosome's
+         own worker call - serial or parallel - returns its OWN keep list
+         in ORIGINAL within-chromosome order; ``joblib.Parallel`` always
+         returns results in call-submission order, never completion
+         order, so parallel fan-out cannot reorder the outer,
+         cross-chromosome sequence either) - the returned list is
+         therefore order-identical to ``n_jobs=1`` for any ``n_jobs``.
+
+    Parallelising *within* a chromosome is explicitly forbidden - the
+    greedy anchor order is load-bearing and a different order yields a
+    different surviving marker set, silently changing every downstream
+    result (I7). Every worker below processes one WHOLE chromosome
+    independently, start to finish, with no shared mutable state.
+
+    ``device`` (ver4-4 R4.g, added during the Stage 5 completion pass):
+    forwarded to the no-NaN fast path's own
+    ``ld_kernels.pairwise_r2_matrix(..., device=...)`` call - ``None``
+    (default) resolves from the run's shared compute-resource settings,
+    gated on ``GPU_LD_R2`` exactly like ``LD_decay_plot.compute_ld_decay_data``
+    gates it (``'cpu'`` when ``GPU_LD_R2`` is off, even on a CUDA-visible
+    node) - see that function's own comment for why the gate has to live
+    at the point ``device`` is resolved, not deeper in the call chain.
+    Never changes the RESULT (the banded matrix is verified
+    device-invariant to floating-point-rounding tolerance - see
+    ``ld_kernels.pairwise_r2_matrix``'s own docstring and the R4.g
+    acceptance criterion "`_cm_prune` returns an identical keep-list with
+    `GPU_LD_R2` on and off"), only which hardware computes it.
     """
-    keep_ids: list = []
     geno_all = genotype_df.to_numpy(dtype=float)
     col_index = {snp_id: i for i, snp_id in enumerate(genotype_df.columns)}
+    groups = list(snp_info.groupby("CHR"))
 
-    for chrom, grp in snp_info.groupby("CHR"):
+    def _process_one_chromosome(chrom, grp):
         grp_sorted = grp.sort_values("CM")
         ids = grp_sorted.index.to_numpy()
         cms = grp_sorted["CM"].to_numpy()
         n = len(ids)
         keep_mask = np.ones(n, dtype=bool)
 
+        col_positions = np.array([col_index[snp_id] for snp_id in ids])
+        block = geno_all[:, col_positions]  # this chromosome only, already in cM order
+        block_has_nan = bool(np.isnan(block).any())
+        if block_has_nan:
+            r2_matrix = None
+        else:
+            r2_matrix = ld_kernels.pairwise_r2_matrix(block, device=_resolved_device, pairwise_complete=True)
+
         for i in range(n):
             if not keep_mask[i]:
                 continue
-            gi = geno_all[:, col_index[ids[i]]]
+            gi = None if r2_matrix is not None else geno_all[:, col_index[ids[i]]]
             j = i + 1
             while j < n and (cms[j] - cms[i]) <= window_cm:
                 if keep_mask[j]:
-                    gj = geno_all[:, col_index[ids[j]]]
-                    if _pairwise_r2(gi, gj) > r2_threshold:
+                    if r2_matrix is not None:
+                        r2 = r2_matrix[i, j]
+                    else:
+                        gj = geno_all[:, col_index[ids[j]]]
+                        r2 = _pairwise_r2(gi, gj)
+                    if r2 > r2_threshold:
                         keep_mask[j] = False
                 j += 1
 
         n_dropped = int((~keep_mask).sum())
         logger.info("cM-prune chr %s: kept %d / %d SNPs (dropped %d)", chrom, keep_mask.sum(), n, n_dropped)
-        keep_ids.extend(ids[keep_mask].tolist())
+        if block_has_nan:
+            print(f"[LD_pruning] NOTE: cM-prune chr {chrom}: missing genotype call(s) found "
+                  f"among this chromosome's {n} marker(s) - used the exact per-pair pruning "
+                  f"path for this chromosome (the banded precompute requires a complete block, "
+                  f"per invariant I7 - see _cm_prune's own docstring).")
+        return chrom, ids[keep_mask].tolist()
 
+    _active_resources = get_active_compute_resources()
+    _n_jobs = n_jobs if n_jobs is not None else _active_resources['n_jobs']
+    # ver4-4 R4.g completion fix: resolved ONCE here (outside
+    # _process_one_chromosome, mirroring _n_jobs immediately above) so
+    # every chromosome - serial or process-fanned-out - uses the SAME
+    # device string; gated on GPU_LD_R2 exactly like
+    # LD_decay_plot.compute_ld_decay_data (see that function's own
+    # comment for why the gate belongs at THIS resolution point, not
+    # deeper in the call chain, or GPU_LD_R2=false would never actually
+    # disable the CUDA path on a CUDA-visible node).
+    _resolved_device = device if device is not None else (
+        _active_resources['device'] if _active_resources.get('gpu_ld_r2', True) else 'cpu'
+    )
+    if _n_jobs and _n_jobs != 1 and len(groups) > 1:
+        try:
+            from joblib import Parallel, delayed
+            results = Parallel(n_jobs=_n_jobs)(
+                delayed(_process_one_chromosome)(chrom, grp) for chrom, grp in groups
+            )
+        except Exception as exc:
+            print(f"[LD_pruning] NOTE: parallel cM-prune fan-out across chromosomes failed "
+                  f"({exc}) - falling back to serial execution (per-chromosome results are "
+                  f"unaffected, only wall-clock time).")
+            results = [_process_one_chromosome(chrom, grp) for chrom, grp in groups]
+    else:
+        results = [_process_one_chromosome(chrom, grp) for chrom, grp in groups]
+
+    keep_ids: list = []
+    for _chrom, ids_kept in results:
+        keep_ids.extend(ids_kept)
     return keep_ids
 
 
@@ -504,15 +899,71 @@ def _prune_partition(
     workdir: Path,
     label: str,
     round_dosage: bool,
+    n_jobs: Optional[int] = None,
+    device: Optional[str] = None,
+    materialize_pruned_bed: bool = True,
+    max_avg_markers_per_window: Optional[float] = None,
+    warn_avg_markers_per_window: Optional[float] = None,
 ) -> list:
     """Run one LD-pruning pass (PLINK2 kb/variants, or the Python cm
     fallback) over a single partition of SNPs. Returns the list of SNP IDs
-    that survived."""
+    that survived.
+
+    ``n_jobs``/``device`` (ver4-4 R3.e/R4.g) are forwarded to
+    ``_cm_prune()`` only - the PLINK2 kb/variants path below is already
+    externally multi-threaded via ``common_flags``' own ``--threads``
+    (see ``_resolve_plink_threads()``), which is a different
+    (PLINK-internal, CPU-only) parallelism mechanism entirely - it has no
+    GPU path for ``device`` to select.
+
+    PERFORMANCE FIX: ``materialize_pruned_bed`` gates the third plink2
+    subprocess call below (``--extract <prune.in> --make-bed``), which
+    re-reads the whole (pre-pruning) bed/bim/fam fileset just written and
+    writes out a SECOND, pruned copy of it. That pruned fileset is pure
+    provenance -- ``ld_prune_snps`` builds its own returned DataFrame
+    directly from ``prune_in_file`` via a plain pandas column selection
+    (see this module's docstring), never from these files. Whenever the
+    caller (``ld_prune_snps``) is about to delete the whole working
+    directory anyway (``work_dir`` not given and ``keep_intermediate`` is
+    False -- the common case, and this project's own default), running
+    this extra plink2 call only to immediately throw its output away was
+    pure wasted wall-clock time: one whole additional read-modify-write
+    pass over the genotype fileset, on every single LD-pruning call, for
+    a file nothing ever reads. ``ld_prune_snps`` now only asks for it when
+    the intermediate files are actually going to survive the call (an
+    explicit ``work_dir``, or ``keep_intermediate=True``) -- i.e. exactly
+    when a person could plausibly want the pruned bed fileset on disk
+    afterwards."""
     if genotype_df.shape[1] == 0:
         return []
 
     if window_unit == "cm":
-        return _cm_prune(genotype_df, snp_info, window_cm=window, r2_threshold=r2_threshold)
+        return _cm_prune(genotype_df, snp_info, window_cm=window, r2_threshold=r2_threshold,
+                          n_jobs=n_jobs, device=device)
+
+    # PLINK2's PED/MAP -> BED conversion (--make-bed, below) requires every
+    # variant belonging to the same chromosome to be CONTIGUOUS in the file
+    # -- it errors out ("has a split chromosome") the moment a chromosome
+    # code reappears after a different one was seen in between. snp_info's
+    # row order at this point is whatever genotype_df's column order was
+    # (see _validate_inputs's "reindex to genotype_df's column order"
+    # comment) -- i.e. the order columns happened to arrive in from the
+    # genotype file / upstream marker-pool routing, which is NOT guaranteed
+    # to be chromosome-contiguous (e.g. PLINK --extract, gene-window
+    # restriction, or RF/SHAP-importance ranking all reorder markers).
+    #
+    # For a real (mapped) partition this reordering is free: kb-window
+    # pruning is defined by actual CHR/POS values, not by row order, so
+    # sorting here changes nothing about which markers get compared -- it
+    # only satisfies PLINK2's file-format requirement. We do NOT do this for
+    # window_unit="variants", where the variant-count window is explicitly
+    # defined BY column order (see ld_prune_snps's docstring) -- reordering
+    # there would silently change which markers get windowed together.
+    if window_unit != "variants":
+        sort_cols = ["CHR", "POS"] if "POS" in snp_info.columns else ["CHR"]
+        sort_order = snp_info[sort_cols].reset_index().sort_values(sort_cols, kind="mergesort").index
+        snp_info = snp_info.iloc[sort_order]
+        genotype_df = genotype_df.iloc[:, sort_order]
 
     raw_prefix = workdir / f"{label}_raw"
     _write_ped_map(genotype_df, snp_info, raw_prefix, round_dosage=round_dosage)
@@ -525,6 +976,26 @@ def _prune_partition(
 
     prune_prefix = workdir / f"{label}_out"
     window_arg = f"{window}kb" if window_unit == "kb" else str(int(window))
+
+    # PATCH_NOTES (performance fix): pre-flight cost estimate/guard, BEFORE
+    # the (potentially very slow) --indep-pairwise call below ever starts -
+    # see check_kb_window_cost()'s own docstring. Only meaningful for 'kb'
+    # windows; 'variants' windows are already bounded by construction.
+    if window_unit == "kb":
+        try:
+            check_kb_window_cost(
+                snp_info["CHR"], snp_info["POS"], window,
+                threads=(common_flags[common_flags.index("--threads") + 1] if "--threads" in common_flags else 1),
+                max_avg_markers_per_window=max_avg_markers_per_window,
+                warn_avg_markers_per_window=(
+                    warn_avg_markers_per_window if warn_avg_markers_per_window is not None
+                    else DEFAULT_WARN_AVG_MARKERS_PER_WINDOW
+                ),
+                context=f" [{label} partition, --indep-pairwise on '{bed_prefix}']",
+            )
+        except ValueError as exc:
+            raise PlinkError(str(exc)) from exc
+
     _run_plink(
         [
             plink_path, "--bfile", str(bed_prefix), *common_flags,
@@ -532,6 +1003,8 @@ def _prune_partition(
             "--out", str(prune_prefix),
         ],
         prune_prefix,
+        heartbeat_seconds=300,
+        heartbeat_label=f"--indep-pairwise {window_arg} {step} {r2_threshold} ({label} partition)",
     )
     prune_in_file = Path(f"{prune_prefix}.prune.in")
     with open(prune_in_file) as fh:
@@ -539,15 +1012,19 @@ def _prune_partition(
 
     # Optional: also materialize the pruned BED fileset, purely for
     # provenance / downstream PLINK use -- not needed for the DataFrame
-    # ld_prune_snps returns.
-    pruned_prefix = workdir / f"{label}_pruned"
-    _run_plink(
-        [
-            plink_path, "--bfile", str(bed_prefix), *common_flags,
-            "--extract", str(prune_in_file), "--make-bed", "--out", str(pruned_prefix),
-        ],
-        pruned_prefix,
-    )
+    # ld_prune_snps returns. Skipped whenever the caller isn't keeping the
+    # working directory around to look at it (see materialize_pruned_bed's
+    # own docstring entry above) -- this is the expensive, entirely
+    # optional half of this function's plink2 work.
+    if materialize_pruned_bed:
+        pruned_prefix = workdir / f"{label}_pruned"
+        _run_plink(
+            [
+                plink_path, "--bfile", str(bed_prefix), *common_flags,
+                "--extract", str(prune_in_file), "--make-bed", "--out", str(pruned_prefix),
+            ],
+            pruned_prefix,
+        )
     return keep_ids
 
 
@@ -585,6 +1062,11 @@ def ld_prune_snps(
     unmapped_window: int = 50,
     unmapped_step: int = 5,
     maf_threshold: float = 0.0,
+    plink_threads: Optional[int] = None,
+    n_jobs: Optional[int] = None,
+    device: Optional[str] = None,
+    max_avg_markers_per_window: Optional[float] = None,
+    warn_avg_markers_per_window: Optional[float] = None,
 ) -> pd.DataFrame:
     """
     LD-prune a 0/1/2(.x) genotype matrix and return it restricted to the
@@ -671,6 +1153,44 @@ def ld_prune_snps(
                   NumPy/pandas computation with no PLINK dependency, so it
                   applies identically regardless of window_unit and even
                   when plink2 itself isn't available.
+    plink_threads : forwarded as every plink2 subprocess call's own
+                  `--threads` flag. `None` (default) falls back to the
+                  run's shared compute-resource settings (`PLINK_THREADS`
+                  config key, via `get_active_compute_resources()`) -
+                  see `_resolve_plink_threads()`'s own docstring for why
+                  this matters (GPU allocations typically reserve far
+                  fewer CPUs than a CPU-only run, and plink2's own
+                  hardware auto-detection is not cgroup-aware).
+    n_jobs      : ver4-4 R3.e - process fan-out width for the ``cm``
+                  window-unit path's own per-chromosome pruning
+                  (``_cm_prune()``); has NO effect on ``"kb"``/
+                  ``"variants"`` (PLINK2-driven) pruning, which is
+                  parallelised separately via `plink_threads` above.
+                  `None` (default) falls back to the run's shared
+                  compute-resource settings (`N_JOBS`, via
+                  `get_active_compute_resources()`); `1` forces today's
+                  exact serial per-chromosome loop.
+    device      : ver4-4 R4.g - forwarded to `_cm_prune()`'s own
+                  `device` (its no-NaN fast path's
+                  `ld_kernels.pairwise_r2_matrix()` call). Has NO effect
+                  on `"kb"`/`"variants"` (PLINK2-driven) pruning, which
+                  has no GPU path. `None` (default) falls back to the
+                  run's shared compute-resource settings, gated on
+                  `GPU_LD_R2` (see `_cm_prune()`'s own docstring for why
+                  the gate lives at the resolution point).
+    max_avg_markers_per_window : float, optional
+                  PATCH_NOTES (performance fix): HARD cap (opt-in, default
+                  None = no cap, no behaviour change for any existing
+                  caller) on the estimated average number of OTHER markers
+                  falling inside each 'kb'-window --indep-pairwise window -
+                  see `check_kb_window_cost()`'s own docstring. When set
+                  and exceeded, this call raises immediately, BEFORE
+                  plink2 ever runs, instead of silently taking a very long
+                  time. Has no effect for `window_unit != "kb"`.
+    warn_avg_markers_per_window : float, optional
+                  Trip-wire for the (non-fatal) cost warning printed for
+                  'kb' windows - defaults to `DEFAULT_WARN_AVG_MARKERS_PER_WINDOW`
+                  when not given.
 
     Returns
     -------
@@ -739,18 +1259,34 @@ def ld_prune_snps(
     workdir.mkdir(parents=True, exist_ok=True)
     logger.info("Working directory: %s", workdir)
 
+    threads = _resolve_plink_threads(plink_threads)
+
     common_flags = []
     if allow_extra_chr:
         common_flags.append("--allow-extra-chr")
     if chr_set is not None:
         common_flags += ["--chr-set", str(chr_set)]
+    common_flags += ["--threads", str(threads)]
+
+    # PERFORMANCE FIX: only ask _prune_partition() to materialize the
+    # (entirely optional, provenance-only) pruned BED fileset when this
+    # workdir is actually going to survive past this call -- see
+    # _prune_partition()'s own materialize_pruned_bed docstring entry for
+    # the full rationale. `cleanup` (computed just above) already encodes
+    # exactly that: True means work_dir was None and keep_intermediate was
+    # False, i.e. the finally-block below is about to shutil.rmtree()
+    # this entire directory regardless.
+    _materialize_pruned_bed = not cleanup
 
     try:
         if window_unit == "variants":
             # Variant-count windows never need real coordinates -- no split.
             keep_ids = _prune_partition(
                 genotype_df, snp_info, window, window_unit, step, r2_threshold,
-                plink_path, common_flags, workdir, "all", round_dosage,
+                plink_path, common_flags, workdir, "all", round_dosage, n_jobs=n_jobs, device=device,
+                materialize_pruned_bed=_materialize_pruned_bed,
+                max_avg_markers_per_window=max_avg_markers_per_window,
+                warn_avg_markers_per_window=warn_avg_markers_per_window,
             )
         else:
             required = ["CHR", "POS"] + (["CM"] if window_unit == "cm" else [])
@@ -768,6 +1304,9 @@ def ld_prune_snps(
                 keep_ids += _prune_partition(
                     genotype_df[mapped_ids], snp_info.loc[mapped_ids], window, window_unit,
                     step, r2_threshold, plink_path, common_flags, workdir, "mapped", round_dosage,
+                    n_jobs=n_jobs, device=device, materialize_pruned_bed=_materialize_pruned_bed,
+                    max_avg_markers_per_window=max_avg_markers_per_window,
+                    warn_avg_markers_per_window=warn_avg_markers_per_window,
                 )
 
             if len(unmapped_ids):
@@ -783,6 +1322,7 @@ def ld_prune_snps(
                     keep_ids += _prune_partition(
                         genotype_df[unmapped_ids], unmapped_snp_info, unmapped_window, "variants",
                         unmapped_step, r2_threshold, plink_path, common_flags, workdir, "unmapped", round_dosage,
+                        n_jobs=n_jobs, device=device, materialize_pruned_bed=_materialize_pruned_bed,
                     )
 
         n_before, n_after = genotype_df.shape[1], len(keep_ids)
@@ -833,6 +1373,29 @@ def LD_pruning(train, valid, test, ld_config):
     # config with no 'maf_threshold' key behaves exactly as before this
     # option existed.
     maf_threshold = ld_config.get('maf_threshold', 0.0)
+    # Optional explicit override (mirrors Preprocess/plink_io.py's own
+    # 'plink_threads' parameter pattern) - falls back to the run's shared
+    # compute-resource settings when absent (see
+    # _resolve_plink_threads()'s docstring above for why this matters).
+    plink_threads = ld_config.get('plink_threads')
+    # ver4-4 R3.e: explicit override for the 'cm' window-unit path's own
+    # per-chromosome process fan-out (_cm_prune) - falls back to the run's
+    # shared N_JOBS setting when absent, exactly like plink_threads above.
+    # Has no effect on 'kb'/'variants' pruning (PLINK-internal threading,
+    # via plink_threads instead).
+    n_jobs = ld_config.get('n_jobs')
+    # ver4-4 R4.g: explicit override for the same 'cm' window-unit path's
+    # no-NaN fast path device (_cm_prune -> ld_kernels.pairwise_r2_matrix)
+    # - falls back to the run's shared TORCH_DEVICE/GPU_LD_R2 settings when
+    # absent, exactly like n_jobs above. Has no effect on 'kb'/'variants'
+    # pruning (no GPU path).
+    device = ld_config.get('device')
+    # PATCH_NOTES (performance fix): optional pre-flight cost guard for a
+    # 'kb'-window --indep-pairwise call - see check_kb_window_cost()'s own
+    # docstring. Both default to "off"/"module default" respectively, so
+    # an existing ld_config with neither key behaves exactly as before.
+    max_avg_markers_per_window = ld_config.get('max_avg_markers_per_window')
+    warn_avg_markers_per_window = ld_config.get('warn_avg_markers_per_window')
 
     # Build the SNP map. window_unit='variants' doesn't strictly need real
     # CHR/POS/CM, so fall back to a placeholder map only when the caller
@@ -888,6 +1451,11 @@ def LD_pruning(train, valid, test, ld_config):
         unmapped_window = unmapped_window,
         unmapped_step = unmapped_step,
         maf_threshold = maf_threshold,
+        plink_threads = plink_threads,
+        n_jobs = n_jobs,
+        device = device,
+        max_avg_markers_per_window = max_avg_markers_per_window,
+        warn_avg_markers_per_window = warn_avg_markers_per_window,
     )
     print(f"Pruned: {genotype_df.shape[1]} -> {pruned[0].shape[1]} markers")
 
