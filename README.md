@@ -31,8 +31,6 @@ The comparison of the inferred genomic marker effects with known key genome regi
 
 This release roughly doubles the codebase and adds, among other things: three new selectable prediction models (ExtraTrees, XGBoost, EBM) plus a fourth weighted-ensemble method (Analytic least-squares); marker-pair interactions from twelve models instead of Random Forest only, each now drawn as its own ring on the circos plot; two further, independently switchable widths of parallelism (task-level and model-level, on top of the existing array-job batches); optional gzip compression of large result files; a streaming, memory-bounded result-assembly path for large Parallel-mode runs; and two new Excel summary reports (`Metric_summary.xlsx`, `Diversity_prediction_theorem.xlsx`).
 
-See **[RELEASE_NOTES.md](RELEASE_NOTES.md)** for the full, detailed list of changes since the previously published version, including notes on upgrading and known limitations.
-
 ## Description
 EasiGP is a web-based application (no coding required to use it day-to-day) that runs and compares multiple genomic prediction models, then visualises what each model has learned as a circos plot. It also includes several optional add-ons for preparing your data and for building on top of your results.
 
