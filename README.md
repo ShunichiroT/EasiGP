@@ -1,4 +1,4 @@
-# Ensemble AnalySis with Interpretable Genomic Prediction (EasiGP): Computational Tool for Interpreting Ensembles of Genomic Prediction Models
+# Ensemble AnalySis with Interpretable Genomic Prediction (EasiGP): Computational Tool for Interpreting Ensembles of Genomic Prediction Models 
 This code is used for "Ensemble AnalySis with Interpretable Genomic Prediction (EasiGP): Computational Tool for Interpreting Ensembles of Genomic Prediction Models". (https://doi.org/10.1002/tpg2.70138)
 
 EasiGP analyses the ensemble of multiple diverse genomic prediction models at the genome level in crop breeding programs.
