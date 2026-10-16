@@ -46,11 +46,6 @@ The comparison of the inferred genomic marker effects with known key genome regi
 - **Better HPC planning.** Resource suggestions are calibrated from the measured time and memory of earlier runs, and a small pilot run (`run_step1_batch.py --pilot`) can measure your own data before you commit a large allocation.
 - **Biological prior network.** Gene locations can be looked up automatically from an annotation file (GFF3/GTF) or Ensembl before any AI-agent step is used.
 
-<<<<<<< HEAD
-The previous release roughly doubled the codebase and added three selectable prediction models (ExtraTrees, XGBoost, EBM), a fourth weighted-ensemble method (Analytic least-squares), marker-pair interactions from twelve models (each drawn as its own circos ring), task-level and model-level parallelism, optional gzip compression of large result files, a streaming result-assembly path for large Parallel-mode runs, and the two Excel summary reports (`Metric_summary.xlsx`, `Diversity_prediction_theorem.xlsx`).
-
-=======
->>>>>>> bf79359cd44eb90e0c70e967a38e1d4ddbb28b6f
 ## Description
 EasiGP is a web-based application (no coding required to use it day-to-day) that runs and compares multiple genomic prediction models, then visualises what each model has learned as a circos plot. It also includes several optional add-ons for preparing your data and for building on top of your results.
 
