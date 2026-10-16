@@ -15146,7 +15146,7 @@ if show_tab_models:
                           "\n"
                           "- **BLUEs:** genotype is a FIXED effect. No genomic-relationship "
                           "information enters the training target, so every downstream model "
-                          "family is treated the same way (recommended default).\n"
+                          "family is treated the same way.\n"
                           "- **BLUPs without GRM:** genotype is RANDOM with independent "
                           "effects.\n"
                           "- **BLUPs with GRM:** genotype is RANDOM and borrows information "
