@@ -168,11 +168,9 @@ This token works with either an API-billed Anthropic account or a Claude subscri
 6. When you're done, press `Ctrl+C` in the terminal to stop the container.
 
 Any files EasiGP creates (results, generated networks, etc.) live inside the container and are lost when it stops, unless you mount a folder from your own computer into it - add `-v "PATH ON YOUR COMPUTER":/workspace/data` to the `docker run` command above (before `shunichirot/easigp:<version>`) to keep a folder in sync, e.g. `-v "$(pwd)/data":/workspace/data` on Mac/Linux or `-v "${PWD}\data":/workspace/data` in PowerShell.
-<<<<<<< HEAD
 
 **Next time you use EasiGP (Docker):** the image is already on your computer, so skip step 3 (the pull) unless a new version has been released. Make sure Docker Desktop is running, run the same `docker run ...` command from step 4, open `http://localhost:8501`, and press `Ctrl+C` in the terminal when you are done.
-=======
->>>>>>> bf79359cd44eb90e0c70e967a38e1d4ddbb28b6f
+
 
 #### For HPC, using Apptainer
 
