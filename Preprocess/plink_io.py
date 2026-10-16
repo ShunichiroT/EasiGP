@@ -26,10 +26,24 @@ actually made):
     mirroring how the existing genotype-CSV workflow already expects a
     phenotype file with the SAME 'ID'/'population' values.
 
+    Update ID ver4-12, R4 (design blueprint SS2.4): 'population' may now
+    be a DERIVED quantity (see pipeline_utils.derive_population_series())
+    rather than a column literally named 'population' in the phenotype
+    file - the analysed phenotype table genomic_prediction.py::GP()'s own
+    load block hands to this module (via `phenotype_df`) already carries
+    a real 'population' column either way, computed once, up front. This
+    module's own contract is unchanged and in fact strengthened by this:
+    'population' is now the phenotype file's derived value on BOTH
+    genotype formats (previously the CSV path read it from the genotype
+    file instead - see architecture doc SS2.1/SS4.1) - it is still never
+    read from, or invented out of, the .fam file itself.
+
 Requires a working `plink2` executable on PATH (or an explicit path via
 `plink_path=`) - the same dependency `Preprocess/LD_pruning.py` already has.
 """
 
+import functools
+import hashlib
 import os
 import re
 import subprocess
@@ -38,7 +52,10 @@ import time
 
 import pandas as pd
 
-from pipeline_utils import get_active_compute_resources
+from pipeline_utils import get_active_compute_resources, note_stage_tag, timed_stage
+from Preprocess.preprocess_memo import (
+    ld_prune_key, memo_enabled, memo_get, memo_put,
+)
 
 
 class PlinkFilesetError(Exception):
@@ -77,6 +94,31 @@ def validate_plink_fileset(bfile_stem):
     return bed_path, bim_path, fam_path
 
 
+def _read_bim_marker_info_uncached(bim_path):
+    """Parse a .bim file into the ['chromosome', 'name', 'start', 'end']
+    marker table (the body ``read_bim_marker_info`` has always had)."""
+    bim = pd.read_csv(
+        bim_path, sep=r'\s+', header=None,
+        names=['chromosome', 'name', 'cm', 'position', 'a1', 'a2'],
+        dtype={'chromosome': str, 'name': str},
+        encoding='utf-8-sig',
+    )
+    return pd.DataFrame({
+        'chromosome': bim['chromosome'],
+        'name': bim['name'],
+        'start': bim['position'].astype(float),
+        'end': bim['position'].astype(float),
+    })
+
+
+@functools.lru_cache(maxsize=8)
+def _read_bim_marker_info_cached(abs_path, size, mtime_ns):
+    """Process-level cache of the parsed .bim, keyed by the file's own
+    identity (path, size, mtime_ns), so a changed file can never be served
+    stale. Callers get a copy (see ``read_bim_marker_info``)."""
+    return _read_bim_marker_info_uncached(abs_path)
+
+
 def read_bim_marker_info(bim_path):
     """Read a .bim file's marker positions only (chromosome, SNP ID, genetic
     distance, bp position, allele 1, allele 2 - PLINK1's standard 6-column,
@@ -95,19 +137,76 @@ def read_bim_marker_info(bim_path):
     marker.end >= gene.start`), and for LD-pruning window logic, while
     staying simpler and more literal than inventing bin boundaries that
     the .bim file itself doesn't provide.
+
+    ver4-35, R1.g2: a process that calls this more than once for the same,
+    unchanged .bim (the Streamlit GUI, an intra-batch worker running several
+    ``GP()`` calls, the GUI's own preview) parses it once and gets an equal
+    COPY afterwards, so a caller that edits the frame cannot affect the
+    cache. Off (every call parses) when
+    ``ACCELERATION['SHARED_BIM_MARKER_INFO']`` is False.
     """
-    bim = pd.read_csv(
-        bim_path, sep=r'\s+', header=None,
-        names=['chromosome', 'name', 'cm', 'position', 'a1', 'a2'],
-        dtype={'chromosome': str, 'name': str},
-        encoding='utf-8-sig',
-    )
-    return pd.DataFrame({
-        'chromosome': bim['chromosome'],
-        'name': bim['name'],
-        'start': bim['position'].astype(float),
-        'end': bim['position'].astype(float),
-    })
+    if get_active_compute_resources().get('accel_shared_bim_marker_info', True):
+        try:
+            _stat = os.stat(bim_path)
+        except OSError:
+            return _read_bim_marker_info_uncached(bim_path)
+        return _read_bim_marker_info_cached(
+            os.path.abspath(bim_path), _stat.st_size, _stat.st_mtime_ns).copy()
+    return _read_bim_marker_info_uncached(bim_path)
+
+
+def shared_bim_marker_info_path(bim_path, memo_dir):
+    """Path of the run-shared marker-info CSV for `bim_path`:
+    ``<memo_dir>/bim_marker_info_<blake2b(abs path, size, mtime_ns)>.csv``
+    (ver4-35, R1.g2). Content-addressed like every other memo entry, so
+    every process of a fan-out run that reads the same .bim resolves the
+    SAME file. Returns None if the .bim cannot be stat-ed."""
+    try:
+        _stat = os.stat(bim_path)
+    except OSError:
+        return None
+    digest = hashlib.blake2b(
+        f"{os.path.abspath(bim_path)}|{_stat.st_size}|{_stat.st_mtime_ns}".encode('utf-8'),
+        digest_size=16).hexdigest()
+    return os.path.join(memo_dir, f"bim_marker_info_{digest}.csv")
+
+
+def write_shared_bim_marker_info(bim_marker_info, bim_path, memo_dir):
+    """Write `bim_marker_info` once to the run-shared path and return that
+    path, or None when it cannot be done (no memo dir, unreadable .bim, an
+    unwritable directory - the caller then keeps its per-run file).
+
+    Byte-identical to the per-run ``_plink_bim_marker_info.csv`` (same
+    ``to_csv`` call). An existing entry is reused as is (the name already
+    encodes the .bim's identity). Written to a temporary file in the same
+    directory and moved with ``os.replace`` (I10), so a concurrent reader
+    never sees a half-written file and a race only repeats identical work."""
+    if not memo_dir:
+        return None
+    path = shared_bim_marker_info_path(bim_path, memo_dir)
+    if path is None:
+        return None
+    if os.path.isfile(path) and os.path.getsize(path) > 0:
+        return path
+    tmp_path = None
+    try:
+        os.makedirs(memo_dir, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(dir=memo_dir, prefix='.bim_marker_info_', suffix='.tmp')
+        os.close(fd)
+        bim_marker_info.to_csv(tmp_path, index=False, encoding='utf-8')
+        os.replace(tmp_path, path)
+        tmp_path = None
+    except OSError as exc:
+        print(f"[plink_io] NOTE: could not write the shared marker table '{path}' "
+              f"({type(exc).__name__}: {exc}) - using the per-run file instead.")
+        return None
+    finally:
+        if tmp_path is not None and os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+    return path
 
 
 def read_fam_iids(fam_path):
@@ -384,14 +483,42 @@ def ld_prune_marker_list_native(bfile_stem, keep_iid_list, ld_config, work_dir=N
             )
         return pruned_snps
 
-    if work_dir is not None:
-        os.makedirs(work_dir, exist_ok=True)
-        pruned_snps = _do_prune(work_dir)
-    else:
-        with tempfile.TemporaryDirectory(prefix='ld_prune_native_') as tmp_dir:
-            pruned_snps = _do_prune(tmp_dir)
+    # ver4-33, R1.c: the pruning decision is a pure function of (fileset
+    # content, plink2 version, training IIDs, LD settings), and every model
+    # group / phenotype / array task of one training set used to re-run it.
+    # `Preprocess.preprocess_memo` keys it on all of those, so a hit returns
+    # exactly the list a fresh run would. Off (legacy) unless
+    # ACCELERATION['preprocess_memo'] is on AND $EASIGP_MEMO_DIR is usable.
+    with timed_stage('ld_prune'):
+        pruned_snps = None
+        memo_key = None
+        if memo_enabled():
+            memo_key = ld_prune_key(bfile_stem, keep_iid_list, ld_config, plink_path, threads)
+            if memo_key is None:
+                note_stage_tag('ld_prune', 'memo off')
+                print(f"[plink_io] NOTE: LD-prune memo skipped for '{bfile_stem}' - could not read the "
+                      f"plink2 version/file stats needed for a safe key - pruning is run normally.")
+            else:
+                cached = memo_get('ld', memo_key)
+                if cached is not None and isinstance(cached.get('snps'), list) and cached['snps']:
+                    pruned_snps = list(cached['snps'])
+                    note_stage_tag('ld_prune', 'memo hit')
+                    print(f"[plink_io] Native PLINK LD pruning: memo hit - {len(pruned_snps)} marker(s) "
+                          f"survived (key {memo_key[:8]}); --indep-pairwise not run.")
+        else:
+            note_stage_tag('ld_prune', 'memo off')
 
-    print(f"[plink_io] Native PLINK LD pruning finished: {len(pruned_snps)} marker(s) survived.")
+        if pruned_snps is None:
+            if work_dir is not None:
+                os.makedirs(work_dir, exist_ok=True)
+                pruned_snps = _do_prune(work_dir)
+            else:
+                with tempfile.TemporaryDirectory(prefix='ld_prune_native_') as tmp_dir:
+                    pruned_snps = _do_prune(tmp_dir)
+            if memo_key is not None:
+                memo_put('ld', memo_key, {'snps': list(pruned_snps)})
+                note_stage_tag('ld_prune', 'memo miss')
+            print(f"[plink_io] Native PLINK LD pruning finished: {len(pruned_snps)} marker(s) survived.")
     return pruned_snps
 
 
@@ -493,6 +620,71 @@ def ld_prune_plink_native(bfile_stem, phenotype_df, keep_iid_list, ld_config, wo
                                  plink_threads=threads)
 
 
+# ver4-33, R1.b: per-process bookkeeping for the direct .bed reader.
+_DIRECT_UNSUPPORTED = {}                       # abs stem -> reason it cannot be used (this process)
+_EXPORT_COUNTS = {'direct': 0, 'plink2': 0}    # genotype reads by mechanism (this process)
+
+
+def _try_direct_genotype(bfile_stem, keep_iid_list, extract_snp_list, plink_path, threads):
+    """ver4-33, R1.b: try to read the requested genotype block straight from
+    the .bed. Returns the ``['IID', *snps]`` frame, or None meaning "use the
+    legacy ``plink2 --export A`` path".
+
+    Why: the plink2 subprocess + text round trip dominated PLINK wall time
+    (design blueprint R1.b). Safety: the counted allele is verified once per
+    process per fileset by ``BedReader.probe`` against the legacy export
+    before any direct result is used.
+
+    Modes (``ACCELERATION['plink_direct_read']``): 'off' -> None, nothing
+    logged beyond the resolved setting. 'auto' -> any problem is logged as a
+    NOTE (once per process per fileset) and None is returned. 'on' -> any
+    problem raises PlinkFilesetError.
+    """
+    mode = get_active_compute_resources().get('accel_plink_direct_read', 'off')
+    if mode == 'off':
+        return None
+
+    from Preprocess.plink_bed import BedReader, BedFormatUnsupported, note_once
+
+    stem_key = os.path.abspath(bfile_stem)
+
+    def _give_up(reason):
+        if mode == 'on':
+            raise PlinkFilesetError(
+                f"ACCELERATION['plink_direct_read']='on' but the direct .bed reader cannot be used "
+                f"for '{bfile_stem}': {reason}. Set it to 'auto' to fall back to plink2 "
+                f"automatically, or 'off'."
+            )
+        note_once('direct-off', bfile_stem,
+                  f"[plink_io] NOTE: direct .bed reader not used for '{bfile_stem}' - {reason} - "
+                  f"falling back to 'plink2 --export A' (slower, results unchanged).")
+        return None
+
+    if stem_key in _DIRECT_UNSUPPORTED:
+        return _give_up(_DIRECT_UNSUPPORTED[stem_key])
+    try:
+        reader = BedReader.open(bfile_stem)
+    except BedFormatUnsupported as exc:
+        _DIRECT_UNSUPPORTED[stem_key] = str(exc)
+        return _give_up(str(exc))
+    if not reader.probe(plink_path=plink_path, threads=threads):
+        _DIRECT_UNSUPPORTED[stem_key] = f"parity probe failed: {reader.probe_detail}"
+        return _give_up(_DIRECT_UNSUPPORTED[stem_key])
+    note_once('direct-ok', bfile_stem,
+              f"[plink_io] Direct .bed reader active for '{bfile_stem}' ({reader.n_variants} variants x "
+              f"{reader.n_samples} samples): {reader.probe_detail}.")
+    try:
+        frame = reader.genotype_frame(keep_iid_list=keep_iid_list, extract_snp_list=extract_snp_list)
+    except (PlinkFilesetError, OSError, ValueError, KeyError, IndexError) as exc:
+        # Data-condition errors (unknown IIDs, nothing left) are re-raised by
+        # the legacy path with its own authoritative message, so fall back and
+        # let it speak; under 'on' surface this one immediately.
+        return _give_up(f"direct read failed ({type(exc).__name__}: {exc})")
+    _EXPORT_COUNTS['direct'] += 1
+    note_stage_tag('geno_read', 'direct')
+    return frame
+
+
 def plink_to_genotype_df(bfile_stem, phenotype_df, extract_snp_list=None, keep_iid_list=None,
                           plink_path='plink2', work_dir=None, plink_threads=None):
     """The main entry point: convert a PLINK bed/bim/fam fileset into a
@@ -543,7 +735,29 @@ def plink_to_genotype_df(bfile_stem, phenotype_df, extract_snp_list=None, keep_i
     matching phenotype_df's own row order (restricted to samples actually
     present in the PLINK fileset), column order matching the (possibly
     --extract-restricted) .bim file's own marker order.
+    
+
+    ver4-33 (R1.a / R1.b): the whole call is timed as the ``geno_read`` stage
+    of the per-task ``[timing]`` line. When
+    ``ACCELERATION['plink_direct_read']`` is 'auto' or 'on' the genotype
+    block is gathered straight from the .bed by
+    ``Preprocess.plink_bed.BedReader`` (after a once-per-process parity probe
+    against ``plink2 --export A``) instead of spawning plink2; 'auto' falls
+    back to plink2 with a logged NOTE if anything cannot be verified, 'on'
+    raises instead. 'off' (the default for a config without ``ACCELERATION``)
+    is the unchanged ver4-32 path. See ``Preprocess/plink_bed.py`` for the
+    one disclosed difference (numeric-looking IIDs keep their .fam text).
     """
+    with timed_stage('geno_read'):
+        return _plink_to_genotype_df_impl(
+            bfile_stem, phenotype_df, extract_snp_list, keep_iid_list, plink_path, work_dir, plink_threads,
+        )
+
+
+def _plink_to_genotype_df_impl(bfile_stem, phenotype_df, extract_snp_list, keep_iid_list,
+                                plink_path, work_dir, plink_threads):
+    """Body of plink_to_genotype_df() (see its docstring); split out only so
+    the public function can wrap the whole call in the ``geno_read`` timer."""
     validate_plink_fileset(bfile_stem)
     threads = _resolve_plink_threads(plink_threads)
 
@@ -642,12 +856,22 @@ def plink_to_genotype_df(bfile_stem, phenotype_df, extract_snp_list=None, keep_i
 
         return genotype
 
-    if work_dir is not None:
-        os.makedirs(work_dir, exist_ok=True)
-        genotype = _do_convert(work_dir)
-    else:
-        with tempfile.TemporaryDirectory(prefix='plink_io_') as tmp_dir:
-            genotype = _do_convert(tmp_dir)
+    genotype = _try_direct_genotype(bfile_stem, keep_iid_list, extract_snp_list, plink_path, threads)
+    if genotype is None:
+        # Legacy path (the default for any config without ACCELERATION, and
+        # the fallback for 'auto'). Said every time so it is visible when the
+        # fast path is NOT in use (A-b3 counts these lines).
+        _EXPORT_COUNTS['plink2'] += 1
+        note_stage_tag('geno_read', 'plink2')
+        print(f"[plink_io] genotype read via plink2 --export A (call #{_EXPORT_COUNTS['plink2']} in this "
+              f"process, '{bfile_stem}', "
+              f"{'all' if extract_snp_list is None else len(extract_snp_list)} marker(s)).")
+        if work_dir is not None:
+            os.makedirs(work_dir, exist_ok=True)
+            genotype = _do_convert(work_dir)
+        else:
+            with tempfile.TemporaryDirectory(prefix='plink_io_') as tmp_dir:
+                genotype = _do_convert(tmp_dir)
 
     phenotype_ids = phenotype_df.copy()
     phenotype_ids['ID'] = phenotype_ids['ID'].astype(str)

@@ -11,6 +11,8 @@ from sklearn.metrics import mean_squared_error
 
 from pipeline_utils import safe_regression_metrics, get_active_compute_resources, apply_torch_compute_settings, gpu_slot
 from .ensemble_regularization import apply_naive_shrinkage, analytic_simplex_weights
+import blue_weights
+from asreml_accuracy_metrics import compute_accuracy_metrics_row, ACCURACY_METRIC_COLUMNS
 
 
 def _safe_row_normalize(df):
@@ -26,21 +28,36 @@ def _safe_row_normalize(df):
 
 
 ## Define the class converting the data into a specific format
-class CSVDataset(Dataset):
+# F6 (optimise_scan): was `CSVDataset`, which collided with models/MLP.py::CSVDataset under the
+# `from models.X import *` lines of genomic_prediction.py (the later import silently won).
+class LinearTransformationDataset(Dataset):
     # load the dataset
-    def __init__(self, data):
+    def __init__(self, data, sample_weight=None):
         # store the inputs and outputs
         X = data.iloc[:,1:]
         y = data.iloc[:,0]
         self.X = torch.tensor(X.values, dtype=torch.float32)
         self.y = torch.tensor(y.values, dtype=torch.float32).reshape(-1, 1)
+        # ver4-25, R8 (design blueprint SS2, Stage 6): optional per-row
+        # BLUE-reliability weight, aligned to `data`'s own row order -
+        # carried THROUGH the DataLoader's own shuffling by returning it
+        # as a third tuple element (below), exactly mirroring
+        # models/MLP.py::CSVDataset's own identical mechanism (see that
+        # class's docstring for the full rationale). `None` (the default
+        # - every pre-ver4-25 caller) makes __getitem__ return the
+        # original 2-tuple, byte-identical to before this parameter
+        # existed (I11).
+        self.w = (None if sample_weight is None else
+                  torch.tensor(np.asarray(sample_weight, dtype='float32')).reshape(-1, 1))
         
     def __len__(self):
         return len(self.X)
  
     # get a row at an index
     def __getitem__(self, idx):
-        return [self.X[idx], self.y[idx]]
+        if self.w is None:
+            return [self.X[idx], self.y[idx]]
+        return [self.X[idx], self.y[idx], self.w[idx]]
     
 class MLP_linear(Module):
     def __init__(self, n_inputs):
@@ -77,8 +94,36 @@ class MLP_linear_simplex(Module):
         w = self.combining_weights()
         return (X * w).sum(dim=1, keepdim=True)
 
-def Linear_transformation(data_train, data_valid, data_test, record, effect, weight, MODEL, HPARAMETERS_OPT):
-    
+def Linear_transformation(data_train, data_valid, data_test, record, effect, weight, MODEL, HPARAMETERS_OPT,
+                           asreml_accuracy_ctx=None, *, sample_weight_ctx=None):
+    """ver4-25, R8 (design blueprint SS2, Stage 6): `sample_weight_ctx`
+    (a `blue_weights.BlueWeightContext`, or `None` - every pre-ver4-25
+    caller, a strict no-op - I11). Unlike the other three weight-
+    optimisation methods, this one genuinely FITS a small model (the
+    linear/softmax combiner) on the TRAINING split of base-model
+    predictions, with `data_valid` used only for early stopping - so,
+    mirroring `models/MLP.py`'s own already-shipped mechanism, its
+    mini-batch training loss becomes `Σw_fit,i·r_i² / Σw_fit,i` whenever
+    weighting is on (`sample_weight_ctx.w_fit` is a plain per-individual
+    vector in BOTH 'diagonal' and 'full' mode - blueprint SS2's own
+    mechanism table - so no mode restriction is needed here, unlike the
+    SCORING side below).
+
+    Its own INTERNAL early-stopping validation loss (also mini-batched)
+    is weighted in 'diagonal' mode only (`sample_weight_ctx.w_valid`, a
+    plain per-row vector, decomposes trivially across shuffled
+    minibatches); 'full' mode's dense `W_valid` genuinely does NOT
+    decompose that way (a GLS quadratic form needs the WHOLE split's own
+    cross terms, not a series of independent mini-batch sums) - the
+    SAME class of problem already disclosed for the five GAT variants'
+    own training loops (ver4-25 Change Summary Part 3 SS7.3), so 'full'-
+    mode early stopping is disclosed as unweighted here too, via a single
+    one-time NOTE. This does NOT affect correctness of the final
+    reported numbers: the never-worse-than-naive floor comparison and
+    this method's own final test-score row (both computed ONCE, over the
+    WHOLE split, never mini-batched) are fully weighted in BOTH modes,
+    exactly like every other weighted-ensemble method in this codebase."""
+
     # Hyperparameter setting
     learning_rate = HPARAMETERS_OPT[0]
     epochs = HPARAMETERS_OPT[1]
@@ -139,9 +184,28 @@ def Linear_transformation(data_train, data_valid, data_test, record, effect, wei
     apply_torch_compute_settings(_resources)
 
     ## Change the data structure
-    train = CSVDataset(data_train.loc[:,['actual']+model_selected])
-    valid = CSVDataset(data_valid.loc[:,['actual']+model_selected])
-    test = CSVDataset(data_test.loc[:,['actual']+model_selected])
+    # ver4-25, R8: `_w_fit` (this task's shared TRAINING weight, a plain
+    # vector in both diagonal and full mode) weights this method's own
+    # mini-batch training loss below; `_w_valid_diag` (diagonal mode
+    # only - see this function's own docstring) weights its INTERNAL
+    # early-stopping validation loss. Both `None` when weighting is off
+    # or in 'full' mode's validation case - a strict no-op, byte-
+    # identical to before this parameter existed (I11).
+    _w_fit = sample_weight_ctx.w_fit if sample_weight_ctx is not None else None
+    _w_valid_diag = (sample_weight_ctx.w_valid
+                      if (sample_weight_ctx is not None and sample_weight_ctx.mode == 'diagonal')
+                      else None)
+    if sample_weight_ctx is not None and sample_weight_ctx.mode == 'full':
+        print("[Linear_transformation] NOTE: BLUE-reliability weighting is on ('full' mode) for "
+              "this run - this method's own TRAINING loss is weighted (a plain per-individual "
+              "vector, unaffected by mode), but its INTERNAL early-stopping validation loss is "
+              "NOT (a dense full-mode covariance weight does not decompose across independent "
+              "mini-batches - the same disclosed limitation as the GAT variants' own training "
+              "loops). This method's own final, whole-split "
+              "floor comparison and test-score row ARE still correctly GLS-weighted.")
+    train = LinearTransformationDataset(data_train.loc[:,['actual']+model_selected], sample_weight=_w_fit)
+    valid = LinearTransformationDataset(data_valid.loc[:,['actual']+model_selected], sample_weight=_w_valid_diag)
+    test = LinearTransformationDataset(data_test.loc[:,['actual']+model_selected])
 
     ## Create data loaders
     train_loader = DataLoader(train, batch_size=batch_s, shuffle=True)
@@ -189,23 +253,55 @@ def Linear_transformation(data_train, data_valid, data_test, record, effect, wei
                 batch_size_valid = len(valid_loader)
 
                 ## MLP training
-                for inputs, targets in train_loader:
+                for _batch in train_loader:
+                    # ver4-25, R8: a weighted batch is a 3-tuple (see
+                    # CSVDataset.__getitem__ above); an unweighted run
+                    # keeps getting the original 2-tuple, so the `else`
+                    # branch below is byte-identical to before this
+                    # feature existed (I11).
+                    if len(_batch) == 3:
+                        inputs, targets, batch_w = _batch
+                        batch_w = batch_w.to(device)
+                    else:
+                        inputs, targets = _batch
+                        batch_w = None
                     inputs, targets = inputs.to(device), targets.to(device)
                     model.train()
                     optimizer.zero_grad()
                     yhat = model(inputs)
-                    loss = F.mse_loss(yhat, targets) + _diversity_term(model)
+                    if batch_w is None:
+                        loss = F.mse_loss(yhat, targets) + _diversity_term(model)
+                    else:
+                        # Sum(w_i * r_i^2) / Sum(w_i) - blueprint SS2 R8's
+                        # own weighted-loss formula, exactly mirroring
+                        # models/MLP.py's own already-shipped mechanism.
+                        _sq_err = (yhat - targets) ** 2
+                        loss = ((_sq_err * batch_w).sum() / batch_w.sum().clamp_min(1e-12)) \
+                            + _diversity_term(model)
                     loss_train_sum += loss
                     loss.backward()
                     optimizer.step()
 
                 ## MLP validation
-                for inputs, targets in valid_loader:
+                for _batch in valid_loader:
+                    if len(_batch) == 3:
+                        inputs, targets, batch_w = _batch
+                        batch_w = batch_w.to(device)
+                    else:
+                        inputs, targets = _batch
+                        batch_w = None
                     inputs, targets = inputs.to(device), targets.to(device)
                     model.eval()
                     with torch.no_grad():
                         yhat = model(inputs)
-                        loss = F.mse_loss(yhat, targets)
+                        if batch_w is None:
+                            loss = F.mse_loss(yhat, targets)
+                        else:
+                            # ver4-25, R8: diagonal-mode only - see this
+                            # function's own docstring for why 'full'
+                            # mode's dense W is not weighted here.
+                            _sq_err = (yhat - targets) ** 2
+                            loss = (_sq_err * batch_w).sum() / batch_w.sum().clamp_min(1e-12)
 
                     loss_valid_sum += loss
 
@@ -253,19 +349,43 @@ def Linear_transformation(data_train, data_valid, data_test, record, effect, wei
         # identical NaN exposure (it is the very column those three sites
         # either reuse or recompute) and is included here too so the fix is
         # not defeated by an unguarded first call.
-        r, mse = safe_regression_metrics(actual_test, predicted_test)
+        #
+        # ver4-25, R8: `_recompute_test_metrics()` centralises the
+        # weighted/unweighted-plus-`metric_weighting` recompute (SS6.3)
+        # so all three branches below (trained/analytic/naive) that can
+        # end up owning `predicted_test` apply the exact SAME pattern,
+        # rather than three independently-drifting copies.
+        _test_weight_kwargs = blue_weights.scoring_for(sample_weight_ctx, 'test')
+
+        def _recompute_test_metrics(_predicted_test_local):
+            _r_unw, _mse_unw = safe_regression_metrics(actual_test, _predicted_test_local)
+            if _test_weight_kwargs:
+                _r, _mse = safe_regression_metrics(actual_test, _predicted_test_local, **_test_weight_kwargs)
+            else:
+                _r, _mse = _r_unw, _mse_unw
+            record.loc[record.shape[0]-1, 'Pearson correlation'] = _r
+            record.loc[record.shape[0]-1, 'MSE'] = _mse
+            if sample_weight_ctx is not None:
+                record.loc[record.shape[0]-1, 'Pearson correlation (unweighted)'] = _r_unw
+                record.loc[record.shape[0]-1, 'MSE (unweighted)'] = _mse_unw
+                record.loc[record.shape[0]-1, 'metric_weighting'] = sample_weight_ctx.mode
+            return _r, _mse
 
         ## Store the metrics
         record = pd.concat([record, pd.DataFrame(record.iloc[-1,:]).T]).reset_index(drop=True)
         record.loc[record.shape[0]-1,'model'] = 'Linear transformation'
-        record.loc[record.shape[0]-1,'Pearson correlation'] = r
-        record.loc[record.shape[0]-1,'MSE'] = mse
+        r, mse = _recompute_test_metrics(predicted_test)
 
         ## Extract predicted and observed values for the validation set
         predicted_valid = []
         #actual_valid = []
         valid_loader = DataLoader(valid, batch_size=batch_s, shuffle=False)
-        for inputs, targets in valid_loader:
+        for _batch in valid_loader:
+            # ver4-25, R8: `valid`'s dataset may now emit a 3-tuple
+            # (diagonal mode) - only `inputs` is needed here, so the
+            # trailing weight element (if present) is simply unpacked
+            # and discarded.
+            inputs = _batch[0]
             inputs = inputs.to(device)
             yhat = model(inputs)
             predicted_valid += yhat.detach().cpu().tolist()
@@ -277,7 +397,10 @@ def Linear_transformation(data_train, data_valid, data_test, record, effect, wei
         train_loader = DataLoader(train, batch_size=batch_s, shuffle=False)
         predicted_train = []
         #actual_train = []
-        for inputs, targets in train_loader:
+        for _batch in train_loader:
+            # ver4-25, R8: `train`'s dataset may now emit a 3-tuple - see
+            # the identical comment on the validation loop just above.
+            inputs = _batch[0]
             inputs = inputs.to(device)
             yhat = model(inputs)
             predicted_train += yhat.detach().cpu().tolist()
@@ -300,8 +423,16 @@ def Linear_transformation(data_train, data_valid, data_test, record, effect, wei
         # above this function's first metric computation. Only the MSE half
         # of the returned pair is used here; this guard has always compared
         # MSE only, never Pearson r.
-        _, _naive_valid_mse = safe_regression_metrics(_actual_valid_arr, _naive_valid_pred)
-        _, _trained_valid_mse = safe_regression_metrics(_actual_valid_arr, predicted_valid)
+        #
+        # ver4-25, R8: graded on the SAME weighted metric (`mse_W`) as
+        # every other weighted-ensemble method's own floor whenever
+        # weighting is on (`_valid_weight_kwargs` is `{}` - a no-op -
+        # otherwise, I11) - the never-worse-than-naive guarantee is
+        # otherwise meaningless once Pearson/MSE elsewhere in this run
+        # are being reported on a different (weighted) scale.
+        _valid_weight_kwargs = blue_weights.scoring_for(sample_weight_ctx, 'valid')
+        _, _naive_valid_mse = safe_regression_metrics(_actual_valid_arr, _naive_valid_pred, **_valid_weight_kwargs)
+        _, _trained_valid_mse = safe_regression_metrics(_actual_valid_arr, predicted_valid, **_valid_weight_kwargs)
 
         # Update ID ver4-6, R6 (blueprint touch point: Linear_transformation
         # gets the analytic solution as an "extra_candidates entry only").
@@ -325,9 +456,10 @@ def Linear_transformation(data_train, data_valid, data_test, record, effect, wei
         _analytic_valid_mse = np.inf
         _analytic_w = None
         if w_opt_analytic_seed:
-            _analytic_w = analytic_simplex_weights(_pred_matrix_valid, _actual_valid_arr)
+            _analytic_w = analytic_simplex_weights(_pred_matrix_valid, _actual_valid_arr, **_valid_weight_kwargs)
             _analytic_valid_pred = _pred_matrix_valid @ _analytic_w
-            _, _analytic_valid_mse = safe_regression_metrics(_actual_valid_arr, _analytic_valid_pred)
+            _, _analytic_valid_mse = safe_regression_metrics(
+                _actual_valid_arr, _analytic_valid_pred, **_valid_weight_kwargs)
 
         # A non-finite _trained_valid_mse (this model's OWN validation
         # predictions are NaN) must trip the never-worse-than-naive guard
@@ -350,15 +482,13 @@ def Linear_transformation(data_train, data_valid, data_test, record, effect, wei
             print(f"[Linear_transformation] The analytic least-squares solution's own "
                   f"validation MSE ({_analytic_valid_mse:.6g}) beat both the trained ensemble's "
                   f"({_trained_valid_mse:.6g}) and naive/equal weighting's ({_naive_valid_mse:.6g}) "
-                  f"- using it for this scenario's predictions instead (ver4-6 R6 floor).")
+                  f"- using it for this scenario's predictions instead (floor rule).")
             _pred_matrix_test = data_test[model_selected].astype(float).to_numpy()
             _pred_matrix_train = data_train[model_selected].astype(float).to_numpy()
             predicted_test = (_pred_matrix_test @ _analytic_w).tolist()
             predicted_valid = _analytic_valid_pred.tolist()
             predicted_train = (_pred_matrix_train @ _analytic_w).tolist()
-            r, mse = safe_regression_metrics(actual_test, predicted_test)
-            record.loc[record.shape[0]-1,'Pearson correlation'] = r
-            record.loc[record.shape[0]-1,'MSE'] = mse
+            r, mse = _recompute_test_metrics(predicted_test)
             _wopt_winner = 'analytic'
         else:
             print(f"[Linear_transformation] Trained ensemble's own validation MSE "
@@ -369,9 +499,7 @@ def Linear_transformation(data_train, data_valid, data_test, record, effect, wei
             predicted_valid = _naive_valid_pred.tolist()
             predicted_train = data_train[model_selected].astype(float).mean(axis=1).to_numpy().tolist()
             # ver4-4 R5 Fix 2 - see the initial metric computation's note above.
-            r, mse = safe_regression_metrics(actual_test, predicted_test)
-            record.loc[record.shape[0]-1,'Pearson correlation'] = r
-            record.loc[record.shape[0]-1,'MSE'] = mse
+            r, mse = _recompute_test_metrics(predicted_test)
             _wopt_winner = 'naive'
 
         if _wopt_winner == 'trained' and shrinkage_alpha < 1.0:
@@ -389,13 +517,25 @@ def Linear_transformation(data_train, data_valid, data_test, record, effect, wei
             predicted_train = (alpha * pd.Series(predicted_train).to_numpy()
                                 + (1 - alpha) * data_train[model_selected].astype(float).mean(axis=1).to_numpy()).tolist()
             # ver4-4 R5 Fix 2 - see the initial metric computation's note above.
-            r, mse = safe_regression_metrics(actual_test, predicted_test)
-            record.loc[record.shape[0]-1,'Pearson correlation'] = r
-            record.loc[record.shape[0]-1,'MSE'] = mse
+            r, mse = _recompute_test_metrics(predicted_test)
 
         data_test['Linear transformation'] = predicted_test
         data_valid['Linear transformation'] = predicted_valid
         data_train['Linear transformation'] = predicted_train
+
+        # Requirements.md (BLUEs/BLUPs accuracy-metrics phase) - computed
+        # here, ONCE, using the FINAL `predicted_test`/`r` (whichever of
+        # trained/analytic/naive/shrunk-blend branches above won) - see
+        # models/Nelder_Mead.py's identical block for the full
+        # explanation. `asreml_accuracy_ctx` is `None` by default (a
+        # strict no-op).
+        if asreml_accuracy_ctx:
+            _new_metrics = compute_accuracy_metrics_row(
+                list(predicted_test), data_test['id'].tolist() if 'id' in data_test.columns else [],
+                r, asreml_accuracy_ctx,
+            )
+            for _col, _val in _new_metrics.items():
+                record.loc[record.shape[0]-1, _col] = _val
 
         ## Extract weights
         data_train_selected, data_test_selected = data_train.loc[:,model_selected], data_test.loc[:,model_selected]
@@ -407,7 +547,15 @@ def Linear_transformation(data_train, data_valid, data_test, record, effect, wei
         d_train = torch.tensor(data_train_selected.values, dtype=torch.float32).to(device)
         d_test = torch.tensor(data_test_selected.values, dtype=torch.float32).to(device)
 
-        weight_sample = pd.DataFrame(record.iloc[record.shape[0]-1,:]).T.drop(['Pearson correlation', 'MSE'],axis=1)
+        # Requirements.md (BLUEs/BLUPs accuracy-metrics phase): the new
+        # metric columns just added onto `record`'s own last row (above)
+        # must ALSO be dropped here - see models/Nelder_Mead.py's
+        # identical comment.
+        weight_sample = pd.DataFrame(record.iloc[record.shape[0]-1,:]).T.drop(
+            ['Pearson correlation', 'MSE'] + list(ACCURACY_METRIC_COLUMNS)
+            + list(blue_weights.METRIC_WEIGHTING_EXTRA_COLUMNS),
+            axis=1, errors='ignore'
+        )
         weight_sample['model'] = 'Linear transformation'
 
         explainer = shap.DeepExplainer(model, shap.sample(d_train, 50))
@@ -426,16 +574,22 @@ def Linear_transformation(data_train, data_valid, data_test, record, effect, wei
         ## Calculate weighted effects
         weight_extracted_normalised = _safe_row_normalize(weight_extracted)
 
+        # F1 fix: the accumulator used to be created only when i == 0, so a first model without effect rows
+        # (e.g. explainability off for it) raised UnboundLocalError on the next model, and no effect rows at all
+        # raised it at the end. It now starts from the first model that HAS effect rows (identical result when
+        # every model has them) and the ensemble effect row is skipped when no model has any.
+        effect_weighted = None
         for i in range(len(model_selected)):
             if effect[effect['model']==model_selected[i]].shape[0] != 0:
-                if i == 0:
+                if effect_weighted is None:
                     effect_weighted = _safe_row_normalize(effect[effect['model']==model_selected[i]].tail(1).iloc[:,5:].abs().reset_index(drop=True)).mul(weight_extracted_normalised[model_selected[i]], axis=0).reset_index(drop=True)
                 else:
                     effect_weighted += _safe_row_normalize(effect[effect['model']==model_selected[i]].tail(1).iloc[:,5:].abs().reset_index(drop=True)).mul(weight_extracted_normalised[model_selected[i]], axis=0).reset_index(drop=True)
 
-        effect = pd.concat([effect, pd.DataFrame(effect.iloc[effect.shape[0]-1,:]).T]).reset_index(drop=True)
-        effect.loc[effect.shape[0]-1,'model'] = 'Linear transformation'
+        if effect_weighted is not None:
+            effect = pd.concat([effect, pd.DataFrame(effect.iloc[effect.shape[0]-1,:]).T]).reset_index(drop=True)
+            effect.loc[effect.shape[0]-1,'model'] = 'Linear transformation'
 
-        effect.loc[effect.shape[0]-1,list(effect_weighted.columns)] = effect_weighted.values
+            effect.loc[effect.shape[0]-1,list(effect_weighted.columns)] = effect_weighted.values
 
     return record, effect, data_test, data_valid, data_train, weight

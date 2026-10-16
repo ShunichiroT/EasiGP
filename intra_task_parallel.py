@@ -78,6 +78,7 @@ tier-1/tier-2 merge.
 
 from __future__ import annotations
 
+import inspect
 import os
 import random
 import shutil
@@ -89,7 +90,15 @@ from typing import Dict, List, Mapping, Optional, Sequence, Tuple
 import pandas as pd
 
 import checkpoint_utils as _ckpt
-from pipeline_utils import cheap_marker_and_sample_counts, result_dir_path, init_rpy2_conversion
+from pipeline_utils import (
+    cheap_marker_and_sample_counts, result_dir_path, init_rpy2_conversion,
+    ensure_memo_dir_env, release_memo_dir_env, gpu_arbiter_for_workers,
+    ensure_telemetry_dir_env, release_telemetry_dir_env,   # ver4-56 (R1)
+)
+# ver4-25, R3 (design blueprint stage 3): builds this task's own sidecar
+# accuracy-metrics-context resolver from its merged ASReml_accuracy_
+# context.csv - see finalise_task_from_merged()'s own updated comment.
+import asreml_accuracy_metrics
 # Import direction is strictly downward (I2): this module imports
 # resource_profiles (for the shared cost table / packing / break-even
 # predicate), never the reverse - resource_profiles.py stays a
@@ -113,7 +122,7 @@ from models.hyperparameter_tuning import base_of, expand_model_list, ensemble_gr
 from models.ensemble import ensemble
 from intra_batch_parallel import (
     isolated_result_name, task_already_complete, merge_isolated_results_into_batch,
-    cleanup_isolated_folders, worker_init, relocate_side_artefacts,
+    cleanup_isolated_folders, worker_init, relocate_side_artefacts, fanout_thread_resources,
     # Update ID 2, Defect D2/D3 fix (see PATCH_NOTES_D2.md) - reused
     # verbatim rather than re-implemented, the same "reuse, don't
     # re-derive" precedent this module already follows for every other
@@ -384,14 +393,21 @@ def _task_has_validation_split(gp_kwargs: dict, task_index: int) -> bool:
     ``MODEL``, and its row-order construction is a pure function of
     ``SCENARIO``/``RATIO``/``SAMPLE_NUM`` alone for this purpose).
 
-    For ``SCENARIO == 'between'``, gate G2's own condition already
-    counts ANY task as having a validation split whenever ``W_OPT`` is
-    active, regardless of the (always-sentinel -1) ratio value - so this
-    returns ``True`` unconditionally in that case, matching G2 exactly.
+    For ``SCENARIO == 'between'``, gate G2's own condition (updated by
+    the between-prediction validation-set patch, Requirements.md items
+    1-4) now decides validation-presence via ``BETWEEN_VALIDATION``/
+    ``BETWEEN_VALIDATION_SOURCE`` - independent of ``W_OPT`` - rather
+    than assuming every 'between' task has one whenever ``W_OPT`` is
+    active. ``BETWEEN_VALIDATION`` absent/``None`` ("not specified")
+    reproduces the pre-patch inference exactly (I11): validation was
+    present iff ``W_OPT`` was set.
     """
     scenario = gp_kwargs.get('SCENARIO')
     if scenario == 'between':
-        return True
+        between_validation = gp_kwargs.get('BETWEEN_VALIDATION')
+        if between_validation is None:
+            return gp_kwargs.get('W_OPT') is not None
+        return bool(between_validation)
     if scenario != 'within':
         return False
     sample_num = int(gp_kwargs.get('SAMPLE_NUM') or 0)
@@ -441,11 +457,91 @@ def task_is_model_fanout_eligible(
     """
     task_index = gp_kwargs['PARALLEL']['batch_id']
 
+    # Update ID ver4-12, R11b (design blueprint SS2.11b, RK-5): Steps 1-8
+    # (now 1-8 including Step 6b) are re-run IDENTICALLY in every model
+    # group under model-level fan-out - with ASReml enabled, that means
+    # this task's REML model would be fitted G times (once per group)
+    # instead of once, and a REML fit is typically the single most
+    # expensive thing in the task. Ineligible by default, via this same
+    # gate, exactly mirroring the existing W_OPT ineligibility rule right
+    # below - the override (`ASREML['allow_model_fanout']=True`) exists
+    # for a user whose ASReml fit is cheap relative to their model set.
+    _asreml_cfg = gp_kwargs.get('ASREML')
+    # Multi-option update (Requirements.md item 3): a run that executes
+    # MORE THAN ONE genotype-effect option (BLUEs/BLUPs without GRM/BLUPs
+    # with GRM) is NEVER model-fanned-out, regardless of
+    # `allow_model_fanout` - `GP()`'s wrapper runs the whole engine once
+    # per option into nested scratch folders and tags the merged result
+    # files with an option column, while this module's tier-1 merge
+    # (`finalise_task_from_merged()`/`merge_model_group_frames()`) assumes
+    # plain, untagged group files. Keeping the two apart is what keeps
+    # every option's numbers exactly equal to a single-option run's.
+    try:
+        import asreml_syntax as _asreml_syntax_for_fanout
+        _multi_option = bool(_asreml_cfg) and _asreml_syntax_for_fanout.is_multi_strategy(_asreml_cfg)
+    except Exception:
+        _multi_option = False
+    if _multi_option:
+        return False, (
+            "More than one ASReml genotype-effect option (BLUEs / BLUPs without GRM / BLUPs "
+            "with GRM) is selected - each option is run as its own complete pass by GP()'s "
+            "option wrapper, so model-level fan-out (which merges plain per-group files) is "
+            "not used for this run."
+        )
+    if _asreml_cfg is not None and not _asreml_cfg.get('allow_model_fanout', False):
+        return False, (
+            "ASREML is enabled and ASREML['allow_model_fanout'] is not set - Steps 1-8 "
+            "(including Step 6b's ASReml-R fit) run identically in every model group, so "
+            "fanning out would multiply the REML fit by the group count. Set "
+            "ASREML['allow_model_fanout']=True to override, if this task's ASReml fit is cheap "
+            "relative to its model set (design blueprint SS2.11b)."
+        )
+
     if gp_kwargs.get('W_OPT') is not None and _task_has_validation_split(gp_kwargs, task_index):
         return False, (
             "W_OPT is active and this task provides a validation split - Step 11's weighted-"
             "ensemble finalisation requires the frozen Step 8 pool, which exists only inside "
             "GP()'s own _process_one_task closure (blueprint decision D1)"
+        )
+
+    # ver4-26, R4 (design blueprint hand-off checklist item 4): the SAME
+    # ineligibility rule as W_OPT just above, extended to JOINT_W_OPT -
+    # "Step 8.5"'s joint search AND the new Step 11 joint-combination
+    # branch both need the frozen Step 8 pool and every joint-group
+    # model's own record/effect/weight rows from THIS SAME
+    # _process_one_task closure, exactly like W_OPT's Step 11 does (same
+    # blueprint decision D1 rationale - never attempted under fan-out in
+    # this delivery).
+    if gp_kwargs.get('JOINT_W_OPT') is not None and _task_has_validation_split(gp_kwargs, task_index):
+        return False, (
+            "JOINT_W_OPT is active and this task provides a validation split - the joint "
+            "hyperparameter+weight search and its Step 11 combination both require the frozen "
+            "Step 8 pool, which exists only inside GP()'s own _process_one_task closure "
+            "(blueprint decision D1, extended to JOINT_W_OPT)"
+        )
+
+    # ver4-57, R2: the SAME ineligibility rule, extended to ITERATIVE_ENSEMBLE - Step 11c
+    # refits the group's marker-channel members from every member's own Step 9 frames,
+    # effects and predictions, which exist together only inside GP()'s own
+    # _process_one_task closure (blueprint AC2.7; same decision D1 rationale as W_OPT).
+    if gp_kwargs.get('ITERATIVE_ENSEMBLE') is not None and _task_has_validation_split(gp_kwargs, task_index):
+        return False, (
+            "ITERATIVE_ENSEMBLE is active and this task provides a validation split - Step 11c "
+            "needs every member's Step 9 frames, marker effects and predictions together, "
+            "which exist only inside GP()'s own _process_one_task closure (blueprint AC2.7, "
+            "decision D1 extended)"
+        )
+
+    # ver4-77, R2: the SAME ineligibility rule, extended to SUPER_LEARNER - Step 11d fits every
+    # member out of fold (and once more on train+valid) from every member's own Step 9 frames
+    # and predictions, which exist together only inside GP()'s own _process_one_task closure
+    # (same decision D1 rationale as W_OPT). Unlike the rules above it applies to EVERY task:
+    # the Super learner also runs without a validation split.
+    if gp_kwargs.get('SUPER_LEARNER') is not None:
+        return False, (
+            "SUPER_LEARNER is active - Step 11d needs every member's Step 9 frames and "
+            "predictions together, which exist only inside GP()'s own _process_one_task "
+            "closure (decision D1 extended)"
         )
 
     min_models_for_parallel = int(gp_kwargs.get('MIN_MODELS_FOR_PARALLEL', 2) or 2)
@@ -672,6 +768,26 @@ def finalise_task_from_merged(task_result_name: str, task_index: int, gp_kwargs:
     # SPEC) - possibly empty, exactly like `effect` above, if no group in
     # this task selected an interaction-capable model.
     interactions = _load('interactions')
+    # ver4-25, R3 (design blueprint stage 3): this task's own PERSISTED
+    # accuracy-metrics context, already merged across every model group
+    # by the SAME tier-1 dedup_rows merge every other ASReml accumulator
+    # uses (checkpoint_utils.MODEL_GROUP_MERGE_SPEC['asreml_accuracy_
+    # ctx']) - this function runs in a completely separate process from
+    # any GP() call, so it has no live, in-memory registry/cache to fall
+    # back on at all; the sidecar file is the ONLY source it has, or
+    # could ever have, for this data. `None` (a no-op resolver that
+    # always returns `None`) when the file has no rows at all - accuracy
+    # metrics were off, or this task's own models never enabled them.
+    asreml_accuracy_ctx = _load('asreml_accuracy_ctx')
+    # ver4-25, R8 Stage 6 completion: this task's own persisted 'full'-
+    # mode test-weight matrix, merged across model groups the same
+    # 'dedup_rows' way every other ASReml accumulator is (checkpoint_
+    # utils.MODEL_GROUP_MERGE_SPEC['asreml_test_weights']) - `None`
+    # frame -> `ctx_resolver_from_frame()`'s own no-op default, exactly
+    # like `asreml_accuracy_ctx` above when 'full' mode was never used.
+    asreml_test_weights = _load('asreml_test_weights')
+    asreml_accuracy_ctx_resolver = asreml_accuracy_metrics.ctx_resolver_from_frame(
+        asreml_accuracy_ctx, asreml_test_weights)
 
     if result_test.shape[0] == 0:
         return
@@ -679,9 +795,19 @@ def finalise_task_from_merged(task_result_name: str, task_index: int, gp_kwargs:
     hp_tune = gp_kwargs.get('HP_TUNE')
     hp_tune_ensemble_mode = gp_kwargs.get('HP_TUNE_ENSEMBLE_MODE', 'per_method')
 
+    # Requirements.md item 4: Spearman / Top-k are computed for EVERY run
+    # (ASReml or not), so the naive ensemble's own rows need the same
+    # per-phenotype direction map GP() itself uses (legacy ASREML
+    # accuracy_metrics.direction, overridden by METRIC_DIRECTIONS).
+    metric_directions = dict((((gp_kwargs.get('ASREML') or {}).get('accuracy_metrics') or {})
+                              .get('direction')) or {})
+    metric_directions.update(dict(gp_kwargs.get('METRIC_DIRECTIONS') or {}))
+
     for group_label, group_models in ensemble_groups(model_base, hp_tune, hp_tune_ensemble_mode):
         result_train, result_valid, result_test, sample_record, sample_effect, sample_interaction_ensemble = ensemble(
             result_train, result_valid, result_test, effect, group_models, interactions,
+            asreml_accuracy_ctx_resolver=asreml_accuracy_ctx_resolver,
+            metric_directions=metric_directions,
         )
         if group_label is not None:
             new_label = f'ensemble__{group_label}'
@@ -745,7 +871,27 @@ def _run_unit(unit_gp_kwargs: dict, task_index: int, group_index: Optional[int])
         return task_index, group_index, False, f"{exc!r}\n{traceback.format_exc()}"
 
 
-def run_batch_with_model_level_parallelism(
+def run_batch_with_model_level_parallelism(*args, **kwargs):
+    """Public entry point (signature and behaviour exactly those of
+    :func:`_run_batch_with_model_level_parallelism`, documented there).
+
+    ver4-33, R1.c: installs ``EASIGP_MEMO_DIR`` (``Result/<outer
+    RESULT_NAME>/_memo``) for the duration of the call - if unset - so every
+    model-group worker of every task shares ONE preprocessing memo (that
+    cross-process sharing is where the repeated LD / merge-RF work was). An
+    outer value always wins; removed again only if this call set it."""
+    bound = inspect.signature(_run_batch_with_model_level_parallelism).bind(*args, **kwargs).arguments
+    memo_set_here = ensure_memo_dir_env(bound['gp_kwargs'].get('RESULT_NAME'))
+    # ver4-56 (R1): model-group workers inherit the TOP-LEVEL telemetry folder (outer value wins).
+    telemetry_set_here = ensure_telemetry_dir_env(bound['gp_kwargs'].get('RESULT_NAME'))
+    try:
+        return _run_batch_with_model_level_parallelism(*args, **kwargs)
+    finally:
+        release_telemetry_dir_env(telemetry_set_here)
+        release_memo_dir_env(memo_set_here)
+
+
+def _run_batch_with_model_level_parallelism(
     gp_kwargs: dict,
     n_task_workers: int = 1,
     n_model_workers: int = 1,
@@ -889,7 +1035,11 @@ def run_batch_with_model_level_parallelism(
     # shared MP_CONTEXT (imported from intra_batch_parallel.py), not the
     # platform default (fork) - same fork-safety reasoning as that
     # module's own Manager() call.
-    gpu_semaphore = MP_CONTEXT.Manager().Semaphore(n_gpu_slots) if n_gpu_slots > 0 else None
+    # ver4-33, R1.h: legacy Semaphore, or a round-robin device-token pool when
+    # ACCELERATION['gpu_device_round_robin'] is on and >1 CUDA device is visible.
+    gpu_semaphore = gpu_arbiter_for_workers(
+        gp_kwargs.get('ACCELERATION'), n_gpu_slots, gp_kwargs.get('GPU_SLOTS_PER_DEVICE', 1),
+        MP_CONTEXT.Manager()) if n_gpu_slots > 0 else None
     r_path = gp_kwargs.get('R_PATH')
     r_blas_threads = gp_kwargs.get('R_BLAS_THREADS')
 
@@ -924,7 +1074,9 @@ def run_batch_with_model_level_parallelism(
         pool_size = max(1, min(n_task_workers * n_model_workers, len(to_run)))
         with ProcessPoolExecutor(
             max_workers=pool_size, mp_context=MP_CONTEXT,
-            initializer=worker_init, initargs=(r_path, r_blas_threads, gpu_semaphore),
+            initializer=worker_init,
+            initargs=(r_path, r_blas_threads, gpu_semaphore,
+                      fanout_thread_resources(gp_kwargs, pool_size)),
         ) as pool:
             futures = {pool.submit(_run_unit, _kwargs_for(t, g), t, g): (t, g) for t, g in to_run}
             for future in as_completed(futures):

@@ -17,7 +17,24 @@ from batch_reader import ResultSet
 # checkpoint_utils.static_write_flags_for()). Every other key is written
 # unconditionally, even when empty, exactly as the pre-Update-3 body below
 # always has.
-_CONDITIONAL_KEYS = ('weight', 'attention_total', 'hp_record', 'stats')
+#
+# Update ID ver4-25, Stage 9 (R12): 'interactions_hok' added - it is
+# EXACTLY as model-selection-driven as 'weight'/'attention_total' (gated
+# by checkpoint_utils.static_write_flags_for()'s own 'interactions_hok'
+# flag: True only if a selected model's 'Marker interaction method' is
+# shapiq-based AND its 'Interaction orders to search for' includes an
+# order >= 3). Leaving it unconditional here would silently write an
+# empty 'Interaction_higher_order.csv.gz' on EVERY run, including plain
+# k=2-only runs that never touch shapiq higher-order interactions at all
+# - directly contradicting RESULT_FILE_NAMES' own comment for this key
+# ("every other run never creates this file at all (R12's own 'k=2
+# unchanged' scope limit, AC12.3)").
+#
+# Update ID ver4-57, R4: 'iter_rounds' added - the Iterative ensemble's per-round diagnostics
+# exist only for a run with ITERATIVE_ENSEMBLE set (static_write_flags_for()'s own
+# 'iter_rounds' flag), so a run without it must not gain an empty Iterative_ensemble_rounds.csv.
+_CONDITIONAL_KEYS = ('weight', 'attention_total', 'hp_record', 'stats', 'interactions_hok',
+                     'iter_rounds')
 
 
 # Combine prediction results from all batches
@@ -304,6 +321,20 @@ def _assemble_legacy(RESULT_NAME, expected_batches=None, RESULT_COMPRESSION='gzi
     metric = pd.DataFrame()
     marker_effect = pd.DataFrame()
     interaction = pd.DataFrame()
+    # Update ID ver4-25, Stage 9 (R12): higher-order (k>=3) shapiq
+    # interaction rows - a sibling accumulator to `interaction` above
+    # (k=2), NOT part of the pre-Update-3 body this function otherwise
+    # reproduces verbatim (the key did not exist then). Added so the
+    # ASSEMBLE_STREAMING=False rollback path does not silently DROP a
+    # user's higher-order interaction data outright - it is written to
+    # its own combined file below exactly like `weight`/`attention`/
+    # `hyperparameter`/`stats` (conditional-on-non-empty, and likewise
+    # left OUT of this function's own return tuple, since every existing
+    # caller already reads it back from the combined file via
+    # `batch_reader.load_combined()`/`ResultSet.interactions_hok_grouped()`,
+    # never from this tuple - I3 untouched).
+    interaction_hok = pd.DataFrame()
+    iter_rounds = pd.DataFrame()   # ver4-57, R4: Iterative_ensemble_rounds.csv (conditional)
     weight = pd.DataFrame()
     attention = pd.DataFrame()
     hyperparameter = pd.DataFrame()  # store optimised hyperparameters found via HP_TUNE
@@ -426,6 +457,28 @@ def _assemble_legacy(RESULT_NAME, expected_batches=None, RESULT_COMPRESSION='gzi
                 interaction = pd.concat([interaction, pd.read_csv(_path)])
             except _ckpt._INCOMPLETE_FILE_ERRORS:
                 interaction = pd.DataFrame()
+        # Update ID ver4-25, Stage 9 (R12): mirrors the 'interactions'
+        # block immediately above, one key over - most batches never
+        # write an 'interactions_hok' file at all (only ones with a
+        # shapiq k>=3 model selected do, per
+        # checkpoint_utils.static_write_flags_for()), so `_path is None`
+        # for them and this is simply skipped, exactly like 'weight'/
+        # 'attention_total' already are for batches that didn't produce
+        # those either.
+        _path = _ckpt.resolve_result_path(RESULT_NAME, i, True, 'interactions_hok')
+        if _path is not None:
+            try:
+                interaction_hok = pd.concat([interaction_hok, pd.read_csv(_path)])
+            except _ckpt._INCOMPLETE_FILE_ERRORS:
+                interaction_hok = pd.DataFrame()
+        # ver4-57, R4: same pattern, one key over - only batches of a run with the Iterative
+        # ensemble on ever write this file; `_path is None` for every other batch.
+        _path = _ckpt.resolve_result_path(RESULT_NAME, i, True, 'iter_rounds')
+        if _path is not None:
+            try:
+                iter_rounds = pd.concat([iter_rounds, pd.read_csv(_path)])
+            except _ckpt._INCOMPLETE_FILE_ERRORS:
+                iter_rounds = pd.DataFrame()
         _path = _ckpt.resolve_result_path(RESULT_NAME, i, True, 'weight')
         if _path is not None:
             try:
@@ -474,6 +527,17 @@ def _assemble_legacy(RESULT_NAME, expected_batches=None, RESULT_COMPRESSION='gzi
         _to_csv(hyperparameter, 'hp_record')
     if stats.shape[0] != 0:
         _to_csv(stats, 'stats')
+    # Update ID ver4-25, Stage 9 (R12): conditional-on-non-empty, same as
+    # weight/attention_total/hp_record/stats immediately above (and the
+    # streaming path's own `_CONDITIONAL_KEYS` treatment of this same
+    # key) - a plain k=2-only run never creates 'Interaction_higher_
+    # order.csv' at all, matching RESULT_FILE_NAMES' own comment for
+    # this key.
+    if interaction_hok.shape[0] != 0:
+        _to_csv(interaction_hok, 'interactions_hok')
+    # ver4-57, R4: conditional-on-non-empty, like the keys above.
+    if iter_rounds.shape[0] != 0:
+        _to_csv(iter_rounds, 'iter_rounds')
 
     # Requirement: an empty `metric` (no batch produced any usable Metric_*
     # output) has no 'model'/'population'/'phenotype' columns to read,
@@ -512,7 +576,14 @@ def _assemble_legacy(RESULT_NAME, expected_batches=None, RESULT_COMPRESSION='gzi
     # membership check only catches the unsuffixed form, leaving suffixed
     # variants behind for downstream plotting code that expects MODEL to
     # contain only real prediction models.
-    _WOPT_LABEL_PREFIXES = ('Linear transformation', 'Nelder Mead', 'Bayesian optimisation', 'Analytic least-squares')
+    # ver4-26, R2/R_last item 5: 'Joint Bayesian optimisation' appended -
+    # see pipeline_utils.py's own identical constant/comment.
+    # ver4-57, R2: 'Iterative ensemble' appended - the opt-in iterative ensemble's own label.
+    # ver4-77, R2: 'Super learner' appended - the opt-in Super learner's own label.
+    _WOPT_LABEL_PREFIXES = (
+        'Linear transformation', 'Nelder Mead', 'Bayesian optimisation', 'Analytic least-squares',
+        'Joint Bayesian optimisation', 'Iterative ensemble', 'Super learner',
+    )
     MODEL = [m for m in MODEL if not any(m == p or m.startswith(p + '__') for p in _WOPT_LABEL_PREFIXES)]
 
     return metric, prediction_train, prediction_test, marker_effect, interaction, attention,\

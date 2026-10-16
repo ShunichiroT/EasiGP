@@ -38,7 +38,8 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 
-from pipeline_utils import get_active_compute_resources
+from pipeline_utils import get_active_compute_resources, note_stage_tag, cuml_gpu_usable
+from Preprocess.preprocess_memo import memo_enabled, memo_get, memo_put, rf_select_key
 
 
 def _random_forest_regressor_cls(use_gpu):
@@ -75,7 +76,7 @@ def _random_forest_regressor_cls(use_gpu):
     (rather than a new one) is the safer fix: it reuses a code path this
     codebase already ships, tests, and falls back from safely.
     """
-    if use_gpu:
+    if use_gpu and cuml_gpu_usable():
         try:
             from cuml.ensemble import RandomForestRegressor as CumlRF
             return CumlRF, True
@@ -153,7 +154,7 @@ def _resolve_n_keep(rf_config, n_markers):
         raise ValueError(f"rf_config['mode'] must be 'percent' or 'count', got {mode!r}")
 
 
-def select_rf_markers(train_x, train_y, rf_config):
+def select_rf_markers(train_x, train_y, rf_config, sample_weight=None):
     """Fit a Random Forest on (train_x, train_y) and return the top markers
     by importance, per `rf_config` (see `_resolve_n_keep` for the
     percent/count mode choice), plus the fitted model itself so a caller
@@ -167,6 +168,20 @@ def select_rf_markers(train_x, train_y, rf_config):
     callers that need one (unlike RF_marker_filtering() below, which skips
     fitting entirely in that case since it has no model-reuse need of its
     own).
+
+    Parameters
+    ----------
+    sample_weight : ver4-25, R8 (design blueprint SS2, Stage 6) - optional
+        per-row fitting weight, aligned to `train_x`'s own row order.
+        `None` (the default - every pre-ver4-25 caller, including this
+        module's own main `RF_marker_filtering()` Step-7 entry point)
+        reproduces the exact previous, unweighted fit - a strict,
+        backward-compatible ADDITION, not a behaviour change for any
+        existing call site. Currently only passed by
+        `Preprocess.data_driven_prior_network.select_markers_for_data_
+        driven_network()`, on behalf of `GAT_biological_prior_knowledge`'s
+        own optional data-driven-merge subsystem (blueprint SS2 R8's own
+        mechanism table).
 
     Returns
     -------
@@ -224,7 +239,32 @@ def select_rf_markers(train_x, train_y, rf_config):
             random_state=rf_config.get('random_state', 0),
             n_jobs=_resolve_n_jobs(rf_config),
         )
-    rf.fit(train_x, train_y)
+    # ver4-25, R8: `sample_weight=None` (every pre-ver4-25 call site,
+    # including this module's own RF_marker_filtering() below) is a
+    # byte-identical `rf.fit(train_x, train_y)` - I11. When given, and
+    # the resolved estimator is cuML (GPU) and does not accept the
+    # keyword, falls back to a fresh CPU forest with the SAME
+    # hyperparameters via `pipeline_utils.fit_with_sample_weight()`
+    # (the same "never silently drop the weights" discipline every other
+    # model file's own cuML branch already uses).
+    if sample_weight is None:
+        rf.fit(train_x, train_y)
+    else:
+        from pipeline_utils import fit_with_sample_weight
+        def _cpu_fallback():
+            return RandomForestRegressor(
+                n_estimators=rf_config.get('n_estimators', 200),
+                max_depth=rf_config.get('max_depth', None),
+                max_features=rf_config.get('max_features', 'sqrt'),
+                min_samples_leaf=rf_config.get('min_samples_leaf', 1),
+                random_state=rf_config.get('random_state', 0),
+                n_jobs=_resolve_n_jobs(rf_config),
+            )
+        rf = fit_with_sample_weight(
+            rf, train_x, train_y, sample_weight,
+            cpu_fallback_factory=(_cpu_fallback if _is_gpu else None),
+            log_prefix='[select_rf_markers]',
+        )
 
     # cuML's `.feature_importances_` returns a cuDF/cupy array rather than
     # a plain numpy one - np.argsort/np.asarray both coerce it correctly
@@ -236,6 +276,37 @@ def select_rf_markers(train_x, train_y, rf_config):
     top_markers = [c for c in train_x.columns if c in top_marker_set]
 
     return top_markers, rf, n_keep
+
+
+def _select_top_markers_memoised(train_x, train_y, rf_config):
+    """``(top_markers, fitted_rf_or_None)`` for the Step-7 RF filter, through
+    the content-addressed preprocessing memo when it is on (ver4-35, R1.g3).
+
+    Why: with model fan-out or a resumed array job every process repeats this
+    forest fit on the very same training matrix (blueprint E8). The memo key
+    is the SAME ``rf_select_key`` the data-driven merge's selection uses and
+    both store the same ``{'selected': [...]}`` payload, because both are the
+    unweighted ``select_rf_markers(train_x, train_y, rf_config)``; a hit
+    skips the fit. On a hit ``fitted_rf`` is ``None`` - callers that need the
+    forest (``return_model=True``) never come through here.
+
+    Memo off (``preprocess_memo`` False, no ``EASIGP_MEMO_DIR``, or a memo
+    that was disabled after an error) is a plain ``select_rf_markers`` call."""
+    if not memo_enabled():
+        top_markers, rf, _ = select_rf_markers(train_x, train_y, rf_config)
+        return top_markers, rf
+    use_gpu = bool(get_active_compute_resources().get('use_gpu_sklearn', False))
+    key = rf_select_key(train_x, train_y, rf_config, None, use_gpu)
+    cached = memo_get('rf', key)
+    if cached is not None and isinstance(cached.get('selected'), list):
+        note_stage_tag('rf_filter', 'memo hit')
+        print(f"[preprocess_memo] Step-7 RF marker filtering: memo hit "
+              f"({len(cached['selected'])} marker(s), key {key[:8]}) - forest fit skipped.")
+        return list(cached['selected']), None
+    note_stage_tag('rf_filter', 'memo miss')
+    top_markers, rf, _ = select_rf_markers(train_x, train_y, rf_config)
+    memo_put('rf', key, {'selected': list(top_markers)})
+    return top_markers, rf
 
 
 def RF_marker_filtering(train, valid, test, rf_config, return_model=False):
@@ -305,7 +376,11 @@ def RF_marker_filtering(train, valid, test, rf_config, return_model=False):
             return train_out, valid_out, test_out, None, list(train_x.columns)
         return train_out, valid_out, test_out
 
-    top_markers, rf, _ = select_rf_markers(train_x, train_y, rf_config)
+    if return_model:
+        # The caller wants the fitted forest: always fit (a memo hit has none).
+        top_markers, rf, _ = select_rf_markers(train_x, train_y, rf_config)
+    else:
+        top_markers, rf = _select_top_markers_memoised(train_x, train_y, rf_config)
 
     phenotype_col = train.columns[-1]
     keep_cols = top_markers + [phenotype_col]

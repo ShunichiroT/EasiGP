@@ -132,6 +132,104 @@ def pairwise_r2_matrix(geno_block: np.ndarray, *, device: str = 'cpu',
     return _pairwise_r2_matrix_numpy(geno_block, pairwise_complete=pairwise_complete)
 
 
+def pairwise_r2_cross(block_a: np.ndarray, block_b: np.ndarray, *,
+                      device: str = 'cpu') -> np.ndarray:
+    """r^2 between every column of `block_a` and every column of `block_b`
+    (samples x markers each, same rows, ``NaN`` = missing call) - the
+    rectangular sibling of :func:`pairwise_r2_matrix` (ver4-35, R1.g1).
+
+    Why: the banded cM pruning needs only the r^2 values between a block of
+    anchors and the markers inside their window, never the whole
+    ``M x M`` matrix of a chromosome. This uses exactly the same four
+    presence-mask products and the same degenerate-pair rule as
+    ``pairwise_r2_matrix(..., pairwise_complete=True)`` (see its docstring for
+    the derivation), so ``pairwise_r2_cross(X[:, a], X[:, b])`` equals
+    ``pairwise_r2_matrix(X)[a][:, b]`` up to floating-point summation order
+    (different matrix shapes block the products differently).
+
+    Returns an ``(n_a, n_b)`` float64 array; ``0.0`` for a pair with fewer
+    than 3 jointly present samples or a monomorphic column in the joint
+    rows. A CUDA `device` ('cuda...') is tried first and any torch/CUDA
+    failure falls back to NumPy with one log line, like the square kernel.
+    Raises ``ValueError`` for a non-2-D input or blocks with different row
+    counts.
+    """
+    block_a = np.asarray(block_a, dtype=np.float64)
+    block_b = np.asarray(block_b, dtype=np.float64)
+    if block_a.ndim != 2 or block_b.ndim != 2 or block_a.shape[0] != block_b.shape[0]:
+        raise ValueError(f"pairwise_r2_cross: both blocks must be 2-D with the same number of "
+                         f"samples, got {block_a.shape} and {block_b.shape}")
+    if str(device).startswith('cuda'):
+        try:
+            return _pairwise_r2_cross_torch(block_a, block_b, device=str(device))
+        except Exception as exc:
+            print(f"[ld_kernels] NOTE: pairwise_r2_cross could not run on device={device!r} "
+                  f"({exc}) - falling back to the NumPy/CPU path. Results are unaffected "
+                  f"(the CPU path computes the identical statistic), only wall-clock time.")
+    return _pairwise_r2_cross_numpy(block_a, block_b)
+
+
+def _pairwise_r2_cross_numpy(block_a: np.ndarray, block_b: np.ndarray) -> np.ndarray:
+    """NumPy core of :func:`pairwise_r2_cross` (also the CUDA fallback)."""
+    presence_a, presence_b = ~np.isnan(block_a), ~np.isnan(block_b)
+    filled_a = np.where(presence_a, block_a, 0.0)
+    filled_b = np.where(presence_b, block_b, 0.0)
+    p_a, p_b = presence_a.astype(np.float64), presence_b.astype(np.float64)
+
+    n_joint = p_a.T @ p_b
+    sx = filled_a.T @ p_b                       # sum of a-column over the jointly present rows
+    sy = p_a.T @ filled_b                       # sum of b-column over the jointly present rows
+    sxy = filled_a.T @ filled_b
+    sxx = (filled_a * filled_a).T @ p_b
+    syy = p_a.T @ (filled_b * filled_b)
+
+    with np.errstate(invalid='ignore', divide='ignore'):
+        mean_x = sx / n_joint
+        mean_y = sy / n_joint
+        cov = sxy / n_joint - mean_x * mean_y
+        var_x = sxx / n_joint - mean_x * mean_x
+        var_y = syy / n_joint - mean_y * mean_y
+        r = cov / np.sqrt(var_x * var_y)
+        r2 = r * r
+
+    degenerate = (n_joint < 3) | (var_x <= 0) | (var_y <= 0) | ~np.isfinite(r2)
+    return np.where(degenerate, 0.0, r2)
+
+
+def _pairwise_r2_cross_torch(block_a: np.ndarray, block_b: np.ndarray, *,
+                             device: str) -> np.ndarray:
+    """torch/CUDA twin of :func:`_pairwise_r2_cross_numpy` (float64, lazy
+    torch import - the only torch use of the cross kernel)."""
+    import torch
+
+    dev = torch.device(device)
+    zero = torch.zeros((), dtype=torch.float64, device=dev)
+    a = torch.as_tensor(block_a, dtype=torch.float64, device=dev)
+    b = torch.as_tensor(block_b, dtype=torch.float64, device=dev)
+    presence_a, presence_b = ~torch.isnan(a), ~torch.isnan(b)
+    filled_a = torch.where(presence_a, a, zero)
+    filled_b = torch.where(presence_b, b, zero)
+    p_a, p_b = presence_a.to(torch.float64), presence_b.to(torch.float64)
+
+    n_joint = p_a.T @ p_b
+    sx = filled_a.T @ p_b
+    sy = p_a.T @ filled_b
+    sxy = filled_a.T @ filled_b
+    sxx = (filled_a * filled_a).T @ p_b
+    syy = p_a.T @ (filled_b * filled_b)
+
+    mean_x = sx / n_joint
+    mean_y = sy / n_joint
+    cov = sxy / n_joint - mean_x * mean_y
+    var_x = sxx / n_joint - mean_x * mean_x
+    var_y = syy / n_joint - mean_y * mean_y
+    r = cov / torch.sqrt(var_x * var_y)
+    r2 = r * r
+
+    degenerate = (n_joint < 3) | (var_x <= 0) | (var_y <= 0) | ~torch.isfinite(r2)
+    return torch.where(degenerate, zero, r2).detach().cpu().numpy()
+
+
 def _pairwise_r2_matrix_numpy(geno_block: np.ndarray, *, pairwise_complete: bool) -> np.ndarray:
     """NumPy implementation shared by both the CPU path and the CUDA
     fallback path of `pairwise_r2_matrix()` above - see that function's

@@ -53,11 +53,14 @@ from sklearn.ensemble import RandomForestRegressor
 
 from Preprocess.RF_marker_filtering import select_rf_markers
 from Preprocess.LD_pruning import LD_pruning
-from pipeline_utils import get_active_compute_resources
-from models.interaction_extraction import tree_shap_interactions
+from Preprocess.preprocess_memo import memo_select_markers
+from pipeline_utils import available_memory_bytes, get_active_compute_resources, timed_stage
+from models.interaction_extraction import (
+    tree_shap_interactions, _shap_row_chunk, _SHAP_STREAM_CHUNK_BYTES,
+)
 
 
-def select_markers_for_data_driven_network(train_x, train_y, rf_config):
+def select_markers_for_data_driven_network(train_x, train_y, rf_config, sample_weight=None):
     """Requirement 2: "reuse the trained RF used in the RF filtering" to
     decide which markers feed the data-driven network - i.e. run the exact
     same selection RF_marker_filtering() would (same config, same
@@ -71,6 +74,13 @@ def select_markers_for_data_driven_network(train_x, train_y, rf_config):
     named at the call site, and so a future change to exactly what "reuse
     RF filtering" means only has one place to change.
 
+    Parameters
+    ----------
+    sample_weight : ver4-25, R8 (design blueprint SS2, Stage 6) - optional
+        per-row BLUE-reliability fitting weight, aligned to `train_x`'s
+        own row order - forwarded to `select_rf_markers()` unchanged.
+        `None` (default) is a strict, byte-identical no-op (I11).
+
     Returns
     -------
     (selected_markers, fitted_rf) : (list of str, RandomForestRegressor)
@@ -82,12 +92,59 @@ def select_markers_for_data_driven_network(train_x, train_y, rf_config):
         since a forest fit on the full marker set cannot itself be reused
         for shap_interaction_values() restricted to a narrower column set.
     """
-    selected_markers, fitted_rf, _ = select_rf_markers(train_x, train_y, rf_config)
+    selected_markers, fitted_rf, _ = select_rf_markers(train_x, train_y, rf_config, sample_weight=sample_weight)
     return selected_markers, fitted_rf
 
 
+def _shap_cost_guard(n_rows, n_markers, n_estimators, resources):
+    """Print what the TreeSHAP interaction step of the data-driven merge is
+    about to cost, before the forest is even fitted, and stop it if the user
+    asked for that (ver4-35, R1.h1).
+
+    Why: the exact interaction tensor is ``rows x M_sel x M_sel`` float64 and
+    the time grows with ``rows x trees x M_sel`` (blueprint E2, E7); with a
+    few thousand RF-selected markers it silently reaches many GB / hours.
+    Nothing changes in the computation: ``'warn'`` (the default) only logs,
+    ``'raise'`` stops BEFORE the fit when even the streamed peak (see
+    ``tree_shap_interactions(row_chunk=...)``) would exceed 50 % of the
+    memory still available, ``'off'`` prints nothing.
+
+    Raises ``RuntimeError`` only in ``'raise'`` mode with the threshold
+    exceeded."""
+    mode = str(resources.get('accel_bio_prior_cost_guard', 'warn'))
+    if mode == 'off':
+        return
+    full_bytes = int(n_rows) * int(n_markers) ** 2 * 8
+    chunk = _shap_row_chunk(None, int(n_rows), int(n_markers))
+    streamed = chunk < int(n_rows)
+    peak_bytes = chunk * int(n_markers) ** 2 * 8
+    available = available_memory_bytes()
+    over = available is not None and peak_bytes > 0.5 * available
+    proxy = int(n_rows) * int(n_estimators) * int(n_markers)
+    available_text = f"{available / 1e9:.1f} GB" if available is not None else "unknown"
+    print(f"[bio-prior cost] data-driven merge TreeSHAP: {n_rows} rows x {n_markers} selected "
+          f"markers x {n_estimators} trees (time proxy rows*trees*markers = {proxy:,}); the exact "
+          f"interaction tensor is {full_bytes / 1e9:.2f} GB"
+          + (f", streamed in chunks of {chunk} row(s) so the peak is {peak_bytes / 1e9:.2f} GB"
+             if streamed else "")
+          + f" (available {available_text}); guard={mode}.")
+    if over:
+        print(f"[bio-prior cost] WARNING: the TreeSHAP step needs about {peak_bytes / 1e9:.2f} GB "
+              f"at its peak, over 50% of the {available_text} available. To cut it: lower the "
+              f"merge's rf_filter (fewer selected markers - the tensor grows with their square) "
+              f"or its sample size. (ACCELERATION bio_prior_cost_guard='off' silences this, "
+              f"'raise' stops before the fit.)")
+        if mode == 'raise':
+            raise RuntimeError(
+                f"[bio-prior cost] the data-driven merge's TreeSHAP step would need about "
+                f"{peak_bytes / 1e9:.2f} GB at its peak ({n_rows} rows x {n_markers} markers) "
+                f"against {available_text} available, and bio_prior_cost_guard='raise'. Lower "
+                f"the merge's rf_filter or sample size, or set bio_prior_cost_guard='warn'.")
+
+
 def compute_data_driven_interactions(train_x_selected, train_y, base_rf_config, top_rate,
-                                       n_estimators_override=None, sample_size=50, random_state=40):
+                                       n_estimators_override=None, sample_size=50, random_state=40,
+                                       sample_weight=None):
     """Requirement 2: the SAME pairwise-Shapley-interaction algorithm as
     models/GAT_prior_knowledge.py's own RF+SHAP interaction search
     (fit RF -> shap.TreeExplainer -> shap_interaction_values -> upper
@@ -140,6 +197,12 @@ def compute_data_driven_interactions(train_x_selected, train_y, base_rf_config, 
         comparable against the plain (non-biological-prior) GAT_prior_
         knowledge model's own interaction search run on the same data,
         unless the caller deliberately overrides it.
+    sample_weight : ver4-25, R8 (design blueprint SS2, Stage 6) - optional
+        per-row BLUE-reliability fitting weight, aligned to
+        `train_x_selected`'s own row order. `None` (default) is a strict,
+        byte-identical no-op (I11) - this forest is always CPU/scikit-
+        learn (see the comment above), so no GPU-fallback branch is
+        needed here, unlike `select_rf_markers()`'s own.
 
     Returns
     -------
@@ -174,6 +237,15 @@ def compute_data_driven_interactions(train_x_selected, train_y, base_rf_config, 
     # GPU allocation.
     _resources = get_active_compute_resources()
     n_estimators = n_estimators_override if n_estimators_override is not None else base_rf_config.get('n_estimators', 500)
+    # ver4-35, R1.h1: say what this step costs BEFORE paying for it.
+    _shap_cost_guard(min(sample_size, train_x_selected.shape[0]), len(marker_names),
+                     int(n_estimators), _resources)
+    if _resources.get('accel_merge_shap_device', 'cpu') != 'cpu':
+        # R1.h3: the GPU TreeSHAP route is not part of this release (blueprint
+        # pre-check P10 is open), so the request is acknowledged, not honoured.
+        print(f"[data_driven_prior_network] NOTE: ACCELERATION['merge_shap_device']="
+              f"{_resources.get('accel_merge_shap_device')!r} is accepted but not implemented "
+              f"yet - the TreeSHAP interaction step runs on the CPU (results unaffected).")
     rf = RandomForestRegressor(
         n_estimators=int(n_estimators),
         max_depth=base_rf_config.get('max_depth', None),
@@ -187,7 +259,8 @@ def compute_data_driven_interactions(train_x_selected, train_y, base_rf_config, 
         n_jobs=base_rf_config.get('n_jobs') if base_rf_config.get('n_jobs') is not None
         else _resources['n_jobs'],
     )
-    rf.fit(train_x_selected, train_y)
+    with timed_stage('merge_shap'):     # ver4-35, R1.a (the fit and the SHAP step below add up)
+        rf.fit(train_x_selected, train_y, sample_weight=sample_weight)
 
     # Update ID ver4-5, R2 (blueprint §4.4): from here on, this used to be
     # a private, byte-for-byte copy of models/GAT_prior_knowledge.py's own
@@ -205,10 +278,13 @@ def compute_data_driven_interactions(train_x_selected, train_y, base_rf_config, 
     # networks and every other caller already expect 'marker_1'/'marker_2')
     # completely unchanged.
     sample_n = min(sample_size, train_x_selected.shape[0])
-    pair = tree_shap_interactions(
-        rf, shap.sample(train_x_selected, sample_n), marker_names,
-        n_jobs=_resources['n_jobs'], reduce='sum_then_abs',
-    )
+    # ver4-35, R1.a: the TreeSHAP step as stage 'merge_shap' (the forest fit
+    # just above is the same stage, so it is the merge's whole SHAP cost).
+    with timed_stage('merge_shap'):
+        pair = tree_shap_interactions(
+            rf, shap.sample(train_x_selected, sample_n), marker_names,
+            n_jobs=_resources['n_jobs'], reduce='sum_then_abs',
+        )
     pair = pair.rename(columns={'marker1': 'marker_1', 'marker2': 'marker_2'})
     pair = pair[pair['value'] > 0].reset_index(drop=True)
     n_candidate_pairs = pair.shape[0]
@@ -245,7 +321,7 @@ def compute_data_driven_interactions(train_x_selected, train_y, base_rf_config, 
 
 
 def ensure_bio_prior_merge_cache(model_name, merge_train, merge_valid, merge_test,
-                                  data_driven_merge, network_cache):
+                                  data_driven_merge, network_cache, sample_weight=None):
     """Requirement 11 (efficiency) - PERFORMANCE FIX: this is the one
     piece of logic that decides whether the data-driven merge's two
     expensive steps (LD-pruning-then-RF-filtering, and the pairwise-
@@ -340,6 +416,17 @@ def ensure_bio_prior_merge_cache(model_name, merge_train, merge_valid, merge_tes
         and returns the correct result, it just never stores or reuses
         anything (byte-identical to how the model file's own inline
         version already handled `network_cache=None`).
+    sample_weight : ver4-25, R8 (design blueprint SS2, Stage 6) - optional
+        per-row BLUE-reliability fitting weight, aligned to `merge_train`'s
+        own row order (this task's `id_train` order - the SAME order
+        `merge_train` itself is aligned to, since it is exactly the full/
+        unrestricted marker pool for this task's OWN splits - architecture
+        doc SS8/SS13.4 - never a differently-ordered or differently-
+        membered table). Forwarded to `select_markers_for_data_driven_
+        network()`/`compute_data_driven_interactions()` - blueprint SS2
+        R8's own mechanism table entry for this subsystem. `None`
+        (default - every pre-ver4-25 caller) is a strict, byte-identical
+        no-op (I11).
 
     Returns
     -------
@@ -382,8 +469,11 @@ def ensure_bio_prior_merge_cache(model_name, merge_train, merge_valid, merge_tes
             merge_train_x, _, _ = LD_pruning(
                 merge_train_x, pd.DataFrame(), merge_test.iloc[:, :-1], data_driven_merge['ld_prune']
             )
-        rf_selected_markers, _fitted_rf = select_markers_for_data_driven_network(
-            merge_train_x, merge_train_y, rf_filter_cfg
+        # ver4-33, R1.c: memoised (content-addressed, on disk) so the K model
+        # groups of one task fit this forest once, not K times. `_fitted_rf`
+        # is None on a memo hit - it is unused here.
+        rf_selected_markers, _fitted_rf = memo_select_markers(
+            merge_train_x, merge_train_y, rf_filter_cfg, sample_weight=sample_weight
         )
         print(f"[{model_name}] Data-driven merge: {len(rf_selected_markers)} marker(s) "
               f"selected by RF filtering (out of {merge_train_x.shape[1]} candidate(s)).")
@@ -404,6 +494,7 @@ def ensure_bio_prior_merge_cache(model_name, merge_train, merge_valid, merge_tes
         pair_df = compute_data_driven_interactions(
             merge_train.loc[:, rf_selected_markers], merge_train_y, rf_filter_cfg, top_rate,
             n_estimators_override=data_driven_merge.get('shap_n_estimators_override'),
+            sample_weight=sample_weight,
         )
         print(f"[{model_name}] Data-driven merge: {pair_df.shape[0]} unique pairwise "
               f"interaction(s) kept (top {top_rate}% - see the data_driven_prior_network log "
@@ -411,7 +502,60 @@ def ensure_bio_prior_merge_cache(model_name, merge_train, merge_valid, merge_tes
         if _cache_entry is not None:
             _cache_entry['pair_df'] = pair_df
 
+    # ver4-61, R7: optional cap on the number of data-driven edges handed to
+    # the merge. Applied to the RETURNED view only - the memoised `pair_df`
+    # above stays uncapped, so the cache key semantics are unchanged and a
+    # config with a different `max_edges` can reuse the same cache entry.
+    # Why: the data-driven edges are ~99 % of the merged graph's edges and the
+    # GATv2 edge cost/memory scale with the edge count (blueprint ver4-61 R7).
+    pair_df = _apply_max_edges_cap(pair_df, data_driven_merge.get('max_edges'), model_name)
+
     return rf_selected_markers, pair_df
+
+
+def _apply_max_edges_cap(pair_df, max_edges, model_name='GAT_biological_prior_knowledge'):
+    """Return `pair_df` unchanged, or its `max_edges` strongest rows.
+
+    Pure helper (no cache access). Rows are ranked by `value` descending with
+    ties broken by `marker_1` then `marker_2` (stable sort), so the same
+    input always yields the same kept set regardless of row order (I9).
+
+    Parameters
+    ----------
+    pair_df : pd.DataFrame with columns ['marker_1', 'marker_2', 'value']
+    max_edges : int or None
+        None / absent (legacy) keeps every row. A positive int keeps that many.
+        Anything else (0, negative, non-integer) is ignored with a WARNING.
+    model_name : str
+        Used only as the log prefix.
+
+    Returns
+    -------
+    pd.DataFrame - `pair_df` itself when no cap applies, else a new frame.
+    """
+    if max_edges is None:
+        print(f"[{model_name}] Data-driven merge: max_edges=None (no cap; "
+              f"{pair_df.shape[0]} data-driven edge(s) used).")
+        return pair_df
+    try:
+        cap = int(max_edges)
+    except (TypeError, ValueError):
+        cap = 0
+    if cap <= 0 or isinstance(max_edges, bool):
+        print(f"[{model_name}] WARNING: data_driven_merge['max_edges']={max_edges!r} is not a "
+              f"positive integer - ignored (all {pair_df.shape[0]} data-driven edge(s) kept).")
+        return pair_df
+    if pair_df.shape[0] <= cap:
+        print(f"[{model_name}] Data-driven merge: max_edges={cap} >= {pair_df.shape[0]} "
+              f"available edge(s) - nothing trimmed.")
+        return pair_df
+    ordered = pair_df.sort_values(
+        by=['value', 'marker_1', 'marker_2'], ascending=[False, True, True], kind='mergesort'
+    )
+    kept = ordered.iloc[:cap].reset_index(drop=True)
+    print(f"[{model_name}] Data-driven merge: max_edges={cap} -> kept the {cap} strongest of "
+          f"{pair_df.shape[0]} data-driven edge(s).")
+    return kept
 
 
 def merge_biological_and_data_driven_networks(gene_to_markers, pair_df, rf_selected_markers, marker_info):
@@ -519,7 +663,12 @@ def merge_biological_and_data_driven_networks(gene_to_markers, pair_df, rf_selec
                 bare_marker_names.append(m)
 
     if bare_marker_names:
-        missing_coords = [m for m in bare_marker_names if m not in set(marker_info['name'])]
+        # ver4-61, R1: build the name set ONCE. The legacy expression
+        # `m not in set(marker_info['name'])` rebuilt a set of every .bim
+        # marker name (3.2 M on a PLINK input) for each bare marker (~600),
+        # i.e. ~20 minutes per call. Same membership test, same output.
+        _known_marker_names = set(marker_info['name'])
+        missing_coords = [m for m in bare_marker_names if m not in _known_marker_names]
         if missing_coords:
             raise ValueError(
                 f"{len(missing_coords)} bare marker(s) selected for the data-driven network "

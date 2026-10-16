@@ -12,10 +12,27 @@ from torch_geometric.explain import Explainer, CaptumExplainer
 
 from pipeline_utils import (
     get_active_compute_resources, apply_torch_compute_settings, gpu_slot, dataloader_num_workers,
+    is_lean_search_fit,
 )
+from models.gat_stability import gat_stable
 
 
-def GAT_infinitesimal_node_level(data_train, data_valid, data_test, params):
+@gat_stable('GAT_infinitesimal_node_level')
+def GAT_infinitesimal_node_level(data_train, data_valid, data_test, params, *, sample_weight_ctx=None):
+    # ver4-25, R8 (design blueprint SS2, Stage 6): unlike the other four
+    # GAT variants, this model builds ONE graph for the whole task (train
+    # + valid + test as a single HeteroData object, split via boolean
+    # masks - see the mask construction below), so `_w_fit` cannot be
+    # attached per-graph the same way. Instead it becomes a per-NODE
+    # attribute on the 'pheno' node type (`data['pheno'].w`), aligned to
+    # the SAME `data_train`+`data_valid`+`data_test` concatenation order
+    # every mask below already uses - train positions carry the real
+    # weight, valid/test positions carry a neutral placeholder (1.0) that
+    # is NEVER read (the training loss only ever indexes by
+    # `train_mask`). `None` (every pre-ver4-25 caller) is a byte-
+    # identical `F.mse_loss(...)` - I11.
+    _w_fit = sample_weight_ctx.w_fit if sample_weight_ctx is not None else None
+
     
     if data_valid.shape[0] != 0:
         VALID = True
@@ -31,7 +48,18 @@ def GAT_infinitesimal_node_level(data_train, data_valid, data_test, params):
     heads = params[6]
     samples = params[7]
     marker_effect = params[8]
-    
+
+    # ver4-46, R1: inside a hyperparameter-SEARCH fit that asked for the lean path only the
+    # validation predictions are read. Every pheno node is connected ONLY to its own
+    # marker nodes (the 'affect' / 'self' edges above), so test individuals never touch
+    # the train/valid nodes: leaving them out changes no train or validation output, and
+    # saves building their node types, the HGT test sampling and the full-graph train
+    # pass below. (Not bit-identical to a full-graph fit: the HGT sampler's own random
+    # draws and its neighbour cap `max_neighbors` depend on the node count.)
+    _lean = bool(VALID and is_lean_search_fit())
+    if _lean:
+        data_test = data_test.iloc[:0]
+
     ## Preprocess the data so that it can be converted into a graph format
     data = pd.concat([data_train, data_valid, data_test])
     data_QTL, data_pheno = data.iloc[:,:-1].reset_index(drop=True), data.iloc[:,-1].reset_index(drop=True)
@@ -69,6 +97,16 @@ def GAT_infinitesimal_node_level(data_train, data_valid, data_test, params):
     data['pheno'].train_mask = torch.from_numpy(mask_train).to(torch.bool)
     data['pheno'].valid_mask = torch.from_numpy(mask_valid).to(torch.bool)
     data['pheno'].test_mask = torch.from_numpy(mask_test).to(torch.bool)
+
+    if _w_fit is not None:
+        # ver4-25, R8: real weight for the n_train training nodes,
+        # neutral placeholder (1.0, never read - see this function's own
+        # docstring) for valid/test nodes, in the SAME row order the
+        # masks above already use (train, then valid, then test).
+        w_all = np.concatenate([
+            np.asarray(_w_fit, dtype=float), np.ones(n_valid + n_test, dtype=float),
+        ])
+        data['pheno'].w = torch.from_numpy(w_all).to(torch.float)
     
     ## Define GAT class
     class GAT(torch.nn.Module):
@@ -126,7 +164,21 @@ def GAT_infinitesimal_node_level(data_train, data_valid, data_test, params):
                 with torch.autocast(device_type=device.type, enabled=use_amp):
                     out = model(batch.x_dict, batch.edge_index_dict)
                     mask = batch['pheno'].train_mask
-                    loss = F.mse_loss(out[mask].unsqueeze(-1), batch['pheno'].y[mask])
+                    if _w_fit is None:
+                        loss = F.mse_loss(out[mask].unsqueeze(-1), batch['pheno'].y[mask])
+                    else:
+                        # ver4-25, R8: Sum(w_i*r_i^2)/Sum(w_i) over the
+                        # sampled subgraph's own train-masked nodes -
+                        # HGTLoader carries `data['pheno'].w` forward
+                        # through its own node sampling/relabelling the
+                        # SAME way it already does for `y`/`train_mask`
+                        # (both node-level attributes on the identical
+                        # node type), so `batch['pheno'].w[mask]` is
+                        # aligned to `batch['pheno'].y[mask]` element-
+                        # for-element.
+                        _w_batch = batch['pheno'].w[mask].unsqueeze(-1)
+                        _sq_err = (out[mask].unsqueeze(-1) - batch['pheno'].y[mask]) ** 2
+                        loss = (_sq_err * _w_batch).sum() / _w_batch.sum().clamp_min(1e-12)
                 loss_train_sum += loss.detach()
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
@@ -177,11 +229,12 @@ def GAT_infinitesimal_node_level(data_train, data_valid, data_test, params):
                                      batch_size=bsize,shuffle=False,
                                      input_nodes=('pheno', data['pheno'].valid_mask),
                                      num_workers=_num_workers, pin_memory=_pin_memory)
-        test_loader = HGTLoader(data, 
-                                 num_samples={key:[max_neighbors] * 4 for key in data.node_types},
-                                 batch_size=bsize,shuffle=False,
-                                 input_nodes=('pheno', data['pheno'].test_mask),
-                                 num_workers=_num_workers, pin_memory=_pin_memory)
+        if not _lean:
+            test_loader = HGTLoader(data, 
+                                     num_samples={key:[max_neighbors] * 4 for key in data.node_types},
+                                     batch_size=bsize,shuffle=False,
+                                     input_nodes=('pheno', data['pheno'].test_mask),
+                                     num_workers=_num_workers, pin_memory=_pin_memory)
         ## Train a model
         model = train()
 
@@ -189,18 +242,21 @@ def GAT_infinitesimal_node_level(data_train, data_valid, data_test, params):
         model.eval()
         predicted_test = []
         actual_test = []
-        with torch.no_grad():
-            for test in test_loader:
-                test = test.to(device)
-                result = model(test.x_dict, test.edge_index_dict)
-                predicted_test.append(result[test['pheno'].test_mask].cpu().tolist())
-                actual_test.append([item for sublist in test['pheno'].y[test['pheno'].test_mask].cpu().tolist() for item in sublist])
-        predicted_test = [item for sublist in predicted_test for item in sublist]
-        actual_test = [item for sublist in actual_test for item in sublist]
+        if not _lean:
+            with torch.no_grad():
+                for test in test_loader:
+                    test = test.to(device)
+                    result = model(test.x_dict, test.edge_index_dict)
+                    predicted_test.append(result[test['pheno'].test_mask].cpu().tolist())
+                    actual_test.append([item for sublist in test['pheno'].y[test['pheno'].test_mask].cpu().tolist() for item in sublist])
+            predicted_test = [item for sublist in predicted_test for item in sublist]
+            actual_test = [item for sublist in actual_test for item in sublist]
 
-        ## Calculate the metrics
-        mse = mean_squared_error(actual_test,predicted_test)
-        r = pearsonr(actual_test, predicted_test)[0]
+            ## Calculate the metrics
+            mse = mean_squared_error(actual_test,predicted_test)
+            r = pearsonr(actual_test, predicted_test)[0]
+        else:
+            mse = r = float('nan')   # not read by a search fit
 
         ## Store prediction result for the validation data
         predicted_valid = []
@@ -218,12 +274,13 @@ def GAT_infinitesimal_node_level(data_train, data_valid, data_test, params):
         ## Store prediction result for the train data
         predicted_train = []
         actual_train = []
-        with torch.no_grad():
-            result = model(data.x_dict, data.edge_index_dict)
-        predicted_train.append(result[data['pheno'].train_mask].cpu().tolist())
-        actual_train.append([item for sublist in data['pheno'].y[data['pheno'].train_mask].cpu().tolist() for item in sublist])
-        predicted_train = [k for i in predicted_train for k in i]
-        actual_train = [k for i in actual_train for k in i]
+        if not _lean:
+            with torch.no_grad():
+                result = model(data.x_dict, data.edge_index_dict)
+            predicted_train.append(result[data['pheno'].train_mask].cpu().tolist())
+            actual_train.append([item for sublist in data['pheno'].y[data['pheno'].train_mask].cpu().tolist() for item in sublist])
+            predicted_train = [k for i in predicted_train for k in i]
+            actual_train = [k for i in actual_train for k in i]
 
         ## Extract marker effects
         if marker_effect == True:

@@ -94,6 +94,14 @@ INTERACTION_ARTEFACT = {
 # models - it needs the R/BGLR toolchain, which this dict deliberately
 # does not model, since that check already happens elsewhere via
 # configure_r_environment()/rpy2 itself, not an importable Python package).
+#
+# Update ID ver4-12, R13: 'asreml' (Preprocess/asreml_blup.py's Step 6b
+# stage) is deliberately NOT added here either, for a related but distinct
+# reason - it is not a MODEL at all (it does not appear in MODEL/MODEL_RUN),
+# and it is not merely an importable Python package (it is a licensed R
+# package requiring per-machine activation on top of installation) - see
+# Preprocess/asreml_license.py's own module docstring for where that fact
+# is owned instead.
 OPTIONAL_DEPENDENCY = {
     'XGBoost': 'xgboost',
     'EBM': 'interpret',
@@ -266,6 +274,32 @@ def is_available(base_name) -> bool:
     return _AVAILABILITY_CACHE[package]
 
 
+def is_installed(base_name) -> bool:
+    """Cheap, GUI-rendering sibling of ``is_available()``: True if `base_name` has no optional
+    dependency, or that dependency is INSTALLED (``importlib.util.find_spec`` - located on the
+    path, never imported/executed). ``is_available()`` really imports the package; for
+    ``xgboost`` and especially ``interpret`` (EBM) that is several seconds of cold-import time -
+    far longer on a shared HPC filesystem - and the GUI used to pay it on EVERY launch just to
+    decide whether to draw a checkbox. The GUI therefore draws the picker from this function and
+    only does the full ``is_available()`` import probe when a Run is started (and ``GP()`` still
+    runs its own ``is_available()`` preflight before task 0, unchanged), so a package that is
+    installed but cannot actually be imported is still caught before any model is fitted.
+    NEVER RAISES. Cached per package name for the life of the process."""
+    package = optional_dependency_for(base_name)
+    if package is None:
+        return True
+    if package not in _INSTALLED_CACHE:
+        try:
+            import importlib.util
+            _INSTALLED_CACHE[package] = importlib.util.find_spec(package) is not None
+        except Exception:
+            _INSTALLED_CACHE[package] = False
+    return _INSTALLED_CACHE[package]
+
+
+_INSTALLED_CACHE: "dict[str, bool]" = {}
+
+
 def known_models():
     """Every base model name this registry currently knows about, in
     INTERACTION_ARTEFACT's own insertion order - lets a caller iterate the
@@ -293,3 +327,206 @@ def model_family(base_name) -> str:
     safe to call from plotting code with whatever model name a run's own
     Weight.csv happens to contain, however that name got there."""
     return 'conventional' if _normalise(base_name) in CONVENTIONAL_MODELS else 'machine_learning'
+
+
+# ---------------------------------------------------------------------------
+# ver4-98 (X04; the class map of the ver4-91 P3 design): the architecture class of a model, so
+# that reports can add up weights per class instead of quoting raw weights among near-duplicates
+# (ver4-69: BayesB 0.94 vs rrBLUP 0 at equal out-of-fold r). Additive and pure: nothing in the
+# engine reads it, so no run changes. `bio_prior` is its own class because that model reads a
+# different information source (I6).
+# ---------------------------------------------------------------------------
+MODEL_CLASS = {
+    'rrBLUP': 'additive', 'GBLUP': 'additive',
+    'BayesB': 'sparse',
+    'RKHS': 'kernel', 'SVR': 'kernel',
+    'RF': 'tree', 'ExtraTrees': 'tree', 'GBDT': 'tree', 'XGBoost': 'tree', 'EBM': 'tree',
+    'KNN': 'local',
+    'MLP': 'neural',
+    'GAT_infinitesimal': 'graph', 'GAT_infinitesimal_node_level': 'graph',
+    'GAT_fully_connected': 'graph', 'GAT_prior_knowledge': 'graph',
+    'GAT_biological_prior_knowledge': 'bio_prior',
+}
+
+
+def model_class(label) -> str:
+    """Architecture class of a model label (`MODEL_CLASS`). A tuning-algorithm suffix
+    (``RF__Grid``) and a bio-prior instance suffix (``..._2``) are stripped first; a name this
+    registry has never seen is ``'other'``. Never raises on a string; None raises like the rest
+    of this module."""
+    base = _lane_schema_key(_normalise(label).split('__', 1)[0])
+    return MODEL_CLASS.get(base, 'other')
+
+
+# ---------------------------------------------------------------------------
+# ver4-102 (D01 / R2; the model-class coverage guidance of the ver4-72 and ver4-77 findings).
+# Pure and additive: nothing here changes a result, `GP()` only PRINTS the note. Three groups of
+# classes, each of which a model list should cover with at least one member:
+#   sparse        - BayesB. A sparse member is what an oligogenic trait needs; ver4-72 measured
+#                   +0.007 / +0.047 / +0.019 r (polygenic / oligogenic / epistatic, small
+#                   simulation, 4 models + an elastic net vs 4 models) from adding one.
+#   smooth        - 'additive' (rrBLUP, GBLUP) or 'kernel' (RKHS, SVR): the polygenic backbone.
+#   nonlinear     - 'tree' (RF, ExtraTrees, GBDT, XGBoost, EBM) or 'local' (KNN): interactions.
+# Neural, graph and bio_prior members are never required. The measured gains are simulation
+# evidence, not real-data confirmation (catalogue V03), and the Super learner down-weights a
+# member that does not help, so a missing class is advice, not an error.
+# ---------------------------------------------------------------------------
+CLASS_COVERAGE_GROUPS = {
+    'sparse': ('sparse',),
+    'smooth': ('additive', 'kernel'),
+    'nonlinear': ('tree', 'local'),
+}
+#: One example model per group, in the order a user would be advised to add them.
+CLASS_COVERAGE_EXAMPLES = {'sparse': 'BayesB', 'smooth': 'rrBLUP or GBLUP', 'nonlinear': 'RF or KNN'}
+
+
+def class_coverage(models) -> dict:
+    """Which `CLASS_COVERAGE_GROUPS` a list of model labels covers.
+
+    `models` is any iterable of labels (tuning and instance suffixes are handled by
+    `model_class`; the label ``'ensemble'`` is ignored). Returns ``{'covered': [...], 'missing':
+    [...], 'n_models': int}`` with group names in the order of `CLASS_COVERAGE_GROUPS`. Never
+    raises on strings; an empty list covers nothing."""
+    classes = {model_class(m) for m in models if str(m) != 'ensemble'}
+    covered, missing = [], []
+    for group, members in CLASS_COVERAGE_GROUPS.items():
+        (covered if classes.intersection(members) else missing).append(group)
+    return {'covered': covered, 'missing': missing,
+            'n_models': len([m for m in models if str(m) != 'ensemble'])}
+
+
+def class_coverage_note(models):
+    """The one-line guidance `GP()` prints, or None when nothing is worth saying (fewer than two
+    models, or every group covered)."""
+    info = class_coverage(models)
+    if info['n_models'] < 2 or not info['missing']:
+        return None
+    advice = '; '.join(f"{g}: add {CLASS_COVERAGE_EXAMPLES[g]}" for g in info['missing'])
+    return (f"model-class coverage - the model list has no member from the "
+            f"{', '.join(info['missing'])} group(s) ({advice}). In simulation, adding a missing "
+            f"class to a naive ensemble raised r by up to 0.05 (measured for the sparse "
+            f"class); the Super learner weights a useless member down. Guidance only - nothing "
+            f"is changed. Not confirmed on real data.")
+
+
+# ---------------------------------------------------------------------------
+# ver4-35, R1.f - asynchronous model lane: which models may be fitted in the
+# lane worker, and which process-global random streams each model consumes.
+#
+# Why this exists: the lane (async_lane.py) fits a lane-capable model in a
+# second process while the parent fits CPU models. A fit's result depends on
+# the process-global random streams (torch / numpy / python `random`) it draws
+# from, and the legacy serial run feeds them to the models in MODEL_RUN
+# order. The lane can only reproduce that order exactly if no model that runs
+# in the PARENT draws from a stream a lane model also draws from - so the
+# planner (``async_lane.plan_lane_chains``) needs to know, per model, which
+# streams are consumed. Both tables live here (zero project imports, I2) so
+# every consumer reads one authority.
+# ---------------------------------------------------------------------------
+
+#: Base (schema-key) model names the lane may fit. Start: the bio-prior GAT
+#: only. Extend ONLY after blueprint check P5 (``ModelTrialRunner(...)`` equals
+#: the main-dispatch call, all seven outputs ``DataFrame.equals``) passes for
+#: the model on a real run - MLP and the other GAT variants are candidates.
+LANE_CAPABLE = frozenset({'GAT_biological_prior_knowledge'})
+
+#: Base model name -> frozenset of global random streams the model draws from
+#: ('torch', 'numpy', 'random').
+#:
+#: Source: static census of this tree (blueprint check P6 is the RUNTIME
+#: census - digests before/after each model on a real serial CPU run - and is
+#: still open; see the ver4-35 Change Summary). Findings:
+#:   * the MLP and every GAT variant draw from the torch CPU stream (weight
+#:     init, dropout, DataLoader shuffling);
+#:   * every scikit-learn / gradient-boosting model, the R models' Python-side
+#:     surrogates and the bio-prior merge pass an explicit ``random_state``
+#:     (``0``/``40``) or a seeded ``default_rng``, so they leave the global
+#:     streams alone;
+#:   * RKHS / SVR / KNN can explain through ``shap.KernelExplainer`` /
+#:     ``shapiq`` whose sampling is not proven seed-free, so they are marked
+#:     'numpy' (conservative; irrelevant while no lane model uses numpy).
+#: A model ABSENT from this table is "unknown" and is treated by the planner
+#: as consuming every stream a lane model consumes (never assumed safe).
+GLOBAL_RNG_STREAMS = {
+    'rrBLUP': frozenset(),
+    'GBLUP': frozenset(),
+    'BayesB': frozenset(),
+    'RKHS': frozenset({'numpy'}),
+    'RF': frozenset(),
+    'ExtraTrees': frozenset(),
+    'GBDT': frozenset(),
+    'XGBoost': frozenset(),
+    'EBM': frozenset(),
+    'SVR': frozenset({'numpy'}),
+    'KNN': frozenset({'numpy'}),
+    'MLP': frozenset({'torch'}),
+    'GAT_infinitesimal': frozenset({'torch'}),
+    'GAT_infinitesimal_node_level': frozenset({'torch'}),
+    'GAT_fully_connected': frozenset({'torch'}),
+    'GAT_prior_knowledge': frozenset({'torch'}),
+    'GAT_biological_prior_knowledge': frozenset({'torch'}),
+}
+
+
+def _lane_schema_key(name) -> str:
+    """Strip a bio-prior instance suffix (``..._2``) - the same rule as
+    ``models.hyperparameter_tuning.schema_key_of`` (not imported: this module
+    has zero project imports, I2). Tuning-algorithm suffixes (``__Grid``) must
+    already be removed by the caller (``base_of``)."""
+    text = _normalise(name)
+    prefix = 'GAT_biological_prior_knowledge_'
+    if text.startswith(prefix) and text[len(prefix):].isdigit():
+        return 'GAT_biological_prior_knowledge'
+    return text
+
+
+def lane_capable(name) -> bool:
+    """True if model `name` (a base name, bio-prior instance suffix allowed)
+    may be fitted by the asynchronous lane. Unregistered names are not
+    lane-capable, never an error."""
+    return _lane_schema_key(name) in LANE_CAPABLE
+
+
+def global_rng_streams(name):
+    """The global random streams model `name` draws from, as a frozenset, or
+    ``None`` when the model is not in :data:`GLOBAL_RNG_STREAMS` (unknown -
+    the caller must treat it conservatively)."""
+    return GLOBAL_RNG_STREAMS.get(_lane_schema_key(name))
+
+
+# ---------------------------------------------------------------------------
+# ver4-36, R1.c / R1.d - joint-search speed levers: which models may be fitted
+# with a 1-row `test` stub during the joint SEARCH, and which have an exact
+# closed-form kernel search engine.
+#
+# Why this lives here (I3): `models/joint_tuning.py` must not keep a second list
+# of "which models are BGLR-style". Both tables are plain frozensets (zero
+# project imports, I2) read through the accessors below.
+# ---------------------------------------------------------------------------
+
+#: Models whose R function runs `rbind(train, valid, test)`, masks valid + test
+#: and fits over every row, while the joint search only reads
+#: ``predicted_valid`` - so a search fit may be given ``test.iloc[:1]`` instead
+#: of the whole test frame (R1.c). Confirm fits always get the full test frame.
+SEARCH_TEST_STUB_SAFE = frozenset({'rrBLUP', 'GBLUP', 'BayesB', 'RKHS'})
+
+#: Models whose joint-SEARCH fit can be replaced by an exact Gaussian-process
+#: posterior mean (closed form, milliseconds) - BRR (rrBLUP) and BGLR-RKHS
+#: (R1.d). BayesB has no closed form and GBLUP is deliberately left out (its
+#: kernel is built elsewhere); the confirm fit is always the real BGLR fit.
+EXACT_KERNEL_SEARCH_MODELS = frozenset({'rrBLUP', 'RKHS'})
+
+
+def search_test_stub_safe(base_name) -> bool:
+    """True if a joint-search fit of model `base_name` (a base name; a
+    bio-prior instance suffix is irrelevant because no bio-prior model is in the
+    set) may be handed a 1-row `test` frame. Unregistered names are not safe,
+    never an error."""
+    return _normalise(base_name) in SEARCH_TEST_STUB_SAFE
+
+
+def exact_kernel_search_capable(base_name) -> bool:
+    """True if model `base_name` has an exact closed-form joint-search engine
+    (``models.kernel_effects.exact_kernel_column``). Unregistered names are not
+    capable, never an error."""
+    return _normalise(base_name) in EXACT_KERNEL_SEARCH_MODELS

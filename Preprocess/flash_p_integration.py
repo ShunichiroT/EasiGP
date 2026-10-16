@@ -241,7 +241,8 @@ def _propagate_streamlit_ctx(thread):
 
 def _run_claude_headless(prompt, cwd, claude_binary='claude', permission_mode='dontAsk',
                           allowed_tools=DEFAULT_ALLOWED_TOOLS, model=None, timeout_seconds=3600,
-                          extra_env=None, resume_session_id=None, log_callback=None):
+                          extra_env=None, resume_session_id=None, log_callback=None,
+                          extra_args=None):
     """Invoke Claude Code non-interactively (`claude -p ...`, Claude Code's
     documented headless mode) with `prompt`, from working directory `cwd`.
     Returns an object with the same .returncode/.stdout/.stderr interface
@@ -304,6 +305,13 @@ def _run_claude_headless(prompt, cwd, claude_binary='claude', permission_mode='d
         limit (see _summarize_rate_limit) - without repeating, and paying
         for, the work already done.
 
+    extra_args : sequence of str, optional
+        Extra command-line arguments appended verbatim after the standard ones
+        (e.g. the token-saving flags `--tools WebSearch --system-prompt ...
+        --disable-slash-commands` that Preprocess.gene_location_agent uses for
+        its lean lookups). None (default) = the command line is exactly what it
+        was before this parameter existed, so FLASH-P runs are unaffected.
+
     log_callback : callable(str), optional
         If given, switches this call from the default single-shot
         `--output-format json` (silent until the whole run finishes, then
@@ -348,6 +356,8 @@ def _run_claude_headless(prompt, cwd, claude_binary='claude', permission_mode='d
         cmd += ['--resume', resume_session_id]
     if model:
         cmd += ['--model', model]
+    if extra_args:
+        cmd += [str(a) for a in extra_args]
 
     env = os.environ.copy()
     if permission_mode == 'auto':

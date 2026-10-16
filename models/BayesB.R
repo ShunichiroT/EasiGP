@@ -3,8 +3,29 @@ library(stringr)
 library(data.table)
 library(dplyr)
 
+# Bug fix (Requirement.md follow-up to CHANGE_NOTES.md) - see rrBLUP.R's
+# identical helper for the full root-cause explanation: BGLR's Gibbs
+# sampler draws from R's global RNG, and this file never fixed it, so two
+# calls with identical data/hyperparameters (a re-evaluated search
+# candidate, or the final confirmatory fit vs. whatever earned that
+# candidate its validation-time "win") are independent MCMC draws rather
+# than reproductions of each other - noise the search-space/selection-rule
+# fixes in models/hyperparameter_tuning.py cannot catch, because they
+# operate one level above the model's own reproducibility. Seeding from the
+# data being fit (never the hyperparameters) both restores reproducibility
+# and gives every candidate scored against the SAME data a shared MCMC
+# starting point ("common random numbers"), so a difference in validation
+# score reflects probIn/counts/nIter/burnIn actually changing something,
+# not which candidate got MCMC-lucky.
+.bglr_seed <- function(y, X) {
+  y_obs <- y[is.finite(y)]
+  basis <- length(y) * 2654435761 + length(y_obs) * 40503 +
+    sum(y_obs) * 97 + sum(y_obs^2) + ncol(X) * 15487469 + nrow(X)
+  as.integer(abs(basis) %% 2147483397) + 1L
+}
 
-BayesB <- function(train, valid, test, params, RESULT_NAME){
+
+BayesB <- function(train, valid, test, params, RESULT_NAME, weights = NULL){
   
   params <- unlist(params)
   nIter <- as.numeric(params[1])
@@ -44,8 +65,18 @@ BayesB <- function(train, valid, test, params, RESULT_NAME){
   y_test <- y
   y_test[(nrow(data)-(nrow(valid)+nrow(test))+1):nrow(data)] <- NA
   
+  # Bug fix (see module-level comment above): deterministic, data-derived
+  # seed immediately before the fit.
+  set.seed(.bglr_seed(y_test, X))
+  # ver4-25, R8 - see rrBLUP.R's identical comment.
+  if (is.null(weights)) {
+    w_full <- rep(1, nrow(data))
+  } else {
+    w_full <- c(sqrt(as.numeric(unlist(weights))), rep(1, nrow(valid) + nrow(test)))
+  }
   fm <- BGLR(y=y_test,ETA=list(mrk=list(X=X,model='BayesB',probIn=probIn,counts=counts)),
-             nIter=nIter,burnIn=burnIn,verbose=FALSE,saveAt=paste(bglr_output_dir,'/bayes_',run_id,'_', sep = ""))
+             nIter=nIter,burnIn=burnIn,verbose=FALSE,weights=w_full,
+             saveAt=paste(bglr_output_dir,'/bayes_',run_id,'_', sep = ""))
   
   y_predicted <- fm$yHat[(nrow(data)-nrow(test)+1):nrow(data)]
   y_actual <- y[(nrow(data)-nrow(test)+1):nrow(data)]

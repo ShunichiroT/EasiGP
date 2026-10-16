@@ -44,6 +44,7 @@ from typing import Iterator, List, Optional
 import pandas as pd
 
 import checkpoint_utils as _ckpt
+from interaction_reduce import PairSumStore as _PairSumStore  # pure NumPy/pandas, no project imports
 
 # Update ID ver4-9, R7: the same three exception types
 # checkpoint_utils._INCOMPLETE_FILE_ERRORS bundles - a genuinely
@@ -54,6 +55,15 @@ import checkpoint_utils as _ckpt
 # note for the full rationale and the Stage 8 blocking check that
 # confirmed which exception each failure mode actually raises.
 _INCOMPLETE_FILE_ERRORS = (pd.errors.EmptyDataError, EOFError, gzip.BadGzipFile)
+
+# Requirements.md items 1-3: the option-distinguishing column a multi-option
+# ASReml run (BLUEs / BLUPs without GRM / BLUPs with GRM) writes as the FIRST
+# column of every result file. Kept as a literal here (this module imports
+# only checkpoint_utils) - strategy_results.OPTION_COLUMN /
+# asreml_syntax.STRATEGY_COLUMN are the authorities and a unit test asserts
+# the three stay equal. A file WITHOUT the column (single-option / non-ASReml
+# run) is read exactly as before (I11).
+OPTION_COLUMN = 'asreml_option'
 
 
 def _open_text(path: str, mode: str = 'r'):
@@ -151,6 +161,26 @@ def load_combined(result_name: str, key: str) -> "pd.DataFrame":
         return pd.DataFrame()
 
 
+def _usecols_keeping_option(usecols):
+    """`usecols` in a form `pd.read_csv` accepts that ALSO keeps
+    `OPTION_COLUMN` when the file has it (a callable, so a file without the
+    column - every single-option run - is unaffected and pandas never
+    raises for the 'missing' column). `None` stays `None` (read everything)."""
+    if usecols is None:
+        return None
+    wanted = set(usecols) | {OPTION_COLUMN}
+    return lambda c: c in wanted
+
+
+def _select_option(frame: "pd.DataFrame", option: "Optional[str]") -> "pd.DataFrame":
+    """Rows of `frame` for `option`, `OPTION_COLUMN` dropped, index reset -
+    the frame a single-option run would have produced. `option=None` or a
+    frame without the column -> returned untouched."""
+    if option is None or OPTION_COLUMN not in frame.columns:
+        return frame
+    return frame.loc[frame[OPTION_COLUMN] == option].drop(columns=[OPTION_COLUMN]).reset_index(drop=True)
+
+
 # --------------------------------------------------------------------------
 # Pass 1 - header union
 # --------------------------------------------------------------------------
@@ -246,7 +276,10 @@ def _merge_rows(result_name: str, key: str, batch_ids: "list[int]", out_file,
     byte-identical output to before."""
     full_union = header_union(result_name, key, batch_ids)
     if usecols is not None:
-        wanted = set(usecols)
+        # The option column (multi-option runs) always survives a projection
+        # so a reader can filter on it afterwards - it is absent from
+        # `full_union` for single-option runs, so this is a no-op there.
+        wanted = set(usecols) | {OPTION_COLUMN}
         union = [c for c in full_union if c in wanted]
     else:
         union = full_union
@@ -389,7 +422,7 @@ def iter_batch_frames(result_name: str, key: str, batch_ids: "list[int]",
         if path is None:
             continue
         try:
-            frame = pd.read_csv(path, usecols=usecols)
+            frame = pd.read_csv(path, usecols=_usecols_keeping_option(usecols))
         except _INCOMPLETE_FILE_ERRORS:
             continue
         if frame.shape[0] == 0:
@@ -467,10 +500,27 @@ _AGGREGATE_CHUNK_ROWS = 1_000_000
 # is what makes this collapse safe.
 _MARKER_PAIR_GROUP_COLS = ['population', 'model', 'phenotype', 'marker1', 'marker2']
 
+# ver4-25 R12 (Stage 9): the k>=3 analog of `_MARKER_PAIR_GROUP_COLS` above,
+# used by `aggregate_marker_set_sums()`/`ResultSet.interactions_hok_grouped()`
+# to reduce `Interaction_higher_order.csv` the same bounded-memory way. 'order'
+# is part of the key (not just 'markers') so that two distinct k values never
+# collapse into one group even in the pathological case where their 'markers'
+# strings happened to coincide - they can't in practice (a k=3 tuple's
+# ';'-joined string always has two more names than a k=2 pair's would if it
+# were ever stored here, which it isn't - see `_split_interaction_by_order()`),
+# but keying on 'order' explicitly costs nothing and removes the assumption.
+# 'ratio'/'sample' are absent for the same reason they're absent from
+# `_MARKER_PAIR_GROUP_COLS`: circos_plot.py's hub-and-spoke rendering only
+# ever needs the per-(population, model, phenotype, order, markers) AVERAGE
+# across replicates, never the individual raw rows.
+_MARKER_SET_GROUP_COLS = ['population', 'model', 'phenotype', 'order', 'markers']
+
 
 def _iter_key_row_chunks(result_name: str, key: str, source: str,
                           batch_ids: "list[int] | None", usecols: "list[str]",
-                          chunksize: int = _AGGREGATE_CHUNK_ROWS) -> Iterator["pd.DataFrame"]:
+                          chunksize: int = _AGGREGATE_CHUNK_ROWS,
+                          option: "Optional[str]" = None,
+                          dtype: "Optional[dict]" = None) -> Iterator["pd.DataFrame"]:
     """Yield up-to-`chunksize`-row pieces of `key`'s file(s) - the combined
     file (`source='combined'`) or every batch's own file in turn
     (`source='batches'`) - never holding more than one chunk resident at a
@@ -481,7 +531,12 @@ def _iter_key_row_chunks(result_name: str, key: str, source: str,
     truncated/corrupt contributes nothing and is silently skipped - the
     same "nothing usable here" handling `_read_key()`/`iter_batch_frames()`
     already give these cases, just applied per-chunk rather than to a
-    single whole-file read."""
+    single whole-file read.
+
+    `option` (multi-option runs): only that option's rows are yielded, with
+    `OPTION_COLUMN` dropped. `option=None` on a file that HAS the column
+    yields it untouched (the aggregators then group on it, so options are
+    never silently merged)."""
     if source == 'combined':
         path = _resolve_combined_path(result_name, key)
         paths = [path] if path is not None else []
@@ -490,11 +545,13 @@ def _iter_key_row_chunks(result_name: str, key: str, source: str,
 
     for path in paths:
         try:
-            reader = pd.read_csv(path, usecols=usecols, chunksize=chunksize)
+            reader = pd.read_csv(path, usecols=_usecols_keeping_option(usecols), chunksize=chunksize,
+                                 dtype=dtype)
         except _INCOMPLETE_FILE_ERRORS:
             continue
         try:
             for chunk in reader:
+                chunk = _select_option(chunk, option)
                 if chunk.shape[0]:
                     yield chunk
         except _INCOMPLETE_FILE_ERRORS:
@@ -509,7 +566,8 @@ def _iter_key_row_chunks(result_name: str, key: str, source: str,
 
 def aggregate_marker_pair_sums(result_name: str, key: str, source: str,
                                 batch_ids: "list[int] | None" = None,
-                                chunksize: int = _AGGREGATE_CHUNK_ROWS) -> "pd.DataFrame":
+                                chunksize: int = _AGGREGATE_CHUNK_ROWS,
+                                option: "Optional[str]" = None) -> "pd.DataFrame":
     """Memory-bounded replacement for reading the FULL `interactions()`/
     `attention()` table when all a caller ultimately needs is the same
     per-(population, model, phenotype, marker1, marker2) mean
@@ -602,11 +660,14 @@ def aggregate_marker_pair_sums(result_name: str, key: str, source: str,
     as ver4-10's own docstring describes for its analogous fix."""
     usecols = _MARKER_PAIR_GROUP_COLS + ['value']
     parts = []
-    for chunk in _iter_key_row_chunks(result_name, key, source, batch_ids, usecols, chunksize):
+    group_cols = list(_MARKER_PAIR_GROUP_COLS)
+    for chunk in _iter_key_row_chunks(result_name, key, source, batch_ids, usecols, chunksize, option=option):
         chunk = chunk[(chunk['marker1'] != 'factor') & (chunk['marker2'] != 'factor')]
         if chunk.shape[0] == 0:
             continue
-        part = chunk.groupby(_MARKER_PAIR_GROUP_COLS, as_index=False)['value'].agg(
+        # option=None on a multi-option file: keep the options apart.
+        group_cols = ([OPTION_COLUMN] if OPTION_COLUMN in chunk.columns else []) + list(_MARKER_PAIR_GROUP_COLS)
+        part = chunk.groupby(group_cols, as_index=False)['value'].agg(
             value_sum='sum', value_count='count'
         )
         parts.append(part)
@@ -617,7 +678,100 @@ def aggregate_marker_pair_sums(result_name: str, key: str, source: str,
     # once per chunk (see the ver4-11 note above) - identical arithmetic,
     # paid once instead of `len(parts)` times.
     return (pd.concat(parts, ignore_index=True)
-              .groupby(_MARKER_PAIR_GROUP_COLS, as_index=False)[['value_sum', 'value_count']].sum())
+              .groupby(group_cols, as_index=False)[['value_sum', 'value_count']].sum())
+
+
+def aggregate_marker_pair_store(result_name: str, key: str, source: str,
+                                batch_ids: "list[int] | None" = None,
+                                chunksize: int = _AGGREGATE_CHUNK_ROWS,
+                                option: "Optional[str]" = None) -> "_PairSumStore":
+    """Update ID circos-oom-fix (OOM fix, circos step): the memory-bounded successor
+    of `aggregate_marker_pair_sums()` for `ResultSet.interactions_grouped()` /
+    `attention_grouped()`.
+
+    `aggregate_marker_pair_sums()` returns ONE DataFrame with a row per
+    distinct (population, model, phenotype, marker1, marker2) group and five
+    object (Python string) key columns. With several interaction-emitting
+    models and `interaction_top='all'` that group count G reaches hundreds of
+    millions, and the table - ~150-300 bytes per group, then copied several
+    times by circos_plot() and pickled into every worker - is what exhausted
+    even 900 GB.
+
+    This streams the same chunks (`_iter_key_row_chunks()`), reads the two
+    high-cardinality marker columns as pandas 'category' (so no per-row Python
+    string is ever built), and folds each chunk into an
+    `interaction_reduce.PairSumStore`: dictionary-coded 24-byte groups, a
+    hash-factorize + bincount reduction, amortised-linear compaction and an
+    automatic spill-to-disk past a resident-row budget. The sums/counts are
+    the same numbers `aggregate_marker_pair_sums()` produces (same 'factor'
+    filter, same per-group sum and non-NaN count; division still happens once,
+    at the very end, inside `PairSumStore.reduce_groups()`), and
+    `order_mode='sorted'` reproduces the model order the old, groupby-sorted
+    frame gave. `circos_plot()` consumes the store directly and applies its
+    top-N%/top-M selection per key on the numeric arrays - see
+    `circos_plot._precompute_interaction_groups()`.
+
+    Returns an (possibly empty) `PairSumStore`; `store.to_frame()` gives the
+    old DataFrame shape for small tables / tests.
+    """
+    usecols = _MARKER_PAIR_GROUP_COLS + ['value']
+    store = _PairSumStore(order_mode='sorted')
+    dtype = {'marker1': 'category', 'marker2': 'category'}
+    for chunk in _iter_key_row_chunks(result_name, key, source, batch_ids, usecols, chunksize,
+                                      option=option, dtype=dtype):
+        store.ingest(chunk)
+    return store
+
+
+def aggregate_marker_set_sums(result_name: str, key: str, source: str,
+                               batch_ids: "list[int] | None" = None,
+                               chunksize: int = _AGGREGATE_CHUNK_ROWS,
+                               option: "Optional[str]" = None) -> "pd.DataFrame":
+    """ver4-25 R12 (Stage 9): `aggregate_marker_pair_sums()`'s k>=3 analog -
+    the same memory-bounded, streamed, chunk-then-combine-once reduction
+    (see that function's own docstring for the full ver4-11 rationale,
+    which applies here unchanged), but over `Interaction_higher_order.csv`
+    (key='interactions_hok') grouped by `_MARKER_SET_GROUP_COLS` (which
+    includes 'order' and the ';'-joined 'markers' string in place of
+    'marker1'/'marker2') instead of `_MARKER_PAIR_GROUP_COLS`.
+
+    No 'factor'-sentinel-row filter is applied here, unlike
+    `aggregate_marker_pair_sums()`: that filter exists specifically because
+    a `marker1`/`marker2` pair can legitimately be a (marker, 'factor')
+    row emitted by certain models' own pairwise routes, and
+    `circos_plot.interaction()` has always dropped those before plotting.
+    `_split_interaction_by_order()` (genomic_prediction.py) never emits a
+    'factor' sentinel into the k>=3 accumulator - every row it produces
+    for `interactions_hok` came from an actual order>=3 coalition drawn by
+    a shapiq-based route - so there is nothing analogous to filter out.
+
+    Returns SUM and COUNT (not the finalised mean), for the identical
+    reason `aggregate_marker_pair_sums()` does: `circos_plot.py`'s own
+    across-population/across-relabelled-scenario combining has to happen
+    before the final division, not here.
+
+    Columns: `_MARKER_SET_GROUP_COLS` + ['value_sum', 'value_count'].
+    Empty (but correctly-columned) when `key`'s file(s) contribute zero
+    usable rows (e.g. no model was ever run with a shapiq-based
+    interaction method AND an order>=3 request, so
+    Interaction_higher_order.csv was never written for this run at all -
+    see `checkpoint_utils.static_write_flags_for()`'s `'interactions_hok'`
+    flag)."""
+    usecols = _MARKER_SET_GROUP_COLS + ['value']
+    parts = []
+    group_cols = list(_MARKER_SET_GROUP_COLS)
+    for chunk in _iter_key_row_chunks(result_name, key, source, batch_ids, usecols, chunksize, option=option):
+        if chunk.shape[0] == 0:
+            continue
+        group_cols = ([OPTION_COLUMN] if OPTION_COLUMN in chunk.columns else []) + list(_MARKER_SET_GROUP_COLS)
+        part = chunk.groupby(group_cols, as_index=False)['value'].agg(
+            value_sum='sum', value_count='count'
+        )
+        parts.append(part)
+    if not parts:
+        return pd.DataFrame(columns=_MARKER_SET_GROUP_COLS + ['value_sum', 'value_count'])
+    return (pd.concat(parts, ignore_index=True)
+              .groupby(group_cols, as_index=False)[['value_sum', 'value_count']].sum())
 
 
 # --------------------------------------------------------------------------
@@ -635,7 +789,14 @@ def aggregate_marker_pair_sums(result_name: str, key: str, source: str,
 # 'Nelder-Mead' used elsewhere as a *prediction* column name - naming
 # inconsistencies that are load-bearing and therefore never "corrected"
 # opportunistically (I: naming).
-_WOPT_LABEL_PREFIXES = ('Linear transformation', 'Nelder Mead', 'Bayesian optimisation', 'Analytic least-squares')
+# ver4-26, R2/R_last item 5: 'Joint Bayesian optimisation' appended - see
+# pipeline_utils.py's own identical constant/comment.
+# ver4-57, R2: 'Iterative ensemble' appended - the opt-in iterative ensemble's own label.
+# ver4-77, R2: 'Super learner' appended - the opt-in Super learner's own label.
+_WOPT_LABEL_PREFIXES = (
+    'Linear transformation', 'Nelder Mead', 'Bayesian optimisation', 'Analytic least-squares',
+    'Joint Bayesian optimisation', 'Iterative ensemble', 'Super learner',
+)
 
 # Default per-key projections, applied by _read_key() on BOTH source='combined'
 # AND source='batches' whenever a caller doesn't pass its own usecols (R2.2) -
@@ -660,6 +821,11 @@ _WOPT_LABEL_PREFIXES = ('Linear transformation', 'Nelder Mead', 'Bayesian optimi
 _DEFAULT_PROJECTION = {
     'interactions': ['population', 'phenotype', 'model', 'marker1', 'marker2', 'value'],
     'attention_total': ['population', 'phenotype', 'model', 'marker1', 'marker2', 'value'],
+    # ver4-25 R12 (Stage 9): Interaction_higher_order.csv's own projection -
+    # same rationale as the two entries above (R2.2's identical-columns-
+    # regardless-of-source guarantee), 'order'+'markers' standing in for
+    # 'marker1'/'marker2' since a k>=3 coalition isn't a pair.
+    'interactions_hok': ['population', 'phenotype', 'model', 'order', 'markers', 'value'],
 }
 
 # Marker_effect.csv's fixed leading metadata columns (population, phenotype,
@@ -695,7 +861,8 @@ class ResultSet:
     def __init__(self, result_name: str, source: str = 'combined',
                  batch_ids: "list[int] | None" = None,
                  missing_batches: "list | None" = None,
-                 incomplete_batches: "list | None" = None) -> None:
+                 incomplete_batches: "list | None" = None,
+                 option: "Optional[str]" = None) -> None:
         if source not in ('combined', 'batches'):
             raise ValueError(f"ResultSet: source must be 'combined' or 'batches', got {source!r}")
         if source == 'batches' and not batch_ids:
@@ -706,8 +873,29 @@ class ResultSet:
         self.missing_batches = list(missing_batches) if missing_batches is not None else []
         self.incomplete_batches = list(incomplete_batches) if incomplete_batches is not None else []
         self._cache: dict = {}
+        # Multi-option runs (Requirements.md items 1-3): `option=None` is the
+        # FULL view (frames keep the leading OPTION_COLUMN); `option='BLUEs'`
+        # etc. is a per-option view whose every accessor returns exactly the
+        # frame a single-option run would have (rows filtered, column
+        # dropped) - use `view()` to obtain one.
+        self.option = option
 
-        self.metric = self._read_key('record')
+        _full_metric = self._read_key('record', _keep_option=True)
+        self.metric = _select_option(_full_metric, option)
+        # Option labels present in the run (file order; callers wanting the
+        # canonical BLUEs / BLUPs-without-GRM / BLUPs-with-GRM order use
+        # strategy_results.canonical_option_order()). Empty for a single-
+        # option / non-ASReml run. A per-option view keeps the full list, so
+        # `view()` can hop between options.
+        if OPTION_COLUMN in _full_metric.columns:
+            self.options = pd.unique(_full_metric[OPTION_COLUMN].dropna()).tolist()
+        else:
+            self.options = []
+        if option is not None and self.options and option not in self.options:
+            raise ValueError(
+                f"ResultSet: option {option!r} is not present in '{result_name}' "
+                f"(available: {self.options})"
+            )
         if self.metric.shape[0] == 0 or 'model' not in self.metric.columns:
             # Mirrors assemble()'s own "nothing to report" branch exactly -
             # an empty (possibly columnless) Metric.csv/Metric_<i>.csv has
@@ -726,7 +914,8 @@ class ResultSet:
 
     # -- internal I/O --------------------------------------------------- #
 
-    def _read_key(self, key: str, usecols: "list[str] | None" = None) -> "pd.DataFrame":
+    def _read_key(self, key: str, usecols: "list[str] | None" = None,
+                  _keep_option: bool = False) -> "pd.DataFrame":
         # The default projection (interactions/attention_total only) is
         # applied on BOTH sources whenever the caller doesn't pass its own
         # usecols - not just source='batches' - so a circos_plot()/
@@ -736,6 +925,10 @@ class ResultSet:
         # arguments a plot function receives, combined path vs fallback
         # path) hold for these two keys, rather than merely "column
         # superset compatible".
+        #
+        # Multi-option runs: the option column always survives the
+        # projection, the frame is then filtered to `self.option` (column
+        # dropped) unless `_keep_option` (internal: option discovery).
         if usecols is None:
             usecols = _DEFAULT_PROJECTION.get(key)
         if self.source == 'combined':
@@ -743,11 +936,15 @@ class ResultSet:
             if path is None:
                 return pd.DataFrame()
             try:
-                return pd.read_csv(path, usecols=usecols)
+                frame = pd.read_csv(path, usecols=_usecols_keeping_option(usecols))
             except _INCOMPLETE_FILE_ERRORS:
                 return pd.DataFrame()
-        # source == 'batches'
-        return concat_batches(self.result_name, key, self.batch_ids, usecols=usecols)
+        else:
+            # source == 'batches'
+            frame = concat_batches(self.result_name, key, self.batch_ids, usecols=usecols)
+        if _keep_option:
+            return frame
+        return _select_option(frame, self.option)
 
     def _cached(self, cache_name: str, key: str, usecols: "list[str] | None") -> "pd.DataFrame":
         cache_key = (cache_name, tuple(usecols) if usecols else None)
@@ -783,6 +980,24 @@ class ResultSet:
         RF-only since ver4-5 R2) or its batch-merged equivalent."""
         return self._cached('interactions', 'interactions', usecols)
 
+    def interactions_hok(self, usecols: "list[str] | None" = None) -> "pd.DataFrame":
+        """ver4-25 R12 (Stage 9): Interaction_higher_order.csv (k>=3
+        interaction coalitions, drawn only by a shapiq-based interaction
+        method - see `checkpoint_utils._model_requests_higher_order_
+        interactions()` - and only for the orders that method's own
+        'Interaction orders to search for' field requested) or its
+        batch-merged equivalent. Empty DataFrame if no batch in this run
+        ever wrote one - mirrors `asreml_varcomp()`'s own "empty if never
+        written" convention exactly, for the identical reason (a
+        config-selection-driven, not data-driven, conditional file - see
+        `static_write_flags['interactions_hok']`).
+
+        Columns (default projection): `_DEFAULT_PROJECTION['interactions_hok']`
+        - 'markers' is the ';'-joined string form (see
+        `_split_interaction_by_order()`'s own docstring for why a string,
+        not a Python tuple repr, was chosen for CSV round-tripping)."""
+        return self._cached('interactions_hok', 'interactions_hok', usecols)
+
     def attention(self, usecols: "list[str] | None" = None) -> "pd.DataFrame":
         """Attention.csv (GAT attention weights) or its batch-merged
         equivalent. Default projection (source='batches' only) is the
@@ -802,8 +1017,14 @@ class ResultSet:
             self._cache[cache_key] = loader()
         return self._cache[cache_key]
 
-    def interactions_grouped(self) -> "pd.DataFrame":
-        """OOM fix (large Interaction.csv files): the same data
+    def interactions_grouped(self) -> "_PairSumStore":
+        """Update ID circos-oom-fix: returns a `PairSumStore` (dictionary-coded,
+        streaming, spill-capable - see `interaction_reduce.py`) instead of a
+        DataFrame; `circos_plot()` accepts it directly, `.to_frame()` gives
+        the old table shape for small results. The table described below is
+        what it holds, NOT materialised as string columns.
+
+        OOM fix (large Interaction.csv files): the same data
         `interactions()` above serves, pre-reduced to one row per
         (population, model, phenotype, marker1, marker2) combination with
         'value_sum'/'value_count' columns instead of the full per-raw-row
@@ -821,19 +1042,76 @@ class ResultSet:
         themselves are the payload."""
         return self._cached_custom(
             'interactions_grouped',
-            lambda: aggregate_marker_pair_sums(self.result_name, 'interactions', self.source, self.batch_ids),
+            lambda: aggregate_marker_pair_store(self.result_name, 'interactions', self.source, self.batch_ids, option=self.option),
         )
 
-    def attention_grouped(self) -> "pd.DataFrame":
-        """`attention()`'s counterpart to `interactions_grouped()` above -
+    def attention_grouped(self) -> "_PairSumStore":
+        """(Update ID circos-oom-fix: returns a `PairSumStore`, like
+        `interactions_grouped()`.) `attention()`'s counterpart to `interactions_grouped()` above -
         same rationale, same shape, same caveat (NOT a substitute for
         `attention()` wherever attention_distribution() needs the
         individual raw attention values - only for circos_plot()'s ring
         rendering)."""
         return self._cached_custom(
             'attention_grouped',
-            lambda: aggregate_marker_pair_sums(self.result_name, 'attention_total', self.source, self.batch_ids),
+            lambda: aggregate_marker_pair_store(self.result_name, 'attention_total', self.source, self.batch_ids, option=self.option),
         )
+
+    def interactions_hok_grouped(self) -> "pd.DataFrame":
+        """`interactions_hok()`'s counterpart to `interactions_grouped()`
+        above - same OOM-avoidance rationale, same bounded-memory streamed
+        reduction (`aggregate_marker_set_sums()`, the k>=3 analog of
+        `aggregate_marker_pair_sums()`), same caveat (NOT a substitute for
+        `interactions_hok()` wherever the individual raw rows themselves
+        are the payload - only for `circos_plot()`'s k>=3 hub-and-spoke
+        ring rendering, which reduces to exactly this per-(population,
+        model, phenotype, order, markers) granularity anyway).
+
+        Empty (but correctly-columned - `_MARKER_SET_GROUP_COLS` +
+        ['value_sum', 'value_count']) under the identical circumstances
+        `interactions_hok()` itself is empty under."""
+        return self._cached_custom(
+            'interactions_hok_grouped',
+            lambda: aggregate_marker_set_sums(self.result_name, 'interactions_hok', self.source, self.batch_ids, option=self.option),
+        )
+
+    def asreml_varcomp(self, usecols: "list[str] | None" = None) -> "pd.DataFrame":
+        """ver4-25, R10 (design blueprint stage 3): ASReml_variance_
+        components.csv (one row per (scenario, component) - the single,
+        always-on, training-only, genotype-random-iid fit's own canonical
+        variance-components table - see Preprocess/asreml_blup.py::
+        fit_concurrent_variance_model()'s own docstring for the full
+        schema) or its batch-merged equivalent. Empty DataFrame if ASReml
+        was not enabled for this run at all (`static_write_flags
+        ['asreml_varcomp']` was False for every batch) - mirrors
+        `weight()`'s own "empty if never written" convention exactly, for
+        the identical reason (a config-selection-driven, not data-driven,
+        conditional file)."""
+        return self._cached('asreml_varcomp', 'asreml_varcomp', usecols)
+
+    def asreml_accuracy_ctx(self, usecols: "list[str] | None" = None) -> "pd.DataFrame":
+        """ver4-25, R3/R8 (design blueprint stage 3/6): ASReml_accuracy_
+        context.csv (the resume-safe sidecar carrying each scenario's own
+        accuracy-metrics reference values AND, since R8, diagonal-mode
+        BLUE-reliability test weights - role='test_weight' rows - see
+        `asreml_accuracy_metrics.ctx_resolver_from_frame()`) or its
+        batch-merged equivalent. Empty DataFrame if neither feature was
+        ever enabled for this run - mirrors `asreml_varcomp()`'s own
+        "empty if never written" convention."""
+        return self._cached('asreml_accuracy_ctx', 'asreml_accuracy_ctx', usecols)
+
+    def asreml_test_weights(self, usecols: "list[str] | None" = None) -> "pd.DataFrame":
+        """ver4-25, R8 Stage 6 completion: ASReml_test_weight_matrix.csv
+        (the long upper-triangle `population, phenotype, ratio, sample,
+        id1, id2, value` form of `ASREML['blue_weighting']='full'`'s own
+        per-scenario dense test-split GLS weight matrix - see
+        `blue_weights.weight_matrix_from_frame()`'s own docstring for the
+        exact read-side shape, and `genomic_prediction.py`'s Step 6b
+        write site for how each row is produced) or its batch-merged
+        equivalent. Empty DataFrame if `'full'`-mode weighting was never
+        enabled for this run - mirrors `asreml_varcomp()`'s own "empty if
+        never written" convention exactly."""
+        return self._cached('asreml_test_weights', 'asreml_test_weights', usecols)
 
     def weight(self, usecols: "list[str] | None" = None) -> "pd.DataFrame":
         """Update ID ver4-9, R5/R6 (finding F4): Weight.csv (per-scenario
@@ -857,6 +1135,19 @@ class ResultSet:
             raise ValueError(f"ResultSet.prediction(): split must be 'train'/'valid'/'test', got {split!r}")
         return self._cached(f'prediction_{split}', f'result_{split}', usecols)
 
+    def view(self, option: "Optional[str]") -> "ResultSet":
+        """A per-option `ResultSet` over the same files (see `__init__`'s
+        `option`). `option=None`, or a run without options, returns `self`
+        (so one call site serves single- and multi-option runs); an option
+        this run does not contain raises ValueError."""
+        if option is None or not self.options:
+            return self
+        if option == self.option:
+            return self
+        return ResultSet(self.result_name, source=self.source, batch_ids=self.batch_ids,
+                         missing_batches=self.missing_batches,
+                         incomplete_batches=self.incomplete_batches, option=option)
+
     def release(self, *names: str) -> None:
         """Drop cached lazy frames by name (e.g. 'effect', 'interactions',
         'attention', 'interactions_grouped', 'attention_grouped',
@@ -868,11 +1159,17 @@ class ResultSet:
         plotting stages purely to bound peak memory to roughly one stage's
         working set (R1.4), never a correctness concern."""
         if not names:
+            for _v in list(self._cache.values()):
+                _close = getattr(_v, 'close', None)      # PairSumStore: remove any spill files now
+                if callable(_close) and isinstance(_v, _PairSumStore):
+                    _close()
             self._cache.clear()
             return
         for name in names:
             for cache_key in [k for k in self._cache if k[0] == name]:
-                del self._cache[cache_key]
+                _v = self._cache.pop(cache_key)
+                if isinstance(_v, _PairSumStore):
+                    _v.close()
 
     def __iter__(self):
         """Legacy 11-tuple, in the EXACT order assemble()'s pre-Update-3

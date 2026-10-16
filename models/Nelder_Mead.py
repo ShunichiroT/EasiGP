@@ -7,9 +7,11 @@ from scipy.optimize import Bounds, minimize
 from .ensemble_regularization import (
     diversity_regularizer, ensemble_mse_objective, apply_naive_shrinkage, read_regularization_settings,
     analytic_simplex_weights, select_weights_with_floor, stick_breaking_to_simplex,
-    simplex_to_stick_breaking,
+    simplex_to_stick_breaking, _weighted_row_mean,
 )
-from pipeline_utils import get_active_compute_resources
+from pipeline_utils import get_active_compute_resources, safe_regression_metrics
+import blue_weights
+from asreml_accuracy_metrics import compute_accuracy_metrics_row, ACCURACY_METRIC_COLUMNS
 
 
 def _safe_row_normalize(df):
@@ -51,7 +53,27 @@ def _safe_row_normalize(df):
     return df.div(row_sums, axis=0).fillna(0)
 
 
-def Nelder_Mead(data_train, data_valid, data_test, record, effect, weight, MODEL, HPARAMETERS_OPT):
+def Nelder_Mead(data_train, data_valid, data_test, record, effect, weight, MODEL, HPARAMETERS_OPT,
+                asreml_accuracy_ctx=None, *, sample_weight_ctx=None):
+    """ver4-25, R8 (design blueprint SS2, Stage 6): `sample_weight_ctx`
+    (a `blue_weights.BlueWeightContext`, or `None` - every pre-ver4-25
+    caller, a strict no-op - I11) applies this task's shared BLUE-
+    reliability scoring weights (Fairness Principle P8) to: the search
+    objective itself (both the `ensemble_mse` branch, via
+    `ensemble_mse_objective(..., w=/W=)`, and the literal `dpt_ratio`
+    branch's own per-row bracket mean, via `_weighted_row_mean()` -
+    vectorised and loop forms alike), the R6 analytic seed/probe and the
+    R5.2b validation floor (both already the SAME validation-split
+    machinery `Analytic_least_squares.py`/`Bayesian_optimisation.py`
+    share), and this method's own final test-score row (the SAME
+    central weighted-recompute pattern `genomic_prediction.py`'s
+    per-model dispatch loop uses - appended `(unweighted)` columns +
+    `metric_weighting`). See `Analytic_least_squares.py`'s identical
+    parameter docstring for why the relevant weight here is the
+    validation-split SCORING weight (`blue_weights.scoring_for(ctx,
+    'valid')`), not `ctx.w_fit` - every base model is already fitted by
+    the time this method runs; only their validation PREDICTIONS are
+    being combined/scored."""
 
     initial_value = HPARAMETERS_OPT[0]
     minimum_boundary = HPARAMETERS_OPT[1]
@@ -117,6 +139,15 @@ def Nelder_Mead(data_train, data_valid, data_test, record, effect, weight, MODEL
     e_minus_d = (pred_matrix - actual_valid_arr[:, None]) ** 2 - (pred_matrix - _row_mean_pred[:, None]) ** 2
     _K = len(model_selected)
 
+    # ver4-25, R8: the validation-split SCORING weight (diagonal `w` or
+    # full `W`) - `{}` (unweighted no-op) whenever weighting is off, so
+    # every `**_valid_weight_kwargs` splat below is a strict no-op in
+    # that case (I11). See this function's own docstring for why this is
+    # the SCORING weight for 'valid', not `sample_weight_ctx.w_fit`.
+    _valid_weight_kwargs = blue_weights.scoring_for(sample_weight_ctx, 'valid')
+    _valid_w = _valid_weight_kwargs.get('w')
+    _valid_W = _valid_weight_kwargs.get('W')
+
     # ver4-4 §4a / ver4-5 R1.d precedent - see
     # models/Bayesian_optimisation.py's identical announcement for why
     # this default-on, numerics-changing acceleration is logged
@@ -129,7 +160,7 @@ def Nelder_Mead(data_train, data_valid, data_test, record, effect, weight, MODEL
               "(W_OPT_VECTORISED_OBJECTIVE=True, default) - agrees with the original "
               "loop-based computation to 1e-12 relative, but floating-point summation "
               "order differs. Set W_OPT_VECTORISED_OBJECTIVE=false to restore the exact "
-              "pre-ver4-5 computation.")
+              "original computation.")
 
     # Update ID ver4-6 (R5/R6/R7) - three further top-level config flags,
     # read via the SAME process-global compute-resources dict
@@ -144,7 +175,7 @@ def Nelder_Mead(data_train, data_valid, data_test, record, effect, weight, MODEL
     w_opt_simplex_search = bool(_resources.get('w_opt_simplex_search', True))
 
     _objective_source = 'explicit HYPERPARAMETERS_OPT entry' if len(HPARAMETERS_OPT) > 7 else \
-        'default (ver4-6: ensemble_mse fallback - see read_regularization_settings)'
+        'default (ensemble_mse fallback - see read_regularization_settings)'
     print(f"[GP] Nelder Mead weight search: objective_mode={objective_mode!r} "
           f"({_objective_source}), w_opt_analytic_seed={w_opt_analytic_seed}, "
           f"w_opt_validation_floor={w_opt_validation_floor}, "
@@ -166,14 +197,15 @@ def Nelder_Mead(data_train, data_valid, data_test, record, effect, weight, MODEL
         print(f"[GP] NOTE: Nelder Mead weight search - Minimum boundary={minimum_boundary} "
               f"is negative, but W_OPT_SIMPLEX_SEARCH=True means every candidate weight is "
               f"non-negative by construction (a stick-breaking map onto the probability "
-              f"simplex - ver4-6 R7.2(b)); negative weights are unreachable regardless of "
+              f"simplex); negative weights are unreachable regardless of "
               f"this setting. Set W_OPT_SIMPLEX_SEARCH=False to restore the literal "
               f"per-weight box semantics.")
 
     # ver4-6 R6.2: the closed-form least-squares solution, computed ONCE
     # (deterministic) - used as one restart's own starting point below
     # (R6.4) and handed to the validation floor as an extra candidate.
-    analytic_w = analytic_simplex_weights(pred_matrix, actual_valid_arr) if w_opt_analytic_seed else None
+    analytic_w = analytic_simplex_weights(pred_matrix, actual_valid_arr, **_valid_weight_kwargs) \
+        if w_opt_analytic_seed else None
 
     # Update ID ver4-6, R2.2: WORST_TERM is now a FINITE-VALUE CLIP only
     # (dropped from 1e6 to 100.0 - the live objective range for both
@@ -229,18 +261,23 @@ def Nelder_Mead(data_train, data_valid, data_test, record, effect, weight, MODEL
        if objective_mode == 'ensemble_mse':
            # Requirement 5 (§4.3b): alternate, naturally interior-optimised
            # objective - the ensemble prediction's own realised MSE against
-           # the actual validation target, quadratic in `w`.
+           # the actual validation target, quadratic in `w`. ver4-25, R8:
+           # `**_valid_weight_kwargs` is a no-op splat when weighting is off.
            first_term = ensemble_mse_objective(
                weights, w_sum, data_valid, model_selected,
                pred_matrix=(pred_matrix if w_opt_vectorised_objective else None),
                actual=(actual_valid_arr if w_opt_vectorised_objective else None),
+               **_valid_weight_kwargs,
            )
        elif w_opt_vectorised_objective:
            # ver4-5 R1.d - single float64 matrix-vector product + a mean,
            # replacing the loop-based computation below. Verified to
            # agree with it to 1e-12 relative (see this update's Change
-           # Summary §10).
-           first_term = float(np.mean(e_minus_d @ weights) / (_K * w_sum))
+           # Summary §10). ver4-25, R8: the per-row mean over validation
+           # individuals becomes the SAME weighted mean `_weighted_row_
+           # mean()` uses for the loop-based branch below, whenever
+           # weighting is on (byte-identical `np.mean()` otherwise - I11).
+           first_term = _weighted_row_mean(e_minus_d @ weights, w=_valid_w, W=_valid_W) / (_K * w_sum)
        else:
            second_term = data_valid.loc[:,model_selected+['actual']]
            third_term, mean_value = second_term.copy(), second_term.iloc[:,:-1].mean(axis=1)
@@ -251,7 +288,9 @@ def Nelder_Mead(data_train, data_valid, data_test, record, effect, weight, MODEL
 
            second_term = second_term.iloc[:,:-1].div(w_sum,axis=1).mean(axis=1)
            third_term = third_term.iloc[:,:-1].div(w_sum,axis=1).mean(axis=1)
-           first_term = (second_term - third_term).mean()
+           # ver4-25, R8: weighted mean over validation individuals when
+           # weighting is on (byte-identical `.mean()` otherwise - I11).
+           first_term = _weighted_row_mean((second_term - third_term).to_numpy(), w=_valid_w, W=_valid_W)
 
        # Requirement 5 (§4.3a, REQUIRED structural fix, not optional
        # tuning): add the strictly-convex diversity/entropy regulariser
@@ -367,7 +406,7 @@ def Nelder_Mead(data_train, data_valid, data_test, record, effect, weight, MODEL
         _extra_candidates = [('analytic', analytic_w)] if analytic_w is not None else None
         pos.x, _label, _diag = select_weights_with_floor(
             pos_weights, pred_matrix, actual_valid_arr, shrinkage_alpha=shrinkage_alpha,
-            extra_candidates=_extra_candidates,
+            extra_candidates=_extra_candidates, **_valid_weight_kwargs,
         )
         print(f"[GP] Nelder Mead weight search: floor selected {_label!r} (validation MSE - {_diag}).")
         weight_extracted = pd.DataFrame(pos.x).T
@@ -426,14 +465,32 @@ def Nelder_Mead(data_train, data_valid, data_test, record, effect, weight, MODEL
     actual_test =  data_test_selected.iloc[:,-1].tolist()
     
     ## calculate the metrics
-    mse = mean_squared_error(actual_test, predicted_test)
-    r = scipy.stats.pearsonr(actual_test, predicted_test)[0]
-    
+    # ver4-25, R8: safe_regression_metrics() (never raises on a NaN
+    # prediction column, unlike the direct mean_squared_error()/pearsonr()
+    # pair it replaces - R5's own fix, previously missing from this
+    # particular file's own final metric computation) plus, when
+    # weighting is on, the SAME weighted Pearson/MSE every model's own
+    # row already reports, with unweighted copies kept alongside - the
+    # central-recompute pattern `genomic_prediction.py`'s per-model
+    # dispatch loop uses (SS6.3).
+    actual_test_arr = np.asarray(actual_test, dtype=float)
+    predicted_test_arr = np.asarray(predicted_test, dtype=float)
+    r_unweighted, mse_unweighted = safe_regression_metrics(actual_test_arr, predicted_test_arr)
+    _test_weight_kwargs = blue_weights.scoring_for(sample_weight_ctx, 'test')
+    if _test_weight_kwargs:
+        r, mse = safe_regression_metrics(actual_test_arr, predicted_test_arr, **_test_weight_kwargs)
+    else:
+        r, mse = r_unweighted, mse_unweighted
+
     ## Store the metrics
     record = pd.concat([record, pd.DataFrame(record.iloc[-1,:]).T]).reset_index(drop=True)
     record.loc[record.shape[0]-1,'model'] = 'Nelder Mead'
     record.loc[record.shape[0]-1,'Pearson correlation'] = r
     record.loc[record.shape[0]-1,'MSE'] = mse
+    if sample_weight_ctx is not None:
+        record.loc[record.shape[0]-1, 'Pearson correlation (unweighted)'] = r_unweighted
+        record.loc[record.shape[0]-1, 'MSE (unweighted)'] = mse_unweighted
+        record.loc[record.shape[0]-1, 'metric_weighting'] = sample_weight_ctx.mode
 
     ## Weight the predicted phenotypes for the validation set
     predicted_valid = []
@@ -456,8 +513,32 @@ def Nelder_Mead(data_train, data_valid, data_test, record, effect, weight, MODEL
     data_valid['Nelder-Mead'] = predicted_valid
     data_train['Nelder-Mead'] = predicted_train
 
+    # Requirements.md (BLUEs/BLUPs accuracy-metrics phase) - this
+    # method's own up-to-9 new columns (Heritability, Adjusted prediction
+    # accuracy, Spearman correlation, Top-k Coincidence), using the FINAL
+    # `predicted_test`/`r` (whichever branch above produced them) against
+    # 'id_test' (this task's own `data_test['id']`). `asreml_accuracy_ctx`
+    # is `None` by default - a strict no-op identical to before this
+    # feature existed.
+    if asreml_accuracy_ctx:
+        _new_metrics = compute_accuracy_metrics_row(
+            list(predicted_test), data_test['id'].tolist() if 'id' in data_test.columns else [],
+            r, asreml_accuracy_ctx,
+        )
+        for _col, _val in _new_metrics.items():
+            record.loc[record.shape[0]-1, _col] = _val
+
     ## Extract weights
-    weight_sample = pd.DataFrame(record.iloc[record.shape[0]-1,:]).T.drop(['Pearson correlation', 'MSE'],axis=1)
+    # Requirements.md (BLUEs/BLUPs accuracy-metrics phase): the new
+    # metric columns just added onto `record`'s own last row (above) must
+    # ALSO be dropped here - `weight_sample` is a per-model WEIGHT row
+    # (destined for Weight.csv), never a metric row; `errors='ignore'`
+    # since these columns are simply absent when the feature is off.
+    weight_sample = pd.DataFrame(record.iloc[record.shape[0]-1,:]).T.drop(
+        ['Pearson correlation', 'MSE'] + list(ACCURACY_METRIC_COLUMNS)
+        + list(blue_weights.METRIC_WEIGHTING_EXTRA_COLUMNS),
+        axis=1, errors='ignore'
+    )
     weight_sample['model'] = 'Nelder Mead' 
     
     weight_sample = pd.concat([weight_sample.reset_index(drop=True), weight_extracted.reset_index(drop=True)], axis=1)
@@ -466,16 +547,22 @@ def Nelder_Mead(data_train, data_valid, data_test, record, effect, weight, MODEL
     weight_extracted_normalised = _safe_row_normalize(weight_extracted)
     
     ## Calculate weighted effects
+    # F1 fix: the accumulator used to be created only when i == 0, so a first model without effect rows
+    # (e.g. explainability off for it) raised UnboundLocalError on the next model, and no effect rows at all
+    # raised it at the end. It now starts from the first model that HAS effect rows (identical result when
+    # every model has them) and the ensemble effect row is skipped when no model has any.
+    effect_weighted = None
     for i in range(len(model_selected)):
         if effect[effect['model']==model_selected[i]].shape[0] != 0:
-            if i == 0:
+            if effect_weighted is None:
                 effect_weighted = _safe_row_normalize(effect[effect['model']==model_selected[i]].tail(1).iloc[:,5:].abs().reset_index(drop=True)).mul(weight_extracted_normalised[model_selected[i]], axis=0).reset_index(drop=True)
             else:
                 effect_weighted += _safe_row_normalize(effect[effect['model']==model_selected[i]].tail(1).iloc[:,5:].abs().reset_index(drop=True)).mul(weight_extracted_normalised[model_selected[i]], axis=0).reset_index(drop=True)
 
-    effect = pd.concat([effect, pd.DataFrame(effect.iloc[effect.shape[0]-1,:]).T]).reset_index(drop=True)
-    effect.loc[effect.shape[0]-1,'model'] = 'Nelder Mead'
+    if effect_weighted is not None:
+        effect = pd.concat([effect, pd.DataFrame(effect.iloc[effect.shape[0]-1,:]).T]).reset_index(drop=True)
+        effect.loc[effect.shape[0]-1,'model'] = 'Nelder Mead'
     
-    effect.loc[effect.shape[0]-1,list(effect_weighted.columns)] = effect_weighted.values
+        effect.loc[effect.shape[0]-1,list(effect_weighted.columns)] = effect_weighted.values
 
     return record, effect, data_test, data_valid, data_train, weight

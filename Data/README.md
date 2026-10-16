@@ -1,5 +1,7 @@
 ## Description
 
+For a shorter overview of the input files, see section 3 of the [User Manual](../Manual/EasiGP_User_Manual.pdf).
+
 This folder contains three example datasets you can use to try both the genomic prediction and circos plot generation functions of EasiGP before bringing in your own data.
 
 | Folder | Source | Key gene regions included |
@@ -9,6 +11,13 @@ This folder contains three example datasets you can use to try both the genomic 
 | `MaizeNAM/` | Adjusted example data from the MaizeNAM dataset (Buckler et al., 2009) | Flowering time (Dong et al., 2012; Wisser et al., 2019) |
 
 Each folder is a complete, working set of the files described below, so you can point the GUI directly at one of them to see the whole pipeline run end to end.
+
+What is in each folder:
+
+- `MaizeNAM/` has the whole dataset (`MaizeNAM_dataset_genotype.csv`, `MaizeNAM_dataset_phenotype.csv`) and one genotype/phenotype pair per population (`MaizeNAM_dataset_genotype_population_1.csv`, ...). The GUI's default paths point at the population 1 pair, so you can try EasiGP straight away.
+- `TeoNAM/` has combined files plus one genotype/phenotype pair per cross (`W22TIL01_...`, etc.); the small `W22TIL01_subset_...` pair is handy for a quick test.
+- `Arabidopsis/` has the genotype, phenotype, marker information, chromosome and key gene region files (`Gene_info.csv`).
+- **Some large files are zipped** (`Arabidopsis/Arabidopsis_dataset_genotype.zip`, `Arabidopsis/Arabidopsis_marker_info.zip`, `TeoNAM/TeoNAM_genotype.zip`). Unzip them before pointing the GUI at them.
 
 ---
 
@@ -30,6 +39,7 @@ EasiGP reads several small, plain files rather than one combined dataset. The ta
 Two structural rules apply across every tabular file below:
 
 - **The first two columns of the genotype and phenotype files are matched by position, not by name.** Whatever you actually call them, EasiGP treats column 1 as `ID` and column 2 as `population` internally. Every column *after* that - marker names, trait names, gene names - is matched **by name** and is never renamed, since those names are used as join keys elsewhere in the pipeline. In short: get columns 1-2 in the right order; get every other column's *name* right.
+- **The marker information, chromosome information and key gene region files are also matched by position.** Keep the columns in the order shown in each table below (for example `chromosome, name, start, end` for marker information); the header text itself is not checked, so a header such as `Name` instead of `name` still works. The *values* in those files still have to match: marker names must match the genotype column names, and chromosome names must match between files.
 - **Markers are always numerically coded `0`, `1`, or `2`** (the count of one allele at that locus), never letters or genotype strings.
 
 ### 1a. Genotype data (CSV)
@@ -73,7 +83,9 @@ Use this when you have a large marker set already in PLINK format, or want EasiG
 | 2 (`population`) | Name of the individual's population |
 | 3 onward | One column per trait, named however you like - select which trait(s) to predict by name in the GUI |
 
-Each row is one individual.
+Each row is one individual (in the default **Analysed** layout).
+
+The ASReml-R mixed-model adjustment works on plot-level records instead: choose **Phenotype file layout = Raw** on Tab 1 of the GUI, where an individual can appear on several rows. In that layout, the extra columns it needs - for example block, row, range or environment - also go in this file, after column 2. The ASReml-R section of the GUI offers every column of this file when you choose the genotype column and the fixed, random and residual terms. Columns that are not selected as traits are simply not predicted.
 
 ```
 ID,     population, flowering_time, plant_height
@@ -129,8 +141,8 @@ Known genes/regions from the literature that you want drawn on the circos plot a
 | `start` | Beginning position of the gene |
 | `end` | End position of the gene |
 | `name` | Gene name |
-| `colour` | Colour name from the palette offered in the Circos plot tab of the GUI |
-| `source` | Where this gene region came from (e.g. a citation) - shown as the ring section's own label on the plot |
+| `colour` | A category name for the gene (for example a pathway such as `photoperiod` or `transduction`). The colour drawn for each category is set in the Circos plot tab of the GUI |
+| `source` | Where this gene region came from (e.g. a citation or data source) - used only as the ring's label on the plot, not for colouring; genes with the same `source` share one ring |
 | `phenotype` | Which trait this gene is relevant to - must match a phenotype column name from file 2 |
 | `population` | *(Optional)* Which population this row applies to - same rule as `chrom.csv` above: write `all`, or omit the column entirely if every population shares the same gene regions |
 
@@ -139,7 +151,7 @@ chromosome, start,  end,    name, colour, source,          phenotype,       popu
 1,          100000, 102000, FT1,  red,    Dong et al. 2012, flowering_time, all
 ```
 
-**About the `population` column:** only include it if different populations in your data have chromosomes of different lengths (e.g. different reference genome builds per population). Write `all` for a row that applies across every population. If every population shares the same chromosome lengths, you can leave the `population` column out entirely - EasiGP will automatically apply the same rows to every population plus `all`.
+**About the `population` column:** only include it if different populations in your data have different key gene regions (e.g. because they use different reference genome builds). Write `all` for a row that applies across every population. If every population shares the same gene regions, you can leave the `population` column out entirely - EasiGP will automatically apply the same rows to every population plus `all`. Chromosome names here must match those in `chrom.csv` exactly (for example `10` in both, not `10` in one and `A10` in the other), otherwise the gene cannot be drawn.
 
 ### 6. Biological prior network files - optional, for the GAT biological prior-knowledge model
 
@@ -180,6 +192,8 @@ Gene_Name, Chromosome, Start_bp, End_bp, AGI_Locus_ID, Source
 FT1,       1,          100000,   101500, AT1G00000,    TAIR
 FT2,       1,          150200,   151800, AT1G00010,    TAIR
 ```
+
+You do not have to build this table by hand. In the GUI's "Biological prior network" step you can choose to have the coordinates built automatically. EasiGP first answers what it can for free - from a cache of earlier lookups, from an annotation file for your species (GFF3 or GTF - optional, but strongly recommended) and from Ensembl Plants - and only the genes still unresolved are sent to one short AI-agent session (which needs Claude access).
 
 A gene whose coordinates can't be resolved trustworthily is reported and dropped by EasiGP, never guessed at or left at a default value - this applies whether the table above was hand-built or generated automatically.
 

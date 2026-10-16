@@ -53,6 +53,7 @@ import pandas as pd
 
 from pipeline_utils import canonical_model_order, _is_naive_ensemble_label, _is_wopt_label
 from model_registry import model_family
+import plot_style as _ps
 
 # Mirrors metric_plot.py's own METRIC_PLOT_CONFIG default exactly
 # (font_scale=1, a 5-inch-tall panel per subplot) - a caller that omits
@@ -169,7 +170,8 @@ def _draw_stacked_bar(ax, cell: "pd.DataFrame", x_order: "list[str]", member_ord
 
 
 def _draw_figure(long_df: "pd.DataFrame", x_order: "list[str]", member_order: "list[str]",
-                  colours: "dict[str, tuple]", fig_size: int, row_facet: bool, path: str) -> "str | None":
+                  colours: "dict[str, tuple]", fig_size: int, row_facet: bool, path: str,
+                  label_map: "dict | None" = None) -> "str | None":
     """One figure: `col='phenotype'`, and `row='population'` when
     `row_facet` is True (`Weight.png`) or a single unfaceted row when it
     is False (`Weight_total.png`, aggregated across population - the
@@ -192,11 +194,26 @@ def _draw_figure(long_df: "pd.DataFrame", x_order: "list[str]", member_order: "l
             _draw_stacked_bar(ax, cell, x_order, member_order, colours)
             ax.set_title(str(phen) if pop is None else f'{pop} | {phen}')
 
+    _ps.relabel_figure(fig, label_map)       # ver4-95: shortened bar labels, before the layout
     handles = [plt.Rectangle((0, 0), 1, 1, color=colours.get(m, '#999999')) for m in member_order]
     if handles:
-        fig.legend(handles, member_order, loc='lower right')
+        # Requirements.md item 1: the legend must never overlap the plot
+        # area - the same fix already applied to
+        # accuracy_metrics_plot.py's coincidence-curve/pairwise-scatter/
+        # bubble figures (this module deliberately doesn't import that
+        # one - see the module docstring's own I2 invariant - so the
+        # same small fix is duplicated here rather than shared). Anchor
+        # the legend just OUTSIDE the figure's own right edge in
+        # figure-fraction coordinates (never inside any axes' own
+        # bounding box, regardless of how many rows/columns are
+        # faceted), then save with `bbox_inches='tight'` so the canvas
+        # grows to include it instead of clipping it or letting it sit
+        # on top of the rightmost panel's own tick labels the way
+        # `loc='lower right'` (with no reserved space) previously could.
+        fig.legend(handles, member_order, loc='center left', bbox_to_anchor=(1.0, 0.5),
+                   borderaxespad=0.5, frameon=True)
     fig.tight_layout()
-    fig.savefig(path)
+    fig.savefig(path, bbox_inches='tight')
     plt.close(fig)
     return path
 
@@ -273,6 +290,9 @@ def weight_plot(
                 member_order.append(m)
 
     colours = _family_colours(member_order)
+    # ver4-95: MODEL_LABEL_STYLE - only the bar labels (the weighted-ensemble labels) can carry the
+    # 'Super learner__' prefix; the segment/legend names are base models and never change.
+    label_map = _ps.shown_labels(x_order, WEIGHT_PLOT_CONFIG)
 
     per_pop_long = _mean_weight_long(weight, member_order, ['population', 'phenotype'])
     total_long = _mean_weight_long(weight, member_order, ['phenotype'])
@@ -280,17 +300,21 @@ def weight_plot(
         per_pop_long = _add_naive_rows(per_pop_long, ['population', 'phenotype'], naive_models)
         total_long = _add_naive_rows(total_long, ['phenotype'], naive_models)
 
-    matplotlib.rcParams.update({'font.size': 10 * font_size, 'figure.dpi': PLOT_DPI, 'savefig.dpi': PLOT_DPI})
+    # ver4-31 R16: scoped to this call (was a global rcParams.update that leaked its
+    # font size / dpi into whichever plot the runner drew next).
+    with matplotlib.rc_context({'font.size': 10 * font_size, 'figure.dpi': PLOT_DPI, 'savefig.dpi': PLOT_DPI}):
 
-    result_dir = './Result/' + RESULT_NAME + '/'
-    os.makedirs(result_dir, exist_ok=True)
-    paths = []
-    p1 = _draw_figure(per_pop_long, x_order, member_order, colours, fig_size, True, result_dir + 'Weight.png')
-    if p1:
-        paths.append(p1)
-    p2 = _draw_figure(total_long, x_order, member_order, colours, fig_size, False, result_dir + 'Weight_total.png')
-    if p2:
-        paths.append(p2)
+        result_dir = './Result/' + RESULT_NAME + '/'
+        os.makedirs(result_dir, exist_ok=True)
+        paths = []
+        p1 = _draw_figure(per_pop_long, x_order, member_order, colours, fig_size, True, result_dir + 'Weight.png',
+                          label_map=label_map)
+        if p1:
+            paths.append(p1)
+        p2 = _draw_figure(total_long, x_order, member_order, colours, fig_size, False, result_dir + 'Weight_total.png',
+                          label_map=label_map)
+        if p2:
+            paths.append(p2)
 
     if not paths:
         print("[weight_plot] Nothing to plot after resolving contributing models/ensemble "

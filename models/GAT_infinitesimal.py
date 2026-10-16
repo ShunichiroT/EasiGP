@@ -12,10 +12,26 @@ from torch_geometric.explain import Explainer, CaptumExplainer
 
 from pipeline_utils import (
     get_active_compute_resources, apply_torch_compute_settings, gpu_slot, dataloader_num_workers,
+    is_lean_search_fit,
 )
+from models.gat_search import lean_search_fit, undirected_edge_index
+from models.gat_stability import gat_stable
 
 
-def GAT_infinitesimal(data_train, data_valid, data_test, params):
+@gat_stable('GAT_infinitesimal')
+def GAT_infinitesimal(data_train, data_valid, data_test, params, *, sample_weight_ctx=None):
+    # ver4-25, R8 (design blueprint SS2, Stage 6): `sample_weight_ctx.
+    # w_fit` (a plain per-individual vector, aligned to `data_train`'s
+    # own row order - see architecture doc SS4.2's positional-identity
+    # contract) is attached as a per-graph scalar attribute (`tmp.w`,
+    # built EXACTLY like `tmp.y` just below) and used for a
+    # `Sum(w_i*r_i^2)/Sum(w_i)` training loss - the SAME mechanism
+    # `models/MLP.py` already ships. TEST/VALID scoring for this model
+    # is unaffected either way (computed centrally by the caller,
+    # regardless of how the model itself was fit). `None` (every pre-
+    # ver4-25 caller) is a byte-identical `F.mse_loss(...)` - I11.
+    _w_fit = sample_weight_ctx.w_fit if sample_weight_ctx is not None else None
+
     
     if data_valid.shape[0] != 0:
         VALID = True
@@ -31,6 +47,21 @@ def GAT_infinitesimal(data_train, data_valid, data_test, params):
     heads = params[6]
     marker_effect = params[7]
     samples = params[8]
+
+    # ver4-46, R1: lean validation-only fit inside a hyperparameter-SEARCH fit - see
+    # models/GAT_fully_connected.py's identical block and models/gat_search.py.
+    # Every node attends only to itself here, so the shared edge index is the
+    # (de-duplicated) self-loop set the legacy body builds per individual.
+    if VALID and is_lean_search_fit():
+        _m = data_train.shape[1] - 1
+        _loops = np.arange(_m)
+        _predicted_valid = lean_search_fit(
+            geno_train=data_train.iloc[:, :-1], y_train=data_train.iloc[:, -1].to_numpy(),
+            geno_valid=data_valid.iloc[:, :-1], w_fit=_w_fit,
+            edge_index=undirected_edge_index(_loops, _loops, _m), n_markers=_m,
+            neuron=neuron, dropout=dropout, lrate=lrate, decay=decay, epochs=epoch,
+            bsize=bsize, heads=heads, attention_arg=False)
+        return (float('nan'), float('nan'), pd.DataFrame(), [], _predicted_valid, [])
 
     ## Preprocess the data so that it can be converted into a graph format
     if VALID:
@@ -67,6 +98,13 @@ def GAT_infinitesimal(data_train, data_valid, data_test, params):
         tmp.edge_index = torch.stack([torch.from_numpy(edges_from_train_tmp).to(torch.long),torch.from_numpy(edges_to_train_tmp).to(torch.long)], dim=0)
         tmp.x = torch.from_numpy(data_QTL_melt_train_tmp.to_numpy(dtype=float)).to(torch.float)
         tmp.y = torch.from_numpy(data_pheno_train_tmp).to(torch.float)
+        if _w_fit is not None:
+            # ver4-25, R8: built exactly like `tmp.y` just above (a
+            # shape-(1,) tensor per graph) so PyG's default batch
+            # collation concatenates it along dim 0 the SAME way it
+            # already does for `y` - `batch.w` therefore comes out
+            # shape (batch_size,), matching `batch.y` element-for-element.
+            tmp.w = torch.from_numpy(np.expand_dims(np.array(_w_fit[kk], dtype=float), axis=0)).to(torch.float)
         tmp = T.ToUndirected()(tmp)
         data_train += [tmp]
     
@@ -171,7 +209,14 @@ def GAT_infinitesimal(data_train, data_valid, data_test, params):
                 optimizer.zero_grad()
                 with torch.autocast(device_type=device.type, enabled=use_amp):
                     out = model(batch.x, batch.edge_index, batch.batch)
-                    loss = F.mse_loss(torch.squeeze(out), batch.y)
+                    if _w_fit is None:
+                        loss = F.mse_loss(torch.squeeze(out), batch.y)
+                    else:
+                        # ver4-25, R8: Sum(w_i*r_i^2)/Sum(w_i) - the SAME
+                        # weighted-loss formula models/MLP.py already
+                        # ships (blueprint SS2 R8's own mechanism table).
+                        _sq_err = (torch.squeeze(out) - batch.y) ** 2
+                        loss = (_sq_err * batch.w).sum() / batch.w.sum().clamp_min(1e-12)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()

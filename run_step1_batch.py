@@ -48,18 +48,37 @@ Typical workflow
    (Update ID 2, Defect D4 fix - see PATCH_NOTES_D2.md. Checkpoint/resume
    remains the default for a routine retry after a crash/timeout; this flag
    is only for the deliberate "no, really, start this one over" case.)
+
+5. ver4-56 (R4) - calibrate before committing the big array job. Run a small
+   PILOT of K representative tasks (the largest, the smallest, one per ratio,
+   then evenly spaced sizes) of THIS configuration; it writes only under
+   Result/<RESULT_NAME>/_pilot/, never touches the production checkpoints, records
+   resource telemetry, and finishes by printing the calibrated recommendation
+   (ncpus, memory, walltime, batch size, workers, threads):
+
+       python run_step1_batch.py --config Result/<RESULT_NAME>/step1_config.json --pilot 4
+
+   Then apply it with tools/resource_advise.py (or the GUI panel).
 """
 
 import argparse
 import json
+import os
 import sys
 import time
 
 import checkpoint_utils as _ckpt
 from pipeline_utils import (
     configure_r_environment, init_rpy2_conversion,
+    # ver4-56 (R4): the pilot's row selection lives with the other shared task helpers.
+    select_pilot_rows as _select_pilot_rows,
     resolve_batch_id_from_env, restore_ratio, TimestampedWriter, make_run_log_path,
     apply_scratch_tmp_dir,
+    # ver4-25, R14: log-only check for fan-out/CPU-threading keys the GUI
+    # can no longer produce (see pipeline_utils.PINNED_FANOUT_DEFAULTS).
+    log_pinned_fanout_deviations,
+    # ver4-33: ACCELERATION dict (+ engine-only keys) to forward into GP().
+    acceleration_from_cfg,
 )
 
 
@@ -95,7 +114,105 @@ def parse_args():
             'possibly hours-long work.'
         ),
     )
+    parser.add_argument(
+        '--pilot', nargs='?', const=4, default=None, type=int, metavar='K',
+        help=(
+            'Instead of a production batch, run K representative tasks '
+            '(default 4; the largest and smallest by size, one per ratio, then evenly '
+            'spaced) into Result/<RESULT_NAME>/_pilot/ with resource telemetry on, then '
+            'print the calibrated resource recommendation. Never touches the production '
+            'checkpoints; --batch-id and --overwrite are ignored.'
+        ),
+    )
     return parser.parse_args()
+
+
+def _run_pilot(cfg, gp_kwargs, k):
+    """Run the pilot (see ``--pilot``) and print the calibrated advice.
+
+    Returns the process exit code: 0 when at least one pilot task succeeded,
+    1 when none did or the pilot cannot run (telemetry off, nothing to run).
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+    from pipeline_utils import build_sample_table_from_cfg, cheap_task_sizes, telemetry_dir_for
+    from resource_telemetry import TELEMETRY_DIR_ENV, TELEMETRY_PILOT_ENV
+    from intra_batch_parallel import (
+        _MP_CONTEXT, _run_isolated_task, _worker_init, fanout_thread_resources,
+    )
+    from pipeline_utils import gpu_arbiter_for_workers
+
+    if not cfg.get('RESOURCE_TELEMETRY', True):
+        print("[run_step1_batch] --pilot: RESOURCE_TELEMETRY is false in this config, so the pilot "
+              "would record nothing - set it to true (or remove the key) and run again.")
+        return 1
+    table = build_sample_table_from_cfg(cfg)
+    rows = _select_pilot_rows(table, cheap_task_sizes(cfg), k)
+    if not rows:
+        print("[run_step1_batch] --pilot: the configuration produces no tasks - nothing to run.")
+        return 1
+    n_workers = max(1, min(int(cfg.get('N_CPU_WORKERS_TASK', cfg.get('N_CPU_WORKERS', 1)) or 1), len(rows)))
+    # Telemetry goes to the PARENT run's folder (so the advisor finds it), tagged pilot.
+    os.environ.setdefault(TELEMETRY_DIR_ENV, telemetry_dir_for(cfg['RESULT_NAME']))
+    os.environ[TELEMETRY_PILOT_ENV] = '1'
+    print(f"[run_step1_batch] --pilot: running {len(rows)} of {len(table)} task(s) {rows} "
+          f"({n_workers} worker process(es)) into Result/{cfg['RESULT_NAME']}/_pilot/; "
+          f"telemetry -> {os.environ[TELEMETRY_DIR_ENV]}")
+    n_gpu_slots = cfg.get('N_GPU_SLOTS') or 0
+    gpu_semaphore = gpu_arbiter_for_workers(
+        gp_kwargs.get('ACCELERATION'), n_gpu_slots, gp_kwargs.get('GPU_SLOTS_PER_DEVICE', 1),
+        _MP_CONTEXT.Manager()) if n_gpu_slots > 0 else None
+    succeeded, failed = [], {}
+
+    def task_kwargs(index):
+        sub = dict(gp_kwargs)
+        sub['RESULT_NAME'] = f"{cfg['RESULT_NAME']}/_pilot/task_{index}"
+        sub['PARALLEL'] = {'batch_id': index, 'batch_size': 1}
+        sub['RESULT_COMPRESSION'] = 'none'
+        sub.pop('progress_callback', None)
+        return sub
+
+    with ProcessPoolExecutor(
+        max_workers=n_workers, mp_context=_MP_CONTEXT, initializer=_worker_init,
+        initargs=(gp_kwargs.get('R_PATH'), gp_kwargs.get('R_BLAS_THREADS'), gpu_semaphore,
+                  fanout_thread_resources(gp_kwargs, n_workers)),
+    ) as pool:
+        futures = {pool.submit(_run_isolated_task, task_kwargs(i), i): i for i in rows}
+        for future in as_completed(futures):
+            index = futures[future]
+            try:
+                _, ok, error = future.result()
+            except Exception as exc:  # noqa: BLE001 - the worker process itself died
+                ok, error = False, f"worker process error: {exc!r}"
+            if ok:
+                succeeded.append(index)
+                print(f"[run_step1_batch] --pilot: task {index} finished.")
+            else:
+                failed[index] = error
+                print(f"[run_step1_batch] --pilot: task {index} FAILED: {error}")
+    print(f"[run_step1_batch] --pilot: {len(succeeded)} task(s) succeeded, {len(failed)} failed.")
+    if not succeeded:
+        return 1
+    _print_pilot_advice(cfg)
+    return 0
+
+
+def _print_pilot_advice(cfg):
+    """Print the calibrated recommendation after a pilot (never fatal)."""
+    import argparse as _argparse
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tools', 'resource_advise.py')
+    try:
+        spec = importlib.util.spec_from_file_location('resource_advise', path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        args = _argparse.Namespace(telemetry=[], machine_key=None, hpc_profile=None, objective=None,
+                                   target_walltime_h=None, walltime_quantile=None, mem_quantile=None)
+        module.print_report(module.advise(cfg, args))
+        print("[run_step1_batch] Apply it with: python tools/resource_advise.py --config <config> "
+              "--rewrite-script <job script> --rewrite-config")
+    except (OSError, ImportError, ValueError, KeyError) as exc:
+        print(f"[run_step1_batch] --pilot: could not print the recommendation "
+              f"({type(exc).__name__}: {exc}); run tools/resource_advise.py by hand.")
 
 
 def main():
@@ -104,8 +221,16 @@ def main():
     with open(args.config, 'r', encoding='utf-8-sig') as f:
         cfg = json.load(f)
 
+    # ver4-54 (R6): a Tool config belongs to run_tool.py - refuse it here, before any run.
+    if cfg.get('RUN_KIND') == 'tool':
+        sys.exit("This is a Tool config - run it with run_tool.py")
+
     batch_id = args.batch_id
-    if batch_id is None:
+    if args.pilot is not None:
+        # ver4-56 (R4): a pilot has no batch id of its own (each pilot task is its own
+        # one-task run); 0 is only a placeholder for the config's PARALLEL block.
+        batch_id = 0
+    elif batch_id is None:
         try:
             batch_id = resolve_batch_id_from_env()
         except RuntimeError as exc:
@@ -121,10 +246,22 @@ def main():
     # The batch ID is included in the label (not just the log's own
     # timestamp) so two array tasks that happen to start within the same
     # second never collide on the same log filename.
-    log_file_path = make_run_log_path(cfg['RESULT_NAME'], f'step1_batch{batch_id}')
+    log_file_path = make_run_log_path(
+        cfg['RESULT_NAME'], 'pilot' if args.pilot is not None else f'step1_batch{batch_id}')
     log_file = open(log_file_path, 'w', encoding='utf-8')
     sys.stdout = TimestampedWriter(sys.stdout, log_file)
     print(f'[run_step1_batch] Logging to {log_file_path}')
+
+    # ver4-59: a native crash inside R/ASReml/torch ("corrupted double-linked
+    # list", "Segmentation fault") kills the interpreter without a Python
+    # traceback. faulthandler dumps the Python stack of every thread to stderr
+    # (the scheduler's .error file) at SIGSEGV/SIGABRT/SIGBUS/SIGFPE/SIGILL, so
+    # the NEXT crash names the exact fit/function. Diagnostic only.
+    try:
+        import faulthandler
+        faulthandler.enable(file=sys.__stderr__, all_threads=True)
+    except Exception as _fh_exc:
+        print(f'[run_step1_batch] NOTE: faulthandler unavailable ({_fh_exc!r}).')
 
     # PATCH_NOTES (worker-crash fix): resolve an optional, persistent
     # scratch-temp override BEFORE any heavy import (configure_r_environment,
@@ -162,6 +299,11 @@ def main():
     # files, and the two parallel routes also consult the same scratch
     # folder.
     overwrite = bool(args.overwrite or cfg.get('OVERWRITE_RESULTS', False))
+    if overwrite and args.pilot is not None:
+        # ver4-56 (R4): the pilot must never discard production checkpoints.
+        print("[run_step1_batch] --pilot ignores --overwrite / OVERWRITE_RESULTS (it only writes "
+              "under _pilot/ and never touches production state).")
+        overwrite = False
     if overwrite:
         print(f"[run_step1_batch] --overwrite requested: discarding any previously saved "
               f"checkpoint/result files for batch {batch_id} (RESULT_NAME={cfg['RESULT_NAME']}), "
@@ -171,6 +313,8 @@ def main():
         _ckpt.clear_result_files(cfg['RESULT_NAME'], batch_id, True)
         from intra_batch_parallel import cleanup_isolated_folders as _wipe_scratch_folder
         _wipe_scratch_folder(cfg['RESULT_NAME'], batch_id)
+        from pipeline_utils import clear_memo_dir as _clear_memo_dir
+        _clear_memo_dir(cfg['RESULT_NAME'])
 
     configure_r_environment(
         cfg.get('R_PATH'), r_blas_threads=cfg.get('R_BLAS_THREADS'),
@@ -198,6 +342,9 @@ def main():
 
     print(f"[run_step1_batch] RESULT_NAME={cfg['RESULT_NAME']} "
           f"batch_id={batch_id} batch_size={batch_size} models={cfg['MODEL']}")
+    # ver4-25, R14: purely informational - see log_pinned_fanout_deviations()'s
+    # own docstring. Never changes cfg or how GP() is called below.
+    log_pinned_fanout_deviations(cfg, log_prefix='[run_step1_batch]')
 
     gp_kwargs = dict(
         GENOTYPE_FILE_NAME=cfg['GENOTYPE_FILE_NAME'], PHENOTYPE_FILE_NAME=cfg['PHENOTYPE_FILE_NAME'],
@@ -209,6 +356,14 @@ def main():
         GENOTYPE_FORMAT=cfg.get('GENOTYPE_FORMAT', 'csv'), GENOTYPE_PLINK_PATH=cfg.get('GENOTYPE_PLINK_PATH', 'plink2'),
         OTHER_MODELS_MARKER_SOURCE=cfg.get('OTHER_MODELS_MARKER_SOURCE', 'full_or_filtered'),
         HP_TUNE=cfg.get('HP_TUNE'), HP_TUNE_ENSEMBLE_MODE=cfg.get('HP_TUNE_ENSEMBLE_MODE', 'per_method'),
+        # ver4-26, R4 (design blueprint `EasiGP_ver4-26_Design_Blueprint.md`
+        # hand-off checklist): forward the two new joint-search keys into
+        # GP() - None/absent for every pre-ver4-26 config (I11), matching
+        # run_sequential.py's own identical gp_kwargs addition.
+        JOINT_W_OPT=cfg.get('JOINT_W_OPT'), HYPERPARAMETERS_JOINT_OPT=cfg.get('HYPERPARAMETERS_JOINT_OPT'),
+        ITERATIVE_ENSEMBLE=cfg.get('ITERATIVE_ENSEMBLE'),  # ver4-57: opt-in, None = off
+        SUPER_LEARNER=cfg.get('SUPER_LEARNER'),  # ver4-77: opt-in, None = off
+        SEED_BAG=cfg.get('SEED_BAG'),  # ver4-102 (P4): opt-in, None = off
         MIN_DATA_POINTS=cfg.get('MIN_DATA_POINTS', 100),
         # Phase 2, Requirement 6/7/8 - all optional, all default to the
         # exact same behaviour as before these keys existed.
@@ -274,6 +429,9 @@ def main():
         # resolve_compute_resources()'s own docstring for each key's full
         # meaning.
         HP_TUNE_BAYES_DOMAIN_REDUCTION=cfg.get('HP_TUNE_BAYES_DOMAIN_REDUCTION', 'auto'),
+        HP_TUNE_BAYES_MULTI_FIDELITY=cfg.get('HP_TUNE_BAYES_MULTI_FIDELITY', False),
+        HP_TUNE_FAST=cfg.get('HP_TUNE_FAST'),   # ver4-40 R1 (None = legacy tuning)
+        HP_TUNE_PRESET_FILE=cfg.get('HP_TUNE_PRESET_FILE'),   # ver4-61 R6 (None = no preset)
         HP_TUNE_WARM_START=cfg.get('HP_TUNE_WARM_START', False),
         HP_TUNE_SELECTION_MARGIN=cfg.get('HP_TUNE_SELECTION_MARGIN', 0.02),
         HP_TUNE_VALID_REPEATS=cfg.get('HP_TUNE_VALID_REPEATS', 1),
@@ -288,7 +446,39 @@ def main():
         # run_sequential.py's own gp_kwargs; default 'gzip' matches GP()'s
         # own default.
         RESULT_COMPRESSION=cfg.get('RESULT_COMPRESSION', 'gzip'),
+        # Update ID ver4-12 (design blueprint SS4/SS10.6c) - same forward-
+        # every-new-key discipline, same legacy-preserving defaults (I11).
+        # Reaches all three of this script's own dispatch routes (plain/
+        # intra-batch/intra-task) for free, via the same gp_kwargs-
+        # forwarding mechanism the Stage-5 keys above already use.
+        ASREML=cfg.get('ASREML'),
+        ASREML_STRICT=cfg.get('ASREML_STRICT', True),
+        # Requirements.md item 4: per-phenotype 'higher'/'lower' direction for the
+        # always-computed Top-k Coincidence / Czekanowski metrics (independent of ASReml).
+        METRIC_DIRECTIONS=cfg.get('METRIC_DIRECTIONS'),
+        # ver4-33 (design blueprint SS4): None for every pre-ver4-33 config
+        # (-> ver4-32 behaviour, I11); reaches all three dispatch routes.
+        ACCELERATION=acceleration_from_cfg(cfg),
+        PHENOTYPE_FILE_MODE=cfg.get('PHENOTYPE_FILE_MODE', 'analysed'),
+        PHENOTYPE_TRAIT_COLUMNS=cfg.get('PHENOTYPE_TRAIT_COLUMNS'),
+        POPULATION_SOURCE=cfg.get('POPULATION_SOURCE'),
+        # Requirements.md (between-prediction validation-set patch),
+        # items 1-4 - same forward-every-new-key discipline as
+        # run_sequential.py's own gp_kwargs (see that module's matching
+        # comment for the full I11 default-preserving rationale).
+        BETWEEN_VALIDATION=cfg.get('BETWEEN_VALIDATION'),
+        BETWEEN_VALIDATION_SOURCE=cfg.get('BETWEEN_VALIDATION_SOURCE'),
+        BETWEEN_RATIO=cfg.get('BETWEEN_RATIO'),
+        EXCLUDED_POPULATION_COMBINATIONS=cfg.get('EXCLUDED_POPULATION_COMBINATIONS'),
+        # ver4-56 (blueprint R1): log-only usage records; an absent key means True (I11,
+        # justified in the blueprint: log-only, overhead < 0.1 %). Resolved + logged by
+        # pipeline_utils.resolve_compute_resources().
+        RESOURCE_TELEMETRY=cfg.get('RESOURCE_TELEMETRY', True),
+        RESOURCE_TELEMETRY_INTERVAL_S=cfg.get('RESOURCE_TELEMETRY_INTERVAL_S', 0.5),
     )
+
+    if args.pilot is not None:
+        sys.exit(_run_pilot(cfg, gp_kwargs, args.pilot))
 
     _t0 = time.time()
     # Update ID 2 (R1) - three-way route, in priority order:

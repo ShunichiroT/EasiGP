@@ -36,7 +36,7 @@ library(iml)
 # than an exact-vs-approximate change in kind - increase max_shap_features
 # and/or the Shapley nIter/burnIn towards the main model's values for a
 # closer (but slower) match to the original behaviour.
-GBLUP <- function(train, valid, test, params, RESULT_NAME, K_precomputed=NULL){
+GBLUP <- function(train, valid, test, params, RESULT_NAME, K_precomputed=NULL, weights=NULL){
   
   params <- unlist(params)
   nIter <- as.numeric(params[1])
@@ -64,6 +64,21 @@ GBLUP <- function(train, valid, test, params, RESULT_NAME, K_precomputed=NULL){
   if (is.na(shap_row_offset)) shap_row_offset <- 0
   shap_row_count <- suppressWarnings(as.numeric(params[9]))
   if (is.na(shap_row_count)) shap_row_count <- -1
+  # ver4-25, Stage 7 (design blueprint R13, D5): appended, never inserted
+  # (I5) - this file's own params list was 13 elements (indices 1-13, the
+  # last four being the Python-only interaction fields
+  # genomic_prediction.py::_r_model_interaction_fields() reads, never
+  # this file) before this edit. 'iml_shapley' (the legacy, default
+  # value for any config predating this field) reproduces every line
+  # below completely unchanged; 'closed_form' skips the expensive
+  # iml::Shapley perturbation-refit block entirely and instead returns
+  # this fit's own u/mu (fm$ETA[[1]]$u / fm$mu - already computed for
+  # free by the ONE main BGLR fit above, no extra BGLR call) so
+  # genomic_prediction.py can compute the exact VanRaden-identity
+  # closed-form effect on the Python side (models/kernel_effects.py::
+  # gblup_closed_form_effects()) - see that module's own docstring for
+  # the full derivation.
+  effect_method <- if (length(params) >= 14 && !is.na(params[14])) as.character(params[14]) else 'iml_shapley'
 
   # A process- and call-unique id for BGLR's saveAt path - see RKHS.R for the
   # full explanation. In short: the same './Result/<RESULT_NAME>/GBLUP_'
@@ -114,9 +129,21 @@ GBLUP <- function(train, valid, test, params, RESULT_NAME, K_precomputed=NULL){
   
   y_test <- y
   y_test[(nrow(data)-(nrow(valid)+nrow(test))+1):nrow(data)] <- NA
+
+  # ver4-25, R8 (design blueprint SS2, Stage 6) - see rrBLUP.R's
+  # identical comment. NOTE: the legacy iml::Shapley effect refit
+  # (true_model(), further below) is NOT weighted this stage - it is
+  # superseded by the Stage 7 closed-form GBLUP effect route (blueprint
+  # R13) and is a disclosed scope decision (ver4-25 Change Summary Part
+  # 3) rather than an oversight.
+  if (is.null(weights)) {
+    w_full <- rep(1, nrow(data))
+  } else {
+    w_full <- c(sqrt(as.numeric(unlist(weights))), rep(1, nrow(valid) + nrow(test)))
+  }
   
   fm <- BGLR(y=y_test,ETA=list(list(K = G, model = "RKHS")),
-             nIter=nIter,burnIn=burnIn,verbose=FALSE,saveAt=next_save_prefix('GBLUP'))
+             nIter=nIter,burnIn=burnIn,verbose=FALSE,weights=w_full,saveAt=next_save_prefix('GBLUP'))
   
   y_predicted <- fm$yHat[(nrow(data)-nrow(test)+1):nrow(data)]
   y_actual <- y[(nrow(data)-nrow(test)+1):nrow(data)]
@@ -135,9 +162,25 @@ GBLUP <- function(train, valid, test, params, RESULT_NAME, K_precomputed=NULL){
       y_actual_valid <- data.frame()
   }
   
-  if (get_effect == TRUE){
+  # ver4-25, Stage 7 (R13): the 'closed_form' route needs only this
+  # already-completed fit's own u/mu - no perturbation refits, so it
+  # skips the ENTIRE iml::Shapley block below (all_marker_names/
+  # top_positions/true_model()/the Shapley$new() loop) whenever it is
+  # selected, returning them as new r_u/r_mu list elements instead of a
+  # populated r_effect - genomic_prediction.py computes the actual
+  # per-marker effect vector from these on the Python side and assigns
+  # it into the SAME 'effect' slot downstream, so every existing
+  # r_list_get(result, 'r_effect') caller is unaffected in shape, only
+  # in WHERE the numbers were computed.
+  if (get_effect == TRUE && effect_method == 'closed_form') {
+    effect <- data.frame()
+    r_u <- fm[["ETA"]][[1]][["u"]]
+    r_mu <- fm[["mu"]]
+  } else if (get_effect == TRUE){
     all_marker_names <- colnames(data)[1:(ncol(data)-1)]
     n_features <- length(all_marker_names)
+    r_u <- NA
+    r_mu <- NA
 
     # Cheap, model-agnostic importance proxy: absolute correlation with the
     # trait, computed on the training portion only (O(N*M), no extra model
@@ -266,13 +309,17 @@ GBLUP <- function(train, valid, test, params, RESULT_NAME, K_precomputed=NULL){
     }
   }else{
     effect <- data.frame()
+    r_u <- NA
+    r_mu <- NA
   }
-  
-  return(list(r_pearson=pearson, 
-              r_MSE=MSE, 
-              r_effect=effect, 
-              r_y_predicted=y_predicted, 
-              r_y_predicted_valid=y_predicted_valid, 
-              r_y_predicted_train=y_predicted_train))
-  
+
+  return(list(r_pearson=pearson,
+              r_MSE=MSE,
+              r_effect=effect,
+              r_y_predicted=y_predicted,
+              r_y_predicted_valid=y_predicted_valid,
+              r_y_predicted_train=y_predicted_train,
+              r_u=r_u,
+              r_mu=r_mu))
+
 }

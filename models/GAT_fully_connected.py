@@ -12,10 +12,20 @@ from torch_geometric.explain import Explainer, CaptumExplainer
 from pipeline_utils import (
     get_active_compute_resources, apply_torch_compute_settings, gpu_slot,
     dataloader_num_workers, torch_eval_batch_size, split_batched_edge_attention,
+    is_lean_search_fit,
 )
+from models.gat_search import fully_connected_edge_index, lean_search_fit
+from models.gat_stability import gat_stable
 
 
-def GAT_fully_connected(data_train, data_valid, data_test, params):
+@gat_stable('GAT_fully_connected')
+def GAT_fully_connected(data_train, data_valid, data_test, params, *, sample_weight_ctx=None):
+    # ver4-25, R8 (design blueprint SS2, Stage 6): see
+    # models/GAT_infinitesimal.py's identical comment - `_w_fit` is
+    # attached per-graph (`tmp.w`) and used for a weighted training loss;
+    # `None` (every pre-ver4-25 caller) is byte-identical (I11).
+    _w_fit = sample_weight_ctx.w_fit if sample_weight_ctx is not None else None
+
  
     if data_valid.shape[0] != 0:
         VALID = True
@@ -33,7 +43,24 @@ def GAT_fully_connected(data_train, data_valid, data_test, params):
     heads = params[6]
     marker_effect = params[7]
     samples = params[8]
-    
+
+    # ver4-46, R1: inside a hyperparameter-SEARCH fit that asked for the lean path
+    # (HP_TUNE_FAST['gat_lean_fit']) only the validation predictions are read, so skip
+    # the per-individual graph lists, the DataLoaders, the test/train/attention passes
+    # and the edge-name lists (models/gat_search.py). Same layers, same random draws,
+    # same validation predictions. Never taken by the confirmatory fit or an untuned
+    # fit (I11), and never without a validation split.
+    if VALID and is_lean_search_fit():
+        _m = data_train.shape[1] - 1
+        _predicted_valid = lean_search_fit(
+            geno_train=data_train.iloc[:, :-1], y_train=data_train.iloc[:, -1].to_numpy(),
+            geno_valid=data_valid.iloc[:, :-1], w_fit=_w_fit,
+            edge_index=fully_connected_edge_index(_m), n_markers=_m,
+            neuron=neuron, dropout=dropout, lrate=lrate, decay=decay, epochs=epoch,
+            bsize=bsize, heads=heads, attention_arg=True)
+        return (float('nan'), float('nan'), pd.DataFrame(), [], _predicted_valid, [],
+                pd.DataFrame())
+
     ## Preprocess the data so that it can be converted into a graph format    
     if VALID:
         data_QTL_train,data_QTL_valid, data_QTL_test = data_train.iloc[:,:-1].reset_index(drop=True), data_valid.iloc[:,:-1].reset_index(drop=True), data_test.iloc[:,:-1].reset_index(drop=True)
@@ -122,6 +149,8 @@ def GAT_fully_connected(data_train, data_valid, data_test, params):
         data_pheno_train_tmp = np.expand_dims(np.array(data_pheno_train[kk]),axis=0)
         tmp.x = torch.from_numpy(data_QTL_melt_train_tmp.to_numpy(dtype=float)).to(torch.float)
         tmp.y = torch.from_numpy(data_pheno_train_tmp).to(torch.float)
+        if _w_fit is not None:
+            tmp.w = torch.from_numpy(np.expand_dims(np.array(_w_fit[kk], dtype=float), axis=0)).to(torch.float)
         tmp.edge_index = edge_index_train_base.clone()
         data_train += [tmp]
     
@@ -227,7 +256,11 @@ def GAT_fully_connected(data_train, data_valid, data_test, params):
                 optimizer.zero_grad()
                 with torch.autocast(device_type=device.type, enabled=use_amp):
                     out = model(batch.x,batch.edge_index,batch.batch,None)
-                    loss = F.mse_loss(torch.squeeze(out), batch.y)
+                    if _w_fit is None:
+                        loss = F.mse_loss(torch.squeeze(out), batch.y)
+                    else:
+                        _sq_err = (torch.squeeze(out) - batch.y) ** 2
+                        loss = (_sq_err * batch.w).sum() / batch.w.sum().clamp_min(1e-12)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()

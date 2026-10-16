@@ -656,3 +656,25 @@ def prepare_biological_prior(json_path, location_lookup, out_gene_list_csv,
           f"'{out_adjacency_csv}' ({dropped and len(dropped) or 0} gene(s) dropped: {dropped}).")
 
     return gene_list, adjacency, edge_list, dropped
+
+
+def preview_prior(json_path, location_lookup, unit='bp', include_mediated_edges=False, max_hops=3,
+                  save_gene_list_path=None, save_edge_list_path=None):
+    """Single entry point for the GUI's "Preview + use" buttons (previously the same
+    load -> candidates -> gene list -> adjacency -> optional save sequence was pasted
+    three times in main_app.py). Same calls, same order, same outputs as
+    prepare_biological_prior(); the two save paths are optional.
+
+    Returns (n_gene_rows, n_edges, dropped_gene_ids).
+    """
+    network = load_network_json(json_path)
+    candidate_genes = extract_candidate_genes(network)
+    gene_list, dropped = build_gene_list(candidate_genes, location_lookup, unit=unit)
+    adjacency, edge_list = build_gene_adjacency(
+        network, gene_list, include_mediated_edges=include_mediated_edges, max_hops=max_hops
+    )
+    if save_gene_list_path:
+        save_gene_list_csv(gene_list, save_gene_list_path)
+    if save_edge_list_path:
+        save_adjacency(adjacency, edge_list, edge_list_csv_path=save_edge_list_path)
+    return int(gene_list.shape[0]), int(edge_list.shape[0]), list(dropped)

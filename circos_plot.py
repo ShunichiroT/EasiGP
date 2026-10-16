@@ -16,9 +16,15 @@ import math
 import re
 import time
 import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import pickle
+from concurrent.futures import ProcessPoolExecutor, as_completed, wait, FIRST_COMPLETED
 
-from pipeline_utils import unify_columns_by_position
+from pipeline_utils import unify_columns_by_position, is_naive_ensemble_label, is_wopt_label
+import plot_style as _ps
+# Memory-bounded (dictionary-coded, streaming, spill-capable) reduction of the
+# marker-pair interaction/attention tables - see interaction_reduce.py. Pure
+# NumPy/pandas with no project imports, so this is a safe downward import.
+from interaction_reduce import PairSumStore, store_from_frame
 
 # ---------------------------------------------------------------------------
 # Performance (multi-CPU circos-plot rendering): circos_plot()'s own
@@ -59,6 +65,9 @@ _CIRCOS_WORKER_CTX = None
 # every model process) or being re-derived here a second time (the
 # defect R2 exists to fix in the first place).
 import circos_geometry
+# Region highlighting (links coming from chosen genome regions) - pure helpers
+# shared with main_app.py's GUI table/preview; see that module's docstring.
+import circos_highlight as _hl
 
 # ver4-4 R7.b - module-level cache for _load_combined_marker_info() below.
 # Cleared at the top of every circos_plot() call (see that function) so it
@@ -405,6 +414,12 @@ def _load_combined_marker_info(marker_info, RESULT_NAME, PHENOTYPE):
 
     pattern = os.path.join('.', 'Result', RESULT_NAME, f'*_gene_coordinates_{PHENOTYPE}.csv')
     gene_coord_files = glob.glob(pattern)
+    if not gene_coord_files and os.path.dirname(RESULT_NAME):
+        # Multi-option runs (BLUEs / BLUPs ...) plot into
+        # 'Result/<RESULT_NAME>/<option tag>/' but the side artefacts a
+        # model wrote (gene-coordinate tables) live in the parent run folder.
+        gene_coord_files = glob.glob(os.path.join(
+            '.', 'Result', os.path.dirname(RESULT_NAME), f'*_gene_coordinates_{PHENOTYPE}.csv'))
     if not gene_coord_files:
         combined = marker
     else:
@@ -459,7 +474,10 @@ def data_conversion(chrom_info, gene_info, PHENOTYPE, RESULT_NAME, gene_adjust=0
     # being compared/indexed against each other (see the fix a few lines
     # down) is exactly the kind of thing that can silently work in a
     # simple case and silently break in a different one.
-    chromosome['population'] = chromosome['population'].astype(str)
+    # ver4-75: _clean_population_label() (not a bare astype(str)) so a file
+    # that writes the population as 2, 2.0 or '2' all become the SAME '2'
+    # the effect/POPULATION side uses.
+    chromosome['population'] = _remap_population_column(chromosome['population'], _clean_population_label)
     chromosome_population = pd.unique(chromosome['population'])
     
     # ver4-4 R7.a (blueprint §2.7.1/§2.7.2, root-cause finding R7.a):
@@ -489,7 +507,7 @@ def data_conversion(chrom_info, gene_info, PHENOTYPE, RESULT_NAME, gene_adjust=0
         )
         # Requirement (bugfix): same explicit str cast as chromosome
         # above, and for the same reason - see that comment.
-        gene['population'] = gene['population'].astype(str)
+        gene['population'] = _remap_population_column(gene['population'], _clean_population_label)
 
         # Requirement: gene regions are often too small to actually see
         # on the plot (a modest-sized gene against a whole chromosome's
@@ -616,7 +634,211 @@ def data_conversion(chrom_info, gene_info, PHENOTYPE, RESULT_NAME, gene_adjust=0
         
     return pop_source
 
-def quantile_conversion(effect_grouped_all, effect_grouped_pop, marker_info, chrom_info, PHENOTYPE, MODEL, end_adjust, POPULATION, WINDOW, RESULT_NAME, ASCENDING):
+def _window_division(window, chrom_end_max):
+    """Bin edges ``[window*0, window*1, ..., window*k]`` for
+    ``quantile_conversion()``'s ``pd.cut(...)`` - performance fix.
+
+    The previous implementation built this list with a Python ``for`` loop
+    that ran once per bin, and ``quantile_conversion()`` calls it for EVERY
+    (phenotype, population) pair. Its iteration bound was
+    ``int(chromosome['end'].max())`` (one iteration per coordinate unit
+    when ``window`` is small), so a chromosome length expressed in bp with
+    a modest ``WINDOW`` meant hundreds of millions of interpreter-level
+    iterations per call. This computes the identical edges with one
+    ``numpy`` expression.
+
+    Semantics reproduced exactly from the loop it replaces: append
+    ``window*cnt`` for ``cnt = 0, 1, 2, ...``; stop right after appending
+    the first ``window*cnt`` whose successor ``window*(cnt+1)`` exceeds
+    ``chrom_end_max``; never append more than ``chrom_end_max`` values.
+    A non-positive ``window`` is handed to the original loop unchanged.
+    """
+    if window <= 0:
+        division = []
+        cnt = 0
+        for n in range(int(chrom_end_max)):
+            division += [window*cnt]
+            cnt += 1
+            if window*cnt > int(chrom_end_max):
+                break
+        return division
+    k = int(np.floor(chrom_end_max / window))
+    while window * (k + 1) <= chrom_end_max:
+        k += 1
+    while k > 0 and window * k > chrom_end_max:
+        k -= 1
+    n_edges = min(k + 1, max(int(chrom_end_max), 0))
+    return (window * np.arange(n_edges)).tolist()
+
+
+# ---------------------------------------------------------------------------
+# ver4-31, R10 (bug fix): which HUE ('red' = ensemble ring, 'blue' = single
+# model ring) a marker-effect ring gets. This used to be an exact-name list
+# in two places (quantile_conversion() and plot()) that missed every
+# 'ensemble__<algo>' label (per-method HP_TUNE grouping) and 'Joint Bayesian
+# optimisation' (ver4-26), colouring those ensemble rings blue. The label
+# predicates below are the SAME authority pipeline_utils / diversity_summary
+# / weight_plot use to recognise an ensemble label (invariant I3).
+# `ensemble_hue_rule='legacy_list'` (CIRCOS_CONFIG) restores the old list
+# exactly, as a rollback.
+# ---------------------------------------------------------------------------
+_LEGACY_ENSEMBLE_HUE_LABELS = ('ensemble', 'Linear transformation', 'Nelder Mead',
+                               'Bayesian optimisation', 'Analytic least-squares')
+ENSEMBLE_HUE_RULES = ('predicates', 'legacy_list')
+
+
+def _ring_hue(label, rule='predicates'):
+    """`'red'` for an ensemble ring, `'blue'` for a single-model ring."""
+    if rule == 'legacy_list':
+        return 'red' if label in _LEGACY_ENSEMBLE_HUE_LABELS else 'blue'
+    return 'red' if (is_naive_ensemble_label(label) or is_wopt_label(label)) else 'blue'
+
+
+def _ensemble_hue_rule(circos_config):
+    rule = (circos_config or {}).get('ensemble_hue_rule', 'predicates')
+    return rule if rule in ENSEMBLE_HUE_RULES else 'predicates'
+
+
+# --------------------------------------------------------------------------- #
+# ver4-31 R14: label the top-N markers (or the genes they fall in) of one model
+# outside the outer ring. `quantile_conversion()` writes the sidecar table
+# (it is the only place the continuous effects are still around); `plot()`
+# reads it back and draws the labels.
+# --------------------------------------------------------------------------- #
+
+LABEL_SOURCE_CONSENSUS_NAMES = ('consensus', 'consensus_ring')   # ver4-45: `label_source` values meaning "the consensus ring"
+_LABEL_POOL_MAX = 3000       # ver4-45: cap on the candidate pool written beside the top-N label table
+
+
+def _label_options(circos_config):
+    """`{'top', 'source', 'min_sep'}` from `CIRCOS_CONFIG.label_top_markers`
+    (0 = off), `.label_source` ('ensemble' or a model label) and
+    `.label_min_sep_deg`."""
+    c = circos_config or {}
+    try:
+        top = max(int(c.get('label_top_markers', 0) or 0), 0)
+    except (TypeError, ValueError):
+        top = 0
+    try:
+        sep = float(c.get('label_min_sep_deg', 2.0))
+    except (TypeError, ValueError):
+        sep = 2.0
+    _src = str(c.get('label_source', 'ensemble') or 'ensemble').strip() or 'ensemble'
+    return {'top': top, 'source': _src,
+            'consensus': _src.lower() in LABEL_SOURCE_CONSENSUS_NAMES,      # ver4-45: label the consensus ring's top windows
+            'min_sep': sep if sep > 0 else 2.0}
+
+
+def _label_model(MODEL, source):
+    """Which model's effects are labelled: `source` when it names a model in
+    `MODEL`; for 'ensemble' the naive ensemble ('ensemble' /
+    'ensemble__<algo>') when present; otherwise the first model."""
+    models = list(MODEL)
+    if not models:
+        return None
+    if source in models:
+        return source
+    if source == 'ensemble':
+        for m in models:
+            if is_naive_ensemble_label(m):
+                return m
+    return models[0]
+
+
+def _label_table_path(RESULT_NAME, PHENOTYPE, POPULATION):
+    return _circos_intermediate_dir(RESULT_NAME)+'/marker_effect_top_'+str(PHENOTYPE)+'_'+str(POPULATION)+'.tsv'
+
+
+def _atomic_to_csv(frame, path, **kw):
+    """`frame.to_csv(path)` via a per-process temp file + `os.replace`, so a
+    sibling worker process (circos renders one (phenotype, population) across
+    several processes, each rebuilding the same consensus/label sidecars) never
+    reads a half-written file."""
+    tmp = f"{path}.tmp{os.getpid()}"
+    frame.to_csv(tmp, **kw)
+    os.replace(tmp, path)
+
+
+def _label_pool_path(label_tsv):
+    """Sidecar holding a LONGER, ranked candidate list for the same label table
+    (ver4-45). The N strongest rows are what the user-facing table lists; the
+    pool is what `_add_top_marker_labels()` draws from, so that when several of
+    the top-N hits collapse onto one gene label (or fall on a chromosome that is
+    not plotted) the next-strongest candidates take their place and exactly N
+    distinct labels are drawn."""
+    return label_tsv[:-4] + '_pool.tsv' if label_tsv.endswith('.tsv') else label_tsv + '_pool'
+
+
+def _write_label_table(path, frame, top, pool_n=None):
+    """Write the `top` largest-effect rows of `frame` (columns chromosome, start,
+    end, name, value[, tiebreak]) as chromosome / pos / name / value, and (ver4-45)
+    a ranked candidate pool of up to `pool_n` rows beside it (`_label_pool_path`).
+    `tiebreak`, when present, orders rows whose `value` is equal (the consensus
+    ring's integer counts tie constantly)."""
+    f = frame.copy()
+    f['value'] = pd.to_numeric(f['value'], errors='coerce')
+    f = f[np.isfinite(f['value'].to_numpy(dtype=float))]
+    sort_cols, ascending = ['value'], [False]
+    if 'tiebreak' in f.columns:
+        f['tiebreak'] = pd.to_numeric(f['tiebreak'], errors='coerce').fillna(0.0)
+        sort_cols, ascending = ['value', 'tiebreak'], [False, False]
+    f = f.sort_values(sort_cols, ascending=ascending, kind='mergesort')
+    top = int(top)
+    if pool_n is None:
+        pool_n = min(max(top * 10, top + 50), _LABEL_POOL_MAX)
+
+    def _shape(g):
+        return pd.DataFrame({'chromosome': g['chromosome'].astype(str),
+                             'pos': (pd.to_numeric(g['start']) + pd.to_numeric(g['end'])) / 2.0,
+                             'name': g['name'].astype(str), 'value': g['value']})
+
+    _atomic_to_csv(_shape(f.head(top)), path, sep='\t', index=False)
+    _atomic_to_csv(_shape(f.head(max(int(pool_n), top))), _label_pool_path(path), sep='\t', index=False)
+
+
+_GENE_LABEL_UNAVAILABLE_LOGGED = False
+
+
+def _gene_names_for_markers(label_frame, gene_tsvs):
+    """`{marker name: gene name}` for the labelled markers that fall inside a
+    gene-ring region (interval overlap via the shared `pipeline_utils.
+    markers_in_windows`, I6). Empty when there is no gene ring or the helper
+    cannot run (logged once)."""
+    global _GENE_LABEL_UNAVAILABLE_LOGGED
+    frames = []
+    for path in gene_tsvs:
+        try:
+            g = pd.read_csv(path, sep='\t', dtype={'chromosome': str})
+        except Exception:
+            continue
+        if {'chromosome', 'start', 'end'}.issubset(g.columns) and g.shape[0]:
+            name_col = 'name' if 'name' in g.columns else ('index' if 'index' in g.columns else None)
+            if name_col is not None:
+                frames.append(g[['chromosome', 'start', 'end', name_col]].rename(columns={name_col: 'name'}))
+    if not frames:
+        return {}
+    regions = pd.concat(frames, ignore_index=True)
+    marker_df = pd.DataFrame({'chromosome': label_frame['chromosome'].astype(str),
+                              'name': label_frame['name'].astype(str),
+                              'start': label_frame['pos'], 'end': label_frame['pos']})
+    try:
+        from pipeline_utils import markers_in_windows
+        hits = markers_in_windows(regions, marker_df, marker_df['name'].tolist(), window=0.0,
+                                  mode='all_in_window')
+    except Exception as exc:
+        if not _GENE_LABEL_UNAVAILABLE_LOGGED:
+            print(f"[circos_plot] NOTE: gene names for the labelled markers unavailable ({exc!r}); "
+                  f"marker names are used instead.")
+            _GENE_LABEL_UNAVAILABLE_LOGGED = True
+        return {}
+    out = {}
+    for gene_name, members in zip(regions['name'].astype(str).tolist(), hits):
+        for m in members:
+            out.setdefault(str(m), gene_name)
+    return out
+
+
+def quantile_conversion(effect_grouped_all, effect_grouped_pop, marker_info, chrom_info, PHENOTYPE, MODEL, end_adjust, POPULATION, WINDOW, RESULT_NAME, ASCENDING, ensemble_hue_rule='predicates', label_cfg=None):
     """Assign each marker a 10-level colour bucket ('<hue><0-9>') from its
     mean effect for one (PHENOTYPE, POPULATION) pair, per model, and write
     one `marker_effect_<model>_<phenotype>_<population>.tsv` per surviving
@@ -646,20 +868,18 @@ def quantile_conversion(effect_grouped_all, effect_grouped_pop, marker_info, chr
     chromosome['chromosome'] = chromosome['chromosome'].astype(str)
     
     if WINDOW != 0:
-        division = []
-        cnt = 0
-        for n in range(int(chromosome['end'].max())):
-            division += [WINDOW*cnt]
-            cnt += 1
-            if WINDOW*cnt > int(chromosome['end'].max()):
-                break
+        division = _window_division(WINDOW, int(chromosome['end'].max()))
 
     effect_grouped = effect_grouped_all if POPULATION == 'all' else effect_grouped_pop
     
     REMOVE = []
+
+    _lopts = _label_options(label_cfg)
+    _label_model_name = (_label_model(MODEL, _lopts['source'])
+                         if (_lopts['top'] > 0 and not _lopts['consensus']) else None)   # ver4-45: consensus labels are built in plot()
     
     for iii in range(len(MODEL)):
-        colour = 'red' if MODEL[iii] in ['ensemble', 'Linear transformation', 'Nelder Mead', 'Bayesian optimisation', 'Analytic least-squares'] else 'blue'
+        colour = _ring_hue(MODEL[iii], ensemble_hue_rule)      # ver4-31 R10
         if POPULATION == 'all':
             effect_selected = effect_grouped[(effect_grouped['model']==MODEL[iii]) & (effect_grouped['phenotype']==PHENOTYPE)].iloc[:,3:].T
         else:
@@ -756,6 +976,11 @@ def quantile_conversion(effect_grouped_all, effect_grouped_pop, marker_info, chr
                 
                 marker = _load_combined_marker_info(marker_info, RESULT_NAME, PHENOTYPE)
                 merged = pd.merge(effect_selected_copy, marker, left_on=['index'], right_on=['name'])
+                if _label_model_name is not None and MODEL[iii] == _label_model_name:
+                    # ver4-31 R14: the labelled model's top markers (marker centre, effect).
+                    _lt = merged[['chromosome', 'start', 'end', 'index']].rename(columns={'index': 'name'})
+                    _lt['value'] = _lt['name'].map(effect_selected.iloc[:, 0].astype(float))
+                    _write_label_table(_label_table_path(RESULT_NAME, PHENOTYPE, POPULATION), _lt, _lopts['top'])
                 merged = merged.loc[:,['chromosome','start','end','index','colour']]
                 # Requirement (bugfix - END_ADJUST could overflow into a
                 # wildly wrong number for a large coordinate): explicit
@@ -852,7 +1077,36 @@ def quantile_conversion(effect_grouped_all, effect_grouped_pop, marker_info, chr
                         (effect_selected['start'] < _chrom_start), 'start'
                     ] = _chrom_start
                 if not _all_zero_effect:
-                    effect_selected = effect_selected[effect_selected['effect'] > 0].reset_index(drop=True)
+                    _positive_effect_selected = effect_selected[effect_selected['effect'] > 0].reset_index(drop=True)
+                    if _positive_effect_selected.shape[0] == 0:
+                        # Requirement (bugfix - crash report, ver4-11
+                        # circos IndexError): binning GROUPS several
+                        # markers together and SUMS their effects
+                        # (the groupby(...).sum() a few lines above)
+                        # before this filter ever runs. `_all_zero_effect`
+                        # above is computed from the RAW, pre-binning
+                        # per-marker values, so "not every raw marker's
+                        # effect is <= 0" does NOT guarantee "at least
+                        # one bin's SUMMED effect is > 0" - a few small
+                        # positive markers can still net negative once
+                        # summed into the same bin as larger negative
+                        # neighbours. When every bin nets <= 0 this way,
+                        # the '> 0' filter below used to empty
+                        # effect_selected entirely even though
+                        # _all_zero_effect was False, and np.quantile()
+                        # on the resulting empty array raised
+                        # 'IndexError: index -1 is out of bounds for
+                        # axis 0 with size 0' a few lines down. Falling
+                        # through to the SAME colour0-for-every-row
+                        # treatment the genuine all-zero-effect case
+                        # already gets (the 'else' branch just below) is
+                        # correct here too: there is no positively-net
+                        # bin left to build a decile scale from, so
+                        # every bin is coloured the lowest/faintest
+                        # level instead of crashing.
+                        _all_zero_effect = True
+                    else:
+                        effect_selected = _positive_effect_selected
                 # else: keep every row (would otherwise be filtered down
                 # to 0 rows, since every effect is exactly 0) - all get
                 # assigned colour0 directly below instead.
@@ -875,6 +1129,13 @@ def quantile_conversion(effect_grouped_all, effect_grouped_pop, marker_info, chr
                     _levels = np.searchsorted(_thresholds, _values, side='right')
                     effect_selected_copy.iloc[:, 2] = [f"{colour}{lvl}" for lvl in _levels]
                 
+                if _label_model_name is not None and MODEL[iii] == _label_model_name:
+                    # ver4-31 R14: the labelled model's top windows (window centre, summed effect).
+                    _lt = effect_selected[['chromosome', 'start', 'end']].copy()
+                    _lt['name'] = [f"{c}:{int((a + b) / 2)}" for c, a, b in
+                                   zip(_lt['chromosome'], _lt['start'], _lt['end'])]
+                    _lt['value'] = effect_selected['effect'].to_numpy(dtype=float)
+                    _write_label_table(_label_table_path(RESULT_NAME, PHENOTYPE, POPULATION), _lt, _lopts['top'])
                 merged = effect_selected_copy.loc[:,['chromosome', 'start', 'end', 'index', 'effect']]
                 merged = merged.rename(columns={'effect':'colour'})
                 
@@ -986,6 +1247,29 @@ def _select_top_interactions(df, circos_config):
     `models.interaction_extraction.top_select()`'s own 'percentage'
     mode - see that function's own "Bug fix" note for the full
     reproduction.
+
+    Bug fix (round-to-zero starvation on small candidate tables)
+    --------------------------------------------------------------
+    `_m = round(df.shape[0] * interaction_top / 100)` rounds DOWN to
+    ``0`` whenever `df` has fewer than roughly ``50 / interaction_top``
+    rows - e.g. under 50,000 rows at this GUI's own default
+    `interaction_top=0.001` - even when `interaction_top` is genuinely
+    positive and `nonzero` contains real, scored interactions. Confirmed
+    directly: a 66-row shapiq_tree interaction table, entirely nonzero,
+    renders zero links at this default (`_m` rounds to 0) while the
+    identical table renders every link once `interaction_top=100`. This
+    was invisible for the exhaustive `pairwise_shap`/`friedman_h` routes
+    (whose shortlist-scan candidate tables comfortably exceed 50,000
+    rows at the default 500-marker shortlist) but is the reliable,
+    reported failure mode for every shapiq-based route (`shapiq_tree`,
+    `shapiq`, `surrogate_shapiq`), whose budget-bounded or depth-capped
+    output is inherently far smaller - "extracted interactions are not
+    shown in circos plot when using shapiq". The fix floors `_m` at 1
+    whenever a positive `interaction_top` was requested and at least one
+    genuinely-scored (nonzero) row exists, so "some positive percentage
+    of a nonempty, real result" never rounds down to "nothing shown".
+    Mirrors (and must be kept in sync with) the identical fix in
+    `models.interaction_extraction.top_select()`.
     """
     mode = circos_config.get('interaction_top_mode', 'percentage')
     if mode == 'count':
@@ -995,7 +1279,11 @@ def _select_top_interactions(df, circos_config):
     # 'percentage' (default) - rank-based top-N%, not a quantile
     # threshold. See this function's own "Bug fix" note above.
     nonzero = df[df['value'] > 0]
-    _m = int(round(df.shape[0] * (circos_config['interaction_top'] / 100)))
+    _interaction_top = circos_config['interaction_top']
+    _m = int(round(df.shape[0] * (_interaction_top / 100)))
+    if _m == 0 and _interaction_top > 0 and nonzero.shape[0] > 0:
+        # Bug fix (round-to-zero starvation) - see docstring above.
+        _m = 1
     _m = max(0, min(_m, nonzero.shape[0]))
     return nonzero.nlargest(_m, 'value').reset_index(drop=True)
 
@@ -1071,7 +1359,7 @@ def _regroup_and_finalize_mean(df, group_cols):
     return grouped.drop(columns=['value_sum', 'value_count'])
 
 
-def _precompute_interaction_groups(df, *, scope_model_order_by_population):
+def _precompute_interaction_groups(df, *, scope_model_order_by_population, circos_config=None, population_map=None, restrict=None):
     """Requirement (performance fix - circos plot generation "taking
     forever" once more than one interaction-emitting model is selected,
     e.g. RKHS + RF + SVR + KNN together):
@@ -1171,16 +1459,707 @@ def _precompute_interaction_groups(df, *, scope_model_order_by_population):
             derived inline, computed once instead of once per
             (PHENOTYPE, POPULATION) call. Always has exactly one key
             ('all') when `scope_model_order_by_population` is False.
+
+    Update ID circos-oom-fix (OOM fix - "memory error while creating the circos
+    plot even with 900 GB", reproduced with four interaction-emitting
+    models and ``interaction_top='all'``): the reduction above used to run
+    as plain pandas ``groupby`` calls over five *object* (Python string)
+    columns, i.e. ~150-300 bytes per (population, model, phenotype,
+    marker1, marker2) group, made three more full-size copies of that table
+    (`work`, `_all_reduced`, `_pop_reduced`), kept every per-key slice
+    alive, and then PICKLED the whole dict into every worker process of the
+    parallel fan-out. G (the distinct group count) scales with
+    pairs x models x phenotypes x populations, so with several models and
+    a large interaction shortlist it reaches hundreds of millions.
+
+    It now goes through `interaction_reduce.PairSumStore`: names are
+    dictionary-coded once (24 bytes per group), the reduction is a
+    hash-factorize + bincount, the running total spills to disk past a
+    resident-row budget, and - the key point - the "top N% / top M"
+    selection circos applies anyway (`_select_top_interactions()`) is done
+    HERE, per (population, model, phenotype) key, straight on the numeric
+    arrays, so only the rows that will actually be drawn are ever decoded to
+    strings or kept in `groups`. The numbers (means, which rows are kept,
+    their order, tie-breaks) are identical to the old path; see
+    `interaction_reduce.select_top_indices()`.
+
+    Extra parameters
+    ----------------
+    df may also be a `PairSumStore` (what `ResultSet.interactions_grouped()`
+    / `attention_grouped()` now return - already streamed and coded, never a
+    materialised DataFrame).
+    circos_config : when given, `groups` holds only the already-selected
+        rows (``df.attrs['top_selected']`` is set so
+        `_build_interaction_ring()` does not select a second time). None
+        keeps the legacy "full per-key table" behaviour.
+    population_map : optional ``str -> str`` population-label rewrite (the
+        'between'-scenario ``'train->test'`` -> ``'test'`` split); labels
+        that collide are merged by summing sum/count before the mean.
+    restrict : optional ``{'mask_for', 'match'}`` from `_highlight_restrict()` - keep only the
+        pairs involving the highlighted regions BEFORE the top-N%/top-M cut (see
+        `PairSumStore.reduce_groups`). None (default) = legacy behaviour.
     """
-    if df.shape[0] == 0:
+    if isinstance(df, PairSumStore):
+        store = df
+    else:
+        if df is None or df.shape[0] == 0:
+            return {}, {}
+        # in-memory tables keep the legacy first-appearance model order
+        store = store_from_frame(df, order_mode='appearance')
+    return store.reduce_groups(
+        population_map=population_map,
+        select=_selection_spec(circos_config),
+        scope_model_order_by_population=scope_model_order_by_population,
+        restrict=restrict,
+    )
+
+
+def _selection_spec(circos_config):
+    """`interaction_reduce.PairSumStore.reduce_groups(select=...)` spec for
+    `_select_top_interactions()`'s settings, or None when no config was
+    given (legacy: keep every row, select later in `_build_interaction_ring`)."""
+    if circos_config is None:
+        return None
+    return {
+        'mode': circos_config.get('interaction_top_mode', 'percentage'),
+        'top_percent': circos_config.get('interaction_top', 0),
+        'top_count': circos_config.get('interaction_top_count', 0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Update ID ver4-25, R12 (blueprint "Glyph geometry"/"Data flow"): k>=3
+# interaction-hyperedge support - Option A ("one circos per k; hyperedges as
+# hub-and-spoke glyphs", chosen over chord-decomposition (ambiguous - a
+# triple reads identically to 3 independent pairs) and filled-polygon
+# ribbons (occlusion) - see the blueprint's own design-space table). Every
+# function in this block is ADDITIVE: none of it runs, and none of the
+# existing k=2 chord code above is touched, unless `interactions_hok`
+# actually has rows for the (PHENOTYPE, POPULATION, model, order) being
+# rendered - which is only possible when a shapiq-based interaction method
+# was selected with an order>=3 request (checkpoint_utils.
+# _model_requests_higher_order_interactions()) - so a run that never
+# touches this feature renders byte-identically to before it existed
+# (AC12.3).
+# ---------------------------------------------------------------------------
+
+# Colourblind-safe qualitative palette (Okabe-Ito) used ONLY by the
+# 'combined' higher-order layout's own "colour = k" scheme (blueprint's own
+# wording) - the existing red/blue intra-/inter-chromosome convention used
+# everywhere else in this module (every k=2 chord, and every k>=3 hub glyph
+# under the DEFAULT 'per_order' layout) is completely untouched by this
+# palette; it only ever appears on a 'combined'-layout render.
+_OKABE_ITO_PALETTE = ('#E69F00', '#56B4E9', '#009E73', '#F0E442',
+                      '#0072B2', '#D55E00', '#CC79A7', '#000000')
+
+
+def _okabe_ito_colour_for_order(order: int) -> str:
+    """`_OKABE_ITO_PALETTE`, cycled starting at k=2 - deterministic across
+    every 'combined'-layout render (the SAME order always gets the SAME
+    colour, run to run, plot to plot), which is what makes a `combined`
+    figure's own per-order legend entries meaningful rather than
+    arbitrary."""
+    idx = max(0, int(order) - 2) % len(_OKABE_ITO_PALETTE)
+    return _OKABE_ITO_PALETTE[idx]
+
+
+LINK_SORTS = ('none', 'ascending')
+LINK_SCALES = ('minmax', 'rank')
+LINK_COLOUR_MODES = ('chrom', 'chrom_cvd', 'value')
+# 'chrom_cvd' link colours: Okabe-Ito vermillion (intra) and a violet (inter).
+# The blueprint proposed Okabe-Ito bluish-green / reddish-purple, but measured
+# against blue0-9 / red0-9 of the default cytoband map with the Machado
+# deuteranopia simulation and CIELab distance (main_app's own checker) those
+# sit at Delta-E 20.1 / 14.7 - the reddish-purple misses the required 20.
+# Vermillion / violet measure 33.2 / 25.8 under deuteranopia (and >= 25.8 in the
+# worst case over all three dichromacies) and are 67 apart from each other.
+_CVD_INTRA_COLOUR = '#D55E00'
+_CVD_INTER_COLOUR = '#7B2CBF'
+_LINK_VALUE_CMAP = 'cividis'
+
+
+def _link_options(circos_config):
+    """Validated ver4-31 (R11 / R12) link settings from `CIRCOS_CONFIG`; every
+    key is optional and an absent / unknown value means the legacy behaviour
+    (I11): `link_sort` ('none' | 'ascending'), `link_scale` ('minmax' |
+    'rank'), `link_lw_range` (None | (lo, hi) line widths) and
+    `link_colour_mode` ('chrom' | 'chrom_cvd' | 'value')."""
+    c = circos_config or {}
+
+    def _pick(key, allowed, default):
+        v = str(c.get(key, default) if c.get(key, default) is not None else default).strip().lower()
+        return v if v in allowed else default
+
+    lw = c.get('link_lw_range')
+    try:
+        lo, hi = (float(lw[0]), float(lw[1])) if lw is not None else (None, None)
+        lw = (lo, hi) if lo is not None and 0 < lo <= hi else None
+    except (TypeError, ValueError, IndexError):
+        lw = None
+    return {
+        'sort': _pick('link_sort', LINK_SORTS, 'none'),
+        'scale': _pick('link_scale', LINK_SCALES, 'minmax'),
+        'lw_range': lw,
+        'colour_mode': _pick('link_colour_mode', LINK_COLOUR_MODES, 'chrom'),
+    }
+
+
+def _link_strength(values, circos_config, default_lw, alpha_min=None):
+    """`(alpha, lw, s)` Series (index = `values`' index) for a set of link /
+    hyperedge values: THE shared strength mapping of the k=2 chords and the
+    k>=3 hub glyphs (R11). `s` in [0, 1] is the scaled strength - min-max
+    within the displayed set (legacy) or its rank (`link_scale='rank'`, robust
+    to one huge outlier); `alpha = alpha_min + s*(1 - alpha_min)`; `lw` is
+    `default_lw` unless `link_lw_range=(lo, hi)` maps `s` onto a width."""
+    opts = _link_options(circos_config)
+    if alpha_min is None:
+        alpha_min = (circos_config or {}).get('link_alpha_min', 0.15)
+    v = pd.Series(values, dtype=float)
+    n = len(v)
+    if n == 0:
+        return v.copy(), v.copy(), v.copy()
+    if opts['scale'] == 'rank':
+        from scipy.stats import rankdata as _rd
+        s = pd.Series((_rd(v.to_numpy()) - 1.0) / (n - 1.0) if n > 1 else np.ones(1), index=v.index)
+        constant = n <= 1 or float(v.max()) == float(v.min())
+    else:
+        v_min, v_max = v.min(), v.max()
+        constant = not (v_max > v_min)
+        s = (v - v_min) / (v_max - v_min) if not constant else pd.Series(1.0, index=v.index)
+    if constant:
+        # Every displayed link has the same value (including the common case
+        # of a single link) - nothing to contrast against: fully opaque.
+        alpha = pd.Series(1.0, index=v.index)
+        s = pd.Series(1.0, index=v.index)
+    else:
+        alpha = alpha_min + s * (1.0 - alpha_min)
+    if opts['lw_range'] is not None:
+        lo, hi = opts['lw_range']
+        lw = lo + s * (hi - lo)
+    else:
+        lw = pd.Series(float(default_lw), index=v.index)
+    return alpha, lw, s
+
+
+def _link_colour(mode, is_intra, s=1.0):
+    """Colour of one link / hyperedge under `link_colour_mode` `mode`.
+    'chrom' is the legacy red (intra) / blue (inter) pair."""
+    if mode == 'chrom_cvd':
+        return _CVD_INTRA_COLOUR if is_intra else _CVD_INTER_COLOUR
+    if mode == 'value':
+        import matplotlib as _mpl
+        return _mpl.colors.to_hex(_mpl.colormaps[_LINK_VALUE_CMAP](0.08 + 0.87 * float(s)))
+    return 'red' if is_intra else 'blue'
+
+
+def _sort_links(df, circos_config):
+    """`link_sort='ascending'`: weakest first, so the strongest link is drawn
+    last and sits on top (stable sort, index reset). Otherwise `df` as is."""
+    if _link_options(circos_config)['sort'] == 'ascending' and df.shape[0] > 1:
+        return df.sort_values('value', kind='mergesort').reset_index(drop=True)
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Region highlighting: draw-side helpers. The decisions (which links match a
+# region, the styling numbers, the config contract) live in circos_highlight.py;
+# this block only applies them to pyCirclize. Everything here is inert unless
+# `CIRCOS_CONFIG['highlight_regions']` resolves to at least one region on the
+# plot being drawn, so a run that never asks for it renders exactly as before.
+# ---------------------------------------------------------------------------
+_HL_WARNED = set()
+
+
+def _hl_warn_once(message):
+    """Print `message` once per process (every model of every phenotype/population repeats the
+    same region problems otherwise)."""
+    if message not in _HL_WARNED:
+        _HL_WARNED.add(message)
+        print(f"[circos_plot] highlight: {message}")
+
+
+def _resolve_highlight(circos, circos_config, neutral_colours=False):
+    """`(resolved_regions, options)` for one Circos object: the configured regions matched to the
+    sectors actually on this plot (clamped to them, unknown chromosomes dropped with a one-time
+    warning). `resolved_regions == []` means "do not highlight anything".
+
+    `neutral_colours` (the 'combined' higher-order layout, where link colour already encodes k
+    with the very palette the regions would otherwise draw from): every region mark is drawn in
+    one dark neutral instead, so a band can never be mistaken for a k colour."""
+    opts = _hl.highlight_options(circos_config)
+    if neutral_colours:
+        opts = dict(opts, colour_by='single', colour=_hl.NEUTRAL_MARK)
+    for problem in opts['problems']:
+        _hl_warn_once(problem)
+    if not opts['regions']:
+        return [], opts
+    ranges = {sec.name: (sec.start, sec.end) for sec in circos.sectors}
+    resolved, problems = _hl.resolve_regions(opts['regions'], ranges, opts)
+    for problem in problems:
+        _hl_warn_once(problem)
+    if not resolved:
+        _hl_warn_once("none of the requested regions could be placed on this plot - drawing it without highlighting.")
+    return resolved, opts
+
+
+def _highlight_chrom_ranges(chrom_info):
+    """`{chromosome name: (start, end)}` from the chromosome info file - the same ranges the plot's
+    sectors get, so a region resolves here exactly as it will when drawn. `{}` if unreadable."""
+    try:
+        chrom = pd.read_csv(chrom_info)
+        chrom = unify_columns_by_position(chrom, ['chromosome', 'start', 'end'], 'chromosome info file')
+        chrom = chrom.drop_duplicates(subset=['chromosome'])
+        return {str(c): (float(a), float(b)) for c, a, b in zip(chrom['chromosome'], chrom['start'], chrom['end'])}
+    except Exception:
+        return {}
+
+
+def _highlight_restrict(circos_config, chrom_info, marker_info, RESULT_NAME):
+    """`(store_spec, hok_spec)` when `highlight_only_relevant` is on and at least one region can be
+    placed, else `(None, None)` (= legacy selection, untouched).
+
+    `store_spec` is `PairSumStore.reduce_groups(restrict=...)`: for each phenotype, a boolean mask
+    over the marker dictionary saying which markers lie in a highlighted region. `hok_spec` carries
+    the resolved regions for the k >= 3 selection (`_build_higher_order_ring`)."""
+    opts = _hl.highlight_options(circos_config)
+    if not opts['only_relevant'] or not opts['regions']:
+        return None, None
+    ranges = _highlight_chrom_ranges(chrom_info)
+    resolved, problems = _hl.resolve_regions(opts['regions'], ranges, opts) if ranges else ([], [])
+    for problem in problems:
+        _hl_warn_once(problem)
+    if not resolved:
+        _hl_warn_once("'only links involving the highlighted regions' is on but no region could be placed - "
+                      "the top interactions are chosen from all links as usual.")
+        return None, None
+    cache = {}
+
+    def mask_for(phenotype, names):
+        key = str(phenotype)
+        if key not in cache:
+            cache[key] = _marker_region_mask(_load_combined_marker_info(marker_info, RESULT_NAME, phenotype),
+                                             names, resolved)
+        return cache[key]
+
+    print(f"[circos_plot] highlight: top interactions are chosen among the links that involve "
+          f"{', '.join(r['tag'] for r in resolved)} only (match={opts['match']!r}).")
+    return ({'mask_for': mask_for, 'match': opts['match']},
+            {'regions': resolved, 'match': opts['match']})
+
+
+def _marker_region_mask(loc_info, names, resolved):
+    """Boolean array over `names` (marker names, any dtype): is the marker inside a region?
+    Markers absent from `loc_info` are False."""
+    names = np.asarray(names, dtype=object)
+    chrom = loc_info['chromosome'].astype(str).to_numpy()
+    start = np.round(loc_info['start'].astype(float).to_numpy())
+    end = np.round(loc_info['end'].astype(float).to_numpy())
+    inside = _hl.marker_membership(chrom, start, end, resolved)
+    kind = loc_info['name'].dtype.kind
+    if kind in 'iuf':
+        key = pd.to_numeric(pd.Series(names), errors='coerce').to_numpy()
+        known = pd.Series(inside, index=loc_info['name'].to_numpy())
+    else:
+        key = names.astype(str)
+        known = pd.Series(inside, index=loc_info['name'].astype(str).to_numpy())
+    known = known[~known.index.duplicated(keep='first')]
+    return known.reindex(key).fillna(False).to_numpy(dtype=bool)
+
+
+def _highlight_legend_regions(resolved):
+    """`{region index: {'colour', 'legend'}}`, the form the session legend accumulator stores."""
+    return {r['idx']: {'colour': r['colour'], 'legend': r['legend']} for r in resolved}
+
+
+def _prepare_links_with_highlight(interactions, circos_config, link_lw, regions, hl_opts):
+    """The highlight-aware counterpart of the legacy `_sort_links()` + `_link_strength()` pair
+    `plot()` runs on one model's k=2 links. Returns `(interactions, lws, strength, style)`:
+
+      interactions  rows in DRAW order (non-highlighted first, so highlighted links sit on top;
+                    within each group the usual `link_sort` order is kept), with `_alpha` set to
+                    the final opacity. In mode 'only' the non-highlighted rows are gone.
+      lws, strength Series aligned to `interactions` (line width; 0-1 strength for colour mode).
+      style         {'hit': bool array, 'region': int array (index into `regions`, -1 = none),
+                    'n_total': links before 'only' filtering, 'n_hit': highlighted links}.
+
+    Strength (opacity rank) is computed over the links that will be drawn, exactly as in the
+    legacy path, so turning highlighting on never changes how strong a link looks relative to its
+    neighbours - only whether it is emphasised or faded.
+    """
+    interactions = _sort_links(interactions, circos_config)
+    c = interactions
+    hit, region = _hl.classify_pairs(c.iloc[:, 0], c.iloc[:, 1], c.iloc[:, 2],
+                                     c.iloc[:, 3], c.iloc[:, 4], c.iloc[:, 5], regions, hl_opts['match'])
+    n_total, n_hit = int(hit.shape[0]), int(hit.sum())
+    if hl_opts['mode'] == 'only':
+        interactions = interactions.loc[hit].reset_index(drop=True)
+        region, hit = region[hit], hit[hit]
+    style = {'hit': hit, 'region': region, 'n_total': n_total, 'n_hit': n_hit}
+    if interactions.shape[0] == 0:
+        empty = pd.Series(dtype=float)
+        return interactions, empty, empty, style
+    alpha, lws, strength = _link_strength(interactions['value'], circos_config, link_lw)
+    a_min = circos_config.get('link_alpha_min', 0.15)
+    a_out, lw_out = _hl.style_alpha_lw(alpha.to_numpy(), lws.to_numpy(), hit, hl_opts, a_min)
+    order = _hl.draw_order(hit)
+    interactions = interactions.iloc[order].reset_index(drop=True)
+    interactions['_alpha'] = a_out[order]
+    style = dict(style, hit=hit[order], region=region[order])
+    return (interactions, pd.Series(lw_out[order]),
+            strength.iloc[order].reset_index(drop=True), style)
+
+
+def _highlight_counts_text(style, regions):
+    """'12 of 75 links touch the highlighted region(s) (R1=7, R2=5)' for the run log."""
+    per = [f"{regions[p]['tag']}={int((style['region'] == p).sum())}" for p in range(len(regions))]
+    return (f"{style['n_hit']} of {style['n_total']} links touch the highlighted region(s) "
+            f"({', '.join(per)})")
+
+
+def _write_highlight_links_table(png_path, interactions, style, regions):
+    """Sidecar `<plot>_links.tsv` listing the highlighted k=2 links (coordinates, strength, the
+    region each belongs to) - the figure shows them, this lets a person read them off. Written
+    only when at least one link is highlighted."""
+    hit = np.asarray(style['hit'], dtype=bool)
+    if not hit.any() or interactions.shape[0] == 0:
+        return
+    d = interactions.loc[hit]
+    reg = [regions[int(p)] for p in np.asarray(style['region'])[hit]]
+    out = pd.DataFrame({
+        'chromosome_1': d.iloc[:, 0].astype(str).to_numpy(), 'start_1': d.iloc[:, 1].to_numpy(), 'end_1': d.iloc[:, 2].to_numpy(),
+        'chromosome_2': d.iloc[:, 3].astype(str).to_numpy(), 'start_2': d.iloc[:, 4].to_numpy(), 'end_2': d.iloc[:, 5].to_numpy(),
+        'value': d['value'].to_numpy(),
+        'link_type': np.where(d.iloc[:, 0].astype(str).to_numpy() == d.iloc[:, 3].astype(str).to_numpy(),
+                              'within_chromosome', 'between_chromosomes'),
+        'region': [r['tag'] for r in reg], 'region_description': [r['desc'] for r in reg],
+    })
+    _atomic_to_csv(out.sort_values('value', ascending=False, kind='mergesort'),
+                   re.sub(r'\.png$', '', png_path) + '_links.tsv', sep='\t', index=False)
+
+
+def _draw_highlight_regions(circos, regions, opts, circos_config):
+    """Mark every resolved region on the plot (loop-invariant, so called once before the base
+    figure is frozen): a coloured BAND just inside the innermost ring - exactly where the links
+    land - a faint WEDGE of the same colour through the link area so the eye can follow a region's
+    links to its end, and a short radial TAG. A region narrower than `MIN_BAND_DEG` is widened on
+    the page (never in the data) so a 50 kb window on a 100 Mb chromosome is still visible."""
+    if not regions or not (opts['band'] or opts['shade'] or opts['label']):
+        return
+    import matplotlib.patheffects as _pe
+    sectors = {sec.name: sec for sec in circos.sectors}
+    r_in = min(sec.get_lowest_r() for sec in circos.sectors)
+    band_w = 3.0
+    shade_depth = 18.0
+    r_band_lo = max(r_in - band_w, 1.0)
+    figsize = float(circos_config.get('figsize') or 8.0)
+    ppu = circos_geometry.points_per_r_unit(figsize_in=figsize)
+    tags = []
+    for reg in regions:
+        sec = sectors.get(reg['chrom'])
+        if sec is None:
+            continue
+        s, e = float(reg['start']), float(reg['end'])
+        span = max(float(sec.end) - float(sec.start), 1e-9)
+        deg_per_x = math.degrees(sec.x_to_rad(sec.end) - sec.x_to_rad(sec.start)) / span
+        min_x = _hl.MIN_BAND_DEG / max(deg_per_x, 1e-12)
+        if e - s < min_x:
+            mid = (s + e) / 2.0
+            s, e = max(float(sec.start), mid - min_x / 2.0), min(float(sec.end), mid + min_x / 2.0)
+        if opts['shade'] and r_in > 2.0:
+            # a shallow tinted strip (not a wedge to the centre: a whole-chromosome region would
+            # otherwise tint a large part of the disc) under the links
+            sec.rect(s, e, r_lim=(max(r_in - shade_depth, 0.5), r_in), fc=reg['colour'], ec='none', lw=0,
+                     alpha=0.14, zorder=0.5)
+        if opts['band']:
+            sec.rect(s, e, r_lim=(r_band_lo, r_in), fc=reg['colour'], ec='black', lw=0.4)
+        tags.append((reg['tag'], math.degrees(sec.x_to_rad((s + e) / 2.0, ignore_range_error=True))))
+    if not (opts['label'] and tags):
+        return
+    size = max(5.0, min(8.0, float(circos_config.get('label_size', 6)) * 1.3))
+    r_anchor = r_band_lo - 1.5                 # the tag's outer end; it reads inward from here
+    room = max(r_anchor - 3.0, 4.0)
+    placed = []
+    for text, deg in tags:
+        s_pt = size
+        length = circos_geometry.text_width_points(text, s_pt) / ppu
+        if length > room:
+            s_pt = max(4.5, s_pt * room / length)
+        placed.append((text, deg, s_pt))
+    sep = max(2.0, math.degrees(1.5 * size / ppu / max(r_anchor - 5.0, 5.0)))
+    lo = min(math.degrees(sec.rad_lim[0]) for sec in circos.sectors)
+    hi = max(math.degrees(sec.rad_lim[1]) for sec in circos.sectors)
+    angles = circos_geometry.spread_labels([p[1] for p in placed], sep, lo=lo, hi=hi)
+    halo = [_pe.withStroke(linewidth=2.2, foreground='white')]
+    for (text, _deg, s_pt), ang in zip(placed, angles):
+        # Radial text anchored at its OUTER end and reading toward the centre, upright on both
+        # halves of the circle (what pyCirclize's adjust_rotation does for an outside label,
+        # mirrored: its 'outer' style would run the text outward, over the band).
+        d = ang % 360.0
+        right = d <= 180.0
+        circos.text(text, r=r_anchor, deg=ang, size=s_pt, color='black', fontweight='bold',
+                    rotation=(90.0 - d) if right else (270.0 - d), rotation_mode='anchor',
+                    ha='right' if right else 'left', va='center_baseline', path_effects=halo)
+
+
+# Logged once per process, not once per hyperedge - matches this codebase's
+# own established convention for a would-be-noisy per-call warning (e.g.
+# circos_geometry.text_width_points()'s own TextPath-fallback flag).
+_X_TO_RAD_UNAVAILABLE_LOGGED = False
+
+
+def _sector_rad_for_position(circos, chromosome, position):
+    """The angle (radians, in the whole-circle coordinate system
+    pycirclize's own polar axes use) of one genomic `position` within
+    `chromosome`'s own sector of `circos` - the single conversion every
+    hub-and-spoke glyph member needs (blueprint: "hub angle = circular
+    mean of member angles").
+
+    Uses pycirclize's own public `Sector.x_to_rad(x)` (`circos.get_sector
+    (name)` returns that chromosome's `Sector` instance) - `name` here is
+    the SAME sector-name string this module already hands `circos.link()`
+    directly as a region's first element (see `_build_interaction_ring()`
+    's own 'chromosome_marker1'/'chromosome_marker2' columns), and `x` is
+    the SAME BED start/end coordinate space those region tuples already
+    use - i.e. this is the documented, public conversion pycirclize
+    itself relies on internally for exactly this purpose.
+
+    VERIFIED (Update ID ver4-25, R12): unlike the shapiq/R-side code
+    elsewhere in this update - written and syntax-checked only, never
+    executed, for lack of an install in that sandbox - this specific
+    conversion WAS exercised end-to-end against a real, pinned
+    `pycirclize==1.10.1` install: `Circos.get_sector(name).x_to_rad(x,
+    ignore_range_error=True)` confirmed to exist with exactly this
+    signature; `fig.axes[0]` confirmed to be a genuine
+    `matplotlib.projections.polar.PolarAxes` whose data coordinates are
+    literally `(theta_radians, r)`; and a full hub-and-spoke glyph -
+    three spokes converging on one hub via `circos_geometry.
+    hyperedge_hub()`/`bezier_spoke_path()`, drawn with
+    `ax.add_patch(PathPatch(...))` exactly as `_draw_higher_order_
+    glyphs()` below does - rendered and saved to a real PNG with the
+    expected shape (hub pulled toward centre for a spread-out cluster,
+    smooth curved spokes, no exception). This confirms the blueprint's
+    own "V12.1" pre-check claim directly rather than merely trusting it.
+    Still never fatal on its own regardless: any exception here (e.g. a
+    genuinely unresolvable chromosome name for THIS specific run's own
+    BED sectors) is caught by every caller (`_draw_higher_order_glyphs()`
+    below) and turns into "skip drawing this one hyperedge's glyph",
+    never an aborted render - every existing ring/chord on the same plot
+    is completely unaffected.
+    """
+    global _X_TO_RAD_UNAVAILABLE_LOGGED
+    try:
+        # ignore_range_error=True: a marker's own midpoint((start,end))
+        # position should always fall inside its chromosome's own sector
+        # range, but a rounding-edge position sitting a fraction outside
+        # (float midpoint vs. int BED bounds) would otherwise raise
+        # ValueError and drop an otherwise-perfectly-good hyperedge for no
+        # real reason - pycirclize's own `x_to_rad()` docstring offers
+        # exactly this escape hatch for that case (verified directly
+        # against the pinned pycirclize==1.10.1 source: `Sector.x_to_rad
+        # (self, x, ignore_range_error=False)`, confirmed via
+        # `circos.get_sector(name)` + `Sector.x_to_rad()` both existing
+        # with this exact signature - the one part of this module that
+        # WAS verified end-to-end against a real install, unlike the
+        # DISCLOSURE note below for the rest of this function's own
+        # reasoning trail).
+        return circos.get_sector(str(chromosome)).x_to_rad(float(position), ignore_range_error=True)
+    except Exception as exc:
+        if not _X_TO_RAD_UNAVAILABLE_LOGGED:
+            print(f"[circos_plot] NOTE: could not resolve a genomic position to a plot angle "
+                  f"via pycirclize's Sector.x_to_rad() ({exc!r}) - k>=3 interaction hub-and-spoke "
+                  f"glyphs will be skipped for the rest of this run (every other ring/chord on "
+                  f"the plot is unaffected).")
+            _X_TO_RAD_UNAVAILABLE_LOGGED = True
+        raise
+
+
+def _draw_higher_order_glyphs(ax, circos, hok_selected, r_link, *, colourise, alpha_min=0.15,
+                               marker_size_min=6.0, marker_size_max=18.0, circos_config=None,
+                               hl=None, hl_state=None):
+    """Draws every hyperedge in `hok_selected` (columns: 'members' - a
+    list of `(chromosome, position)` tuples, already resolved by
+    `_build_higher_order_ring()` - and 'value', already normalised to sum
+    to 1 within this one (model, order) render) as one hub-and-spoke
+    glyph each, directly onto `ax` (`fig.axes[0]`, the polar axes
+    `circos.plotfig()` just produced for THIS render - see
+    `_sector_rad_for_position()`'s own docstring for why its data
+    coordinates are `(theta, r)` in the same r-unit scale
+    `circos_geometry`'s formulas already use).
+
+    `colourise(is_intra: bool) -> str` picks each hyperedge's own patch
+    colour - the caller decides the scheme: `plot()`'s 'per_order' call
+    site reuses the EXISTING red/blue intra-/inter-chromosome convention
+    every k=2 chord already uses; its 'combined' call site instead colours
+    by k (`_okabe_ito_colour_for_order()`) and lets LINESTYLE (solid/
+    dashed) carry the intra-/inter-chromosome distinction here.
+
+    A hyperedge is "intra" iff EVERY member resolved to the SAME
+    chromosome (blueprint: "existing intra-chromosome (all members same
+    chromosome) / inter-chromosome palette") - any two members on
+    different chromosomes makes the whole hyperedge "inter", exactly
+    mirroring the k=2 chord loop's own `chrom1 != chrom2` test.
+
+    Returns `(has_intra, has_inter)` - whether ANY drawn hyperedge was
+    intra-/inter-chromosome - for the caller to fold into the shared
+    legend accumulator exactly like the k=2 loop's own
+    has_intra_chr_link_for_legend/has_inter_chr_link_for_legend.
+
+    A hyperedge whose own `_sector_rad_for_position()` call fails is
+    silently skipped (not drawn, does not affect `has_intra`/`has_inter`,
+    does not abort the loop) - one bad/unresolvable member never prevents
+    the other, otherwise-drawable, hyperedges on the same ring from being
+    drawn.
+
+    Region highlighting (optional): `hl` is `{'regions': resolved regions, 'opts': highlight
+    options, 'recolour': bool}` (None = off, the legacy behaviour). A hyperedge is highlighted
+    when a member (or, with `match='both'`, every member) lies in a region. Highlighted
+    hyperedges are drawn last, thicker and more opaque, in their region's colour when `recolour`
+    is true (the 'per_order' layout; the 'combined' layout colours by k, so it keeps that colour
+    and only emphasises); the others are faded (grey when `recolour` and `dim == 'grey'`). In
+    mode 'only' the others are not drawn. `hl_state`, when given, is filled with `n_total`,
+    `n_hit`, `hit_intra`, `hit_inter`, `dimmed` and `region` (per hyperedge) for the caller's
+    log/legend; the returned `(has_intra, has_inter)` then covers only hyperedges drawn in their
+    ordinary colours."""
+    has_intra = False
+    has_inter = False
+    if hl_state is not None:
+        hl_state.update(n_total=0, n_hit=0, hit_intra=False, hit_inter=False, dimmed=False, region=[])
+    if hok_selected is None or hok_selected.shape[0] == 0:
+        return has_intra, has_inter
+
+    # ver4-31 R11/R12: the same `link_sort` / `link_scale` / `link_lw_range` /
+    # `link_colour_mode` settings as the k=2 chords (no `circos_config` = the
+    # historical min-max alpha, fixed 1.2 spoke width, file order).
+    _lcfg = dict(circos_config or {})
+    _lcfg['link_alpha_min'] = alpha_min      # glyphs always used the function default, not CIRCOS_CONFIG's
+    hok_selected = _sort_links(hok_selected.reset_index(drop=True), _lcfg).reset_index(drop=True)
+    _hl_on = bool(hl and hl.get('regions'))
+    _hl_hit = _hl_region = None
+    if _hl_on:
+        _hl_hit, _hl_region = _hl.classify_members(list(hok_selected['members']), hl['regions'], hl['opts']['match'])
+        if hl_state is not None:
+            hl_state.update(n_total=int(_hl_hit.shape[0]), n_hit=int(_hl_hit.sum()))
+        if hl['opts']['mode'] == 'only':
+            hok_selected = hok_selected.loc[_hl_hit].reset_index(drop=True)
+            _hl_region, _hl_hit = _hl_region[_hl_hit], _hl_hit[_hl_hit]
+            if hok_selected.shape[0] == 0:
+                return has_intra, has_inter
+    alphas, spoke_lws, strengths = _link_strength(hok_selected['value'], _lcfg, 1.2)
+    if _hl_on:
+        _a, _lw = _hl.style_alpha_lw(alphas.to_numpy(), spoke_lws.to_numpy(), _hl_hit, hl['opts'], alpha_min)
+        _order = _hl.draw_order(_hl_hit)               # highlighted hyperedges last = on top
+        hok_selected = hok_selected.iloc[_order].reset_index(drop=True)
+        alphas, spoke_lws = pd.Series(_a[_order]), pd.Series(_lw[_order])
+        strengths = strengths.iloc[_order].reset_index(drop=True)
+        _hl_hit, _hl_region = _hl_hit[_order], _hl_region[_order]
+        if hl_state is not None:
+            hl_state['region'] = [int(r) for r in _hl_region]
+    _mode = _link_options(_lcfg)['colour_mode']
+    ranks = hok_selected['value'].rank(ascending=False, method='min')
+    n_hyperedges = hok_selected.shape[0]
+
+    for idx, row in hok_selected.iterrows():
+        members = row['members']
+        try:
+            rads = [_sector_rad_for_position(circos, chrom, pos) for chrom, pos in members]
+        except Exception:
+            continue  # already logged once by _sector_rad_for_position()
+
+        is_intra = len({chrom for chrom, _ in members}) == 1
+        _is_hit = bool(_hl_on and _hl_hit[idx])
+        _recoloured = False
+        if _hl_on and hl.get('recolour') and _is_hit:
+            colour = hl['regions'][int(_hl_region[idx])]['colour']
+            _recoloured = True
+            if hl_state is not None:
+                hl_state['hit_intra' if is_intra else 'hit_inter'] = True
+        elif _hl_on and hl.get('recolour') and hl['opts']['dim'] == 'grey':
+            colour = _hl.DIM_GREY
+            _recoloured = True
+            if hl_state is not None:
+                hl_state['dimmed'] = True
+        else:
+            colour = _link_colour(_mode, is_intra, strengths.iloc[idx]) if _mode != 'chrom' else colourise(is_intra)
+        if not _recoloured:
+            if is_intra:
+                has_intra = True
+            else:
+                has_inter = True
+        linestyle = 'solid' if is_intra else 'dashed'
+        if _recoloured and not _is_hit:
+            linestyle = 'solid'
+        alpha = float(alphas.iloc[idx])
+
+        hub_rad, r_hub = circos_geometry.hyperedge_hub(rads, r_link)
+        for member_rad in rads:
+            path = circos_geometry.bezier_spoke_path(member_rad, r_link, hub_rad, r_hub)
+            ax.add_patch(mpatches.PathPatch(
+                path, facecolor='none', edgecolor=colour, linestyle=linestyle,
+                linewidth=float(spoke_lws.iloc[idx]), alpha=alpha,
+            ))
+
+        # Hub marker size ∝ rank (blueprint) - the strongest hyperedge
+        # (rank 1) on THIS render gets the largest hub marker, tapering
+        # down to `marker_size_min` for the weakest; a single surviving
+        # hyperedge always gets the maximum size (nothing to rank it
+        # against).
+        rank = float(ranks.iloc[idx])
+        size = marker_size_max if n_hyperedges <= 1 else (
+            marker_size_max - (rank - 1.0) / (n_hyperedges - 1.0) * (marker_size_max - marker_size_min)
+        )
+        if _hl_on and not _is_hit:
+            size = max(marker_size_min * 0.7, size * 0.7)     # faded hubs stay out of the way
+        ax.plot([hub_rad], [r_hub], marker='o', markersize=size, color=colour, alpha=alpha,
+                markeredgecolor='black', markeredgewidth=0.3, linestyle='none')
+
+    return has_intra, has_inter
+
+
+def _precompute_higher_order_groups(df, *, scope_model_order_by_population):
+    """The k>=3 analog of `_precompute_interaction_groups()` above -
+    identical rationale (avoid re-deriving a per-(population, model,
+    phenotype, order) slice of the FULL `interactions_hok` table from
+    scratch on every one of `circos_plot()`'s `len(PHENOTYPE) *
+    len(POPULATION)` calls) and identical dual-shape handling (the raw
+    one-row-per-observation shape `ResultSet.interactions_hok()`/
+    Sequential's own in-memory accumulator produce, OR the pre-aggregated
+    'value_sum'/'value_count' shape `batch_reader.
+    aggregate_marker_set_sums()`/`ResultSet.interactions_hok_grouped()`
+    produce - `_ensure_marker_pair_sum_count()` already normalises either
+    shape identically, reused here unchanged), just keyed by `order` +
+    the ';'-joined 'markers' string in place of `marker1`/`marker2`.
+
+    Unlike `_precompute_interaction_groups()`, no 'factor'-sentinel-row
+    filter is applied - see `batch_reader.aggregate_marker_set_sums()`'s
+    own docstring for why that filter has no analog here (nothing in the
+    k>=3 accumulation path ever emits one).
+
+    Returns
+    -------
+    (groups, model_order) :
+        groups : dict {(population_key, model_name, phenotype_value,
+            order): DataFrame[markers, value]} - 'population_key' is
+            either 'all' (the cross-population aggregate) or the
+            population's own string label, exactly as
+            `_precompute_interaction_groups()`'s own groups dict.
+        model_order : dict {population_key: [model_name, ...]} - the
+            first-appearance order every model with ANY k>=3 row
+            (regardless of which order) appears in, for THIS
+            population_key - `higher_order_interaction()` below iterates
+            this list and tries every requested order per model, so a
+            model missing a SPECIFIC order simply contributes nothing for
+            that order (see `_build_higher_order_ring()`'s own
+            None-return "nothing to draw" case), rather than needing a
+            second, order-specific membership index here.
+    """
+    if df is None or df.shape[0] == 0:
         return {}, {}
 
     _value_cols = [c for c in ('value', 'value_sum', 'value_count') if c in df.columns]
     has_population = 'population' in df.columns
 
-    keep_cols = (['population'] if has_population else []) + ['model', 'phenotype', 'marker1', 'marker2'] + _value_cols
+    keep_cols = (['population'] if has_population else []) + ['model', 'phenotype', 'order', 'markers'] + _value_cols
     work = df.loc[:, keep_cols]
-    work = work[(work['marker1'] != 'factor') & (work['marker2'] != 'factor')]
     work = _ensure_marker_pair_sum_count(work)
     if has_population:
         work = work.copy()
@@ -1188,29 +2167,129 @@ def _precompute_interaction_groups(df, *, scope_model_order_by_population):
 
     groups = {}
 
-    # The 'all' cross-population aggregate: population dropped entirely
-    # before grouping - matches the original `POPULATION == 'all'`
-    # branch's own column selection (never a filter to one population).
-    # ONE combined `.groupby(...).sum()` across every (model, phenotype,
-    # marker1, marker2) combination - collapses ratio/sample duplicates
-    # for every key at once - then a SECOND, cheap split of that already-
-    # small result into its per-(model, phenotype) slices.
-    _all_reduced = work.groupby(['model', 'phenotype', 'marker1', 'marker2'], as_index=False)[['value_sum', 'value_count']].sum()
+    _all_reduced = work.groupby(['model', 'phenotype', 'order', 'markers'], as_index=False)[['value_sum', 'value_count']].sum()
     _all_reduced['value'] = _all_reduced['value_sum'] / _all_reduced['value_count']
-    for (model_name, phenotype_value), sub in _all_reduced.groupby(['model', 'phenotype'], sort=False):
-        groups[('all', model_name, phenotype_value)] = sub[['marker1', 'marker2', 'value']]
+    for (model_name, phenotype_value, order_value), sub in _all_reduced.groupby(['model', 'phenotype', 'order'], sort=False):
+        groups[('all', model_name, phenotype_value, order_value)] = sub[['markers', 'value']]
     model_order = {'all': work['model'].drop_duplicates().tolist()}
 
     if has_population:
-        _pop_reduced = work.groupby(['population', 'model', 'phenotype', 'marker1', 'marker2'], as_index=False)[['value_sum', 'value_count']].sum()
+        _pop_reduced = work.groupby(['population', 'model', 'phenotype', 'order', 'markers'], as_index=False)[['value_sum', 'value_count']].sum()
         _pop_reduced['value'] = _pop_reduced['value_sum'] / _pop_reduced['value_count']
-        for (population_value, model_name, phenotype_value), sub in _pop_reduced.groupby(['population', 'model', 'phenotype'], sort=False):
-            groups[(population_value, model_name, phenotype_value)] = sub[['marker1', 'marker2', 'value']]
+        for (population_value, model_name, phenotype_value, order_value), sub in _pop_reduced.groupby(['population', 'model', 'phenotype', 'order'], sort=False):
+            groups[(population_value, model_name, phenotype_value, order_value)] = sub[['markers', 'value']]
         if scope_model_order_by_population:
             for population_value, sub in work.groupby('population', sort=False):
                 model_order[population_value] = sub['model'].drop_duplicates().tolist()
 
     return groups, model_order
+
+
+def _build_higher_order_ring(selected, circos_config, marker_info, PHENOTYPE, RESULT_NAME, model_name, order):
+    """The k>=3 analog of `_build_interaction_ring()` above: per-order top
+    selection (via the SAME `_select_top_interactions()` every k=2 ring
+    already uses - `selected` is already scoped to one `order` by
+    `_precompute_higher_order_groups()`'s own per-key grouping, so this
+    naturally implements the blueprint's "per-order top selection" with
+    no new selection function needed), sum-to-1 normalisation (within
+    this one (model, order), matching `_build_interaction_ring()`'s own
+    per-(model) normalisation), and marker-name -> (chromosome, position)
+    resolution for EVERY member of each surviving hyperedge (the
+    variable-length generalisation of `_build_interaction_ring()`'s own
+    fixed marker1/marker2 resolution).
+
+    Returns `None` when there is nothing to draw (no data for this key,
+    `_select_top_interactions()` narrowed it to zero rows, or every
+    surviving hyperedge had an unresolvable member) - callers `continue`
+    on that, mirroring `_build_interaction_ring()`'s own contract
+    exactly.
+
+    A hyperedge with an unresolvable member (a marker name absent from
+    `marker_info`/the gene-coordinate side files) is dropped WHOLE - the
+    same "no resolvable coordinate -> silently drop this row" behaviour
+    `_build_interaction_ring()`'s own `pd.merge(..., 'inner', ...)`
+    already gives a k=2 pair, applied here at the whole-hyperedge
+    granularity, since a glyph with fewer than 2 resolvable members has
+    nothing left worth drawing."""
+    if selected is None or selected.shape[0] == 0:
+        return None
+    _restrict = (circos_config or {}).get('_hl_restrict')
+    if _restrict:
+        # 'only links involving the highlighted regions': drop the hyperedges with no member in a
+        # region BEFORE the top-N% cut, so the cut is taken over the relevant ones.
+        _loc = _load_combined_marker_info(marker_info, RESULT_NAME, PHENOTYPE)
+        _all_names = pd.unique(np.concatenate([str(m).split(';') for m in selected['markers']])) if len(selected) else []
+        _in = dict(zip(_all_names, _marker_region_mask(_loc, np.asarray(_all_names, dtype=object), _restrict['regions'])))
+        _flags = [[_in.get(n, False) for n in str(m).split(';') if n] for m in selected['markers']]
+        _agg = all if _restrict['match'] == 'both' else any
+        selected = selected.loc[[bool(f) and _agg(f) for f in _flags]]
+        if selected.shape[0] == 0:
+            return None
+    selected = _select_top_interactions(selected, circos_config)
+    if selected.shape[0] == 0:
+        return None
+    selected = selected.copy()
+    selected['value'] = selected['value'] / selected['value'].sum()
+
+    loc_info = _load_combined_marker_info(marker_info, RESULT_NAME, PHENOTYPE)
+    loc_lookup = loc_info.drop_duplicates(subset=['name'], keep='first').set_index('name')
+
+    rows = []
+    for _, row in selected.iterrows():
+        member_names = [m for m in str(row['markers']).split(';') if m]
+        members = []
+        unresolved = False
+        for name in member_names:
+            if name not in loc_lookup.index:
+                unresolved = True
+                break
+            loc = loc_lookup.loc[name]
+            chromosome = str(loc['chromosome'])
+            position = int(round((float(loc['start']) + float(loc['end'])) / 2.0))
+            members.append((chromosome, position))
+        if unresolved or len(members) < 2:
+            continue
+        rows.append({'model': model_name, 'order': order, 'members': members, 'value': float(row['value'])})
+
+    if not rows:
+        return None
+    return pd.DataFrame(rows)
+
+
+def higher_order_interaction(higher_order_groups, higher_order_model_order, marker_info, PHENOTYPE,
+                              circos_config, POPULATION, RESULT_NAME, interaction_orders):
+    """The k>=3 analog of `interaction()` below - returns a small
+    DataFrame, one row per SURVIVING (top-selected, fully-resolved)
+    hyperedge, with columns `['model', 'order', 'members', 'value']`
+    ('members': a list of `(chromosome, position)` tuples) - completely
+    SEPARATE from `interaction()`'s own return value, never merged into
+    it, so the existing k=2 chord path stays exactly what it always was
+    (AC12.3: `CIRCOS_INTERACTION_ORDERS=[2]` renders byte-identically to
+    a run that never called this function at all, since `interaction_
+    orders` would then contain no value >= 3 and this returns an empty,
+    correctly-columned frame).
+
+    Only orders `>= 3` in `interaction_orders` are ever resolved here -
+    `2` is silently skipped (that stays `interaction()`'s own, unchanged
+    job)."""
+    total = []
+    models = higher_order_model_order.get(POPULATION, [])
+    for model_name in models:
+        for order in interaction_orders:
+            try:
+                order = int(order)
+            except (TypeError, ValueError):
+                continue
+            if order < 3:
+                continue
+            selected = higher_order_groups.get((POPULATION, model_name, PHENOTYPE, order))
+            ring = _build_higher_order_ring(selected, circos_config, marker_info, PHENOTYPE, RESULT_NAME, model_name, order)
+            if ring is None:
+                continue
+            total.append(ring)
+    if not total:
+        return pd.DataFrame(columns=['model', 'order', 'members', 'value'])
+    return pd.concat(total, ignore_index=True)
 
 
 def _build_interaction_ring(selected, circos_config, marker_info, PHENOTYPE, RESULT_NAME, model_name):
@@ -1234,15 +2313,30 @@ def _build_interaction_ring(selected, circos_config, marker_info, PHENOTYPE, RES
     """
     if selected is None or selected.shape[0] == 0:
         return None
-    selected = _select_top_interactions(selected, circos_config)
-    if selected.shape[0] == 0:
-        return None
+    # Update ID circos-oom-fix: `_precompute_interaction_groups(circos_config=...)`
+    # already applied `_select_top_interactions()`'s exact rule per key (on
+    # the numeric arrays, before any strings were built) and flagged the
+    # frame - selecting AGAIN would apply "top N% of the already-selected
+    # rows". Legacy (unflagged) frames still select here, unchanged.
+    if not selected.attrs.get('top_selected'):
+        selected = _select_top_interactions(selected, circos_config)
+        if selected.shape[0] == 0:
+            return None
     selected = selected.copy()
     selected['value'] = selected['value'] / selected['value'].sum()
 
     loc_info = _load_combined_marker_info(marker_info, RESULT_NAME, PHENOTYPE)
-    start = pd.merge(selected['marker1'], loc_info, 'inner', left_on='marker1', right_on='name')
-    end = pd.merge(selected['marker2'], loc_info, 'inner', left_on='marker2', right_on='name')
+    # marker names are decoded as the strings they were streamed in as; if
+    # marker_info.csv's own name column was type-inferred as numeric (all-
+    # numeric SNP ids) align the merge key instead of failing on object vs int.
+    _name_kind = loc_info['name'].dtype.kind
+    _m1, _m2 = selected['marker1'], selected['marker2']
+    if _name_kind in 'iuf':
+        _m1, _m2 = pd.to_numeric(_m1, errors='coerce'), pd.to_numeric(_m2, errors='coerce')
+    elif _name_kind in 'OUS' or str(loc_info['name'].dtype).startswith('str'):
+        _m1, _m2 = _m1.astype(str), _m2.astype(str)
+    start = pd.merge(_m1, loc_info, 'inner', left_on='marker1', right_on='name')
+    end = pd.merge(_m2, loc_info, 'inner', left_on='marker2', right_on='name')
 
     # ver4-4 R7.a - see the vectorisation note in data_conversion()
     # above; identical int(round(...)) row-loop pattern, replaced the
@@ -1419,7 +2513,8 @@ class _GradientSwatchHandler(mlegend_handler.HandlerBase):
         return patches
 
 
-def _build_circos_legend_handles(colours_used_by_hue, CYTOBAND_COLORMAP, gene_colours_used, has_inter_chr_link, has_intra_chr_link, truncated_labels=None):
+def _build_circos_legend_handles(colours_used_by_hue, CYTOBAND_COLORMAP, gene_colours_used, has_inter_chr_link, has_intra_chr_link, truncated_labels=None, has_hub_glyph=False, combined_orders_used=None, link_colour_mode='chrom',
+                                 highlight_regions=None, highlight_intra=False, highlight_inter=False, highlight_dimmed=False):
     """Requirement 13 (and its Requirement 1 correction): build the
     legend entries for the current plot - ONLY for colours/categories
     that actually appear on THIS specific rendering, never every colour
@@ -1471,13 +2566,38 @@ def _build_circos_legend_handles(colours_used_by_hue, CYTOBAND_COLORMAP, gene_co
     'GAT_biological_pri... = GAT_biological_prior_knowledge__Bayesian',
     so a ring label shortened for space never loses the reader's ability
     to look up what it actually stands for. `None`/empty adds nothing -
-    the common case, since most configs never trigger a truncation."""
+    the common case, since most configs never trigger a truncation.
+
+    `has_hub_glyph` (Update ID ver4-25, R12): True whenever ANY k>=3
+    interaction hub-and-spoke glyph was actually drawn anywhere this
+    session (`'per_order'` layout only - see `plot()`'s own call site) -
+    adds ONE marker-only legend row so a reader who has never seen this
+    glyph before knows what the filled circles mean, without needing a
+    colour scheme of its own (the glyph's spokes/hub already reuse the
+    existing 'inter-chr link'/'intra-chr link' red/blue rows above,
+    exactly like every k=2 chord already does).
+
+    `combined_orders_used` (Update ID ver4-25, R12): optional set of
+    order values (k>=3) actually drawn on a `'combined'`-layout render
+    this session - one legend row per order, in ascending order, coloured
+    with that order's own `_okabe_ito_colour_for_order()` (see
+    `plot()`'s combined-layout call site for why THAT layout colours by
+    k instead of red/blue - both k=2 chords and k>=3 hub glyphs share
+    this same per-order colour scheme on a combined render, so one shared
+    set of legend rows here covers both).
+
+    Region highlighting: `highlight_regions` ({index: {'colour', 'legend'}}, as
+    `_highlight_legend_regions()` builds it) adds one coloured row per highlighted region;
+    `highlight_intra` / `highlight_inter` add the solid / dashed line rows that tell a
+    highlighted within- from a between-chromosome link (their colour is the region's, so the
+    ordinary red/blue rows cannot); `highlight_dimmed` adds the grey 'other links' row."""
     handles = []
     handler_map = {}
     if CYTOBAND_COLORMAP is None:
         CYTOBAND_COLORMAP = _pycirclize_config.CYTOBAND_COLORMAP
 
-    _hue_label = {'blue': 'Marker effect (single model)', 'red': 'Marker effect (ensemble model)'}
+    _hue_label = {'blue': 'Marker effect (single model)', 'red': 'Marker effect (ensemble model)',
+                  'consensus': 'Consensus (models in top level)'}
     for hue in sorted(colours_used_by_hue):
         _levels = []
         for c in colours_used_by_hue[hue]:
@@ -1504,10 +2624,66 @@ def _build_circos_legend_handles(colours_used_by_hue, CYTOBAND_COLORMAP, gene_co
         color = CYTOBAND_COLORMAP.get(str(colour_value), '#ffffff')
         handles.append(mpatches.Patch(facecolor=color, edgecolor='black', linewidth=0.3, label=str(colour_value)))
 
-    if has_inter_chr_link:
-        handles.append(mlines.Line2D([0], [0], color='blue', lw=2, label='inter-chr link'))
-    if has_intra_chr_link:
-        handles.append(mlines.Line2D([0], [0], color='red', lw=2, label='intra-chr link'))
+    if highlight_regions:
+        for _idx in sorted(highlight_regions):
+            _r = highlight_regions[_idx]
+            handles.append(mpatches.Patch(facecolor=_r['colour'], edgecolor='black', linewidth=0.3,
+                                           label=f"Highlighted: {_r['legend']}"))
+        if highlight_intra:
+            handles.append(mlines.Line2D([0], [0], color='0.25', lw=2, linestyle='solid',
+                                          label='Highlighted link, within chromosome'))
+        if highlight_inter:
+            handles.append(mlines.Line2D([0], [0], color='0.25', lw=2, linestyle='dashed',
+                                          label='Highlighted link, between chromosomes'))
+        if highlight_dimmed:
+            handles.append(mlines.Line2D([0], [0], color=_hl.DIM_GREY, lw=1, alpha=0.6,
+                                          label='Other links (faded)'))
+
+    # ver4-31 R12: the link rows follow `CIRCOS_CONFIG.link_colour_mode`.
+    #   'chrom' (legacy)  blue inter / red intra
+    #   'chrom_cvd'       Okabe-Ito reddish-purple inter / bluish-green intra
+    #   'value'           colour = strength (cividis gradient swatch), intra /
+    #                     inter told apart by line style (solid / dashed)
+    if link_colour_mode == 'value':
+        if has_intra_chr_link:
+            handles.append(mlines.Line2D([0], [0], color='0.3', lw=2, linestyle='solid', label='intra-chr link'))
+        if has_inter_chr_link:
+            handles.append(mlines.Line2D([0], [0], color='0.3', lw=2, linestyle='dashed', label='inter-chr link'))
+        if has_intra_chr_link or has_inter_chr_link:
+            import matplotlib as _mpl
+            _cm = _mpl.colormaps[_LINK_VALUE_CMAP]
+            _lo_c, _hi_c = _mpl.colors.to_hex(_cm(0.08)), _mpl.colors.to_hex(_cm(0.95))
+            _lp = mpatches.Patch(facecolor=_lo_c, edgecolor='black', linewidth=0.3,
+                                  label='Link strength  weaker \u2192 stronger')
+            handles.append(_lp)
+            handler_map[_lp] = _GradientSwatchHandler(_lo_c, _hi_c)
+    else:
+        _inter_c, _intra_c = ((_CVD_INTER_COLOUR, _CVD_INTRA_COLOUR) if link_colour_mode == 'chrom_cvd'
+                              else ('blue', 'red'))
+        if has_inter_chr_link:
+            handles.append(mlines.Line2D([0], [0], color=_inter_c, lw=2, label='inter-chr link'))
+        if has_intra_chr_link:
+            handles.append(mlines.Line2D([0], [0], color=_intra_c, lw=2, label='intra-chr link'))
+
+    # Update ID ver4-25, R12: one marker-only row identifying what a
+    # filled-circle hub glyph means, whenever 'per_order' layout actually
+    # drew at least one this session - its spokes/hub otherwise share the
+    # SAME red/blue rows immediately above (no separate colour legend of
+    # its own needed for that layout).
+    if has_hub_glyph:
+        handles.append(mlines.Line2D([0], [0], marker='o', linestyle='none', color='black',
+                                      markerfacecolor='none', markersize=7,
+                                      label='k≥3 interaction hub (per-order layout)'))
+
+    # Update ID ver4-25, R12: one coloured row per k>=3 order actually
+    # drawn on a 'combined'-layout render this session (ascending order) -
+    # the SAME Okabe-Ito colour `plot()`'s combined call site used for
+    # both that order's own k=2-style chords (when order==2 happens to be
+    # part of a combined render) and its hub glyphs.
+    if combined_orders_used:
+        for _order in sorted(combined_orders_used):
+            handles.append(mlines.Line2D([0], [0], color=_okabe_ito_colour_for_order(_order), lw=2,
+                                          label=f'k={_order} interaction (combined layout)'))
 
     # Update ID ver4-6, R2 (blueprint §3.2 Defence 2): one invisible-swatch
     # row per shortened ring label, so the full name a truncated label
@@ -1545,12 +2721,33 @@ def _new_legend_accumulator():
         # the whole run. See `_build_circos_legend_handles()`'s own new
         # parameter for how this becomes legend rows.
         'truncated_labels': {},
+        # Update ID ver4-25, R12: True the first time ANY k>=3 hub-and-
+        # spoke glyph is drawn anywhere this session ('per_order' layout
+        # only) - empty/False for every run that never selects an
+        # order>=3 shapiq method, so the combined legend gains no new row
+        # at all in that (overwhelmingly common, pre-existing-config)
+        # case.
+        'has_hub_glyph': False,
+        # Update ID ver4-25, R12: the set of k>=3 orders actually drawn
+        # on a 'combined'-layout render anywhere this session - empty
+        # unless that layout was both selected AND actually had order>=3
+        # data to draw.
+        'combined_orders_used': set(),
+        # Region highlighting: {region index: {'colour', 'legend'}} plus whether any highlighted
+        # within-/between-chromosome link, or any faded 'other' link, was drawn. All empty/False
+        # when no region was configured, so the legend gains no row in that case.
+        'highlight_regions': {},
+        'highlight_intra': False,
+        'highlight_inter': False,
+        'highlight_dimmed': False,
     }
 
 
 def _merge_into_legend_accumulator(accumulator, *, colours_used_by_hue=None, gene_colours_used=None,
                                     has_inter_chr_link=None, has_intra_chr_link=None,
-                                    truncated_labels=None):
+                                    truncated_labels=None, has_hub_glyph=None, combined_orders_used=None,
+                                    highlight_regions=None, highlight_intra=None, highlight_inter=None,
+                                    highlight_dimmed=None):
     """Folds one plot() call's own legend-relevant findings into the
     shared, session-wide `accumulator` (see `_new_legend_accumulator()`).
     Every argument is optional and merged only if provided, since
@@ -1575,9 +2772,19 @@ def _merge_into_legend_accumulator(accumulator, *, colours_used_by_hue=None, gen
         accumulator['has_intra_chr_link'] = accumulator['has_intra_chr_link'] or has_intra_chr_link
     if truncated_labels:
         accumulator['truncated_labels'].update(truncated_labels)
+    if has_hub_glyph is not None:
+        accumulator['has_hub_glyph'] = accumulator['has_hub_glyph'] or has_hub_glyph
+    if combined_orders_used:
+        accumulator['combined_orders_used'].update(combined_orders_used)
+    if highlight_regions:
+        accumulator['highlight_regions'].update(highlight_regions)
+    for _key, _val in (('highlight_intra', highlight_intra), ('highlight_inter', highlight_inter),
+                       ('highlight_dimmed', highlight_dimmed)):
+        if _val is not None:
+            accumulator[_key] = accumulator[_key] or bool(_val)
 
 
-def _save_circos_legend(handles, handler_map, save_path, *, dpi=600):
+def _save_circos_legend(handles, handler_map, save_path, *, dpi=600, extra_formats=()):
     """Requirement 1 (correction - separate legend file): builds and saves
     a small, STANDALONE figure containing ONLY the legend - no circos plot
     at all - to its own PNG file.
@@ -1629,11 +2836,286 @@ def _save_circos_legend(handles, handler_map, save_path, *, dpi=600):
     legend_fig = plt.figure(figsize=(3.2, fig_height_in))
     legend_fig.legend(handles=handles, handler_map=handler_map, loc='center left',
                        fontsize=8, title='Legend', title_fontsize=9, frameon=True)
-    _safe_savefig(legend_fig, save_path, dpi=dpi, bbox_inches='tight')
+    _ps.save_figure(legend_fig, save_path, dpi=dpi, saver=_safe_savefig, bbox_inches='tight',
+                    extra_formats=extra_formats)
     plt.close(legend_fig)
 
 
-def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MODEL, circos_config, CYTOBAND_COLORMAP, POPULATION, RESULT_NAME, plot_dpi=600, legend_accumulator=None):
+def _attach_link_patches(ax, link_patches):
+    """Attach `link_patches` (pycirclize link patches, as accumulated in
+    ``circos._patches``) to a base figure's axes exactly the way
+    ``Circos.plotfig()`` attaches its default-zorder patches: deep-copied,
+    ``clip_on=False``, batched into one ``PatchCollection(match_original=
+    True)`` - so links are rasterised by the same code path (and come out
+    pixel-identical) as when ``plotfig()`` drew them itself.
+
+    ``plotfig()`` draws links BEFORE the ring patches (they are first in
+    its shared collection); this collection is added after the base one,
+    so its zorder is set just below the base collection's default 1 to keep
+    that stacking. Returns the added artists (for callers that want to
+    ``.remove()`` them).
+    """
+    from copy import deepcopy
+    from matplotlib.collections import PatchCollection
+    patches = []
+    others = []
+    for patch in link_patches:
+        p = deepcopy(patch)
+        p.set_clip_on(False)
+        if p.get_zorder() == 1 and p.get_hatch() is None:
+            patches.append(p)
+        else:
+            ax.add_patch(p)
+            others.append(p)
+    added = list(others)
+    if patches:
+        coll = PatchCollection(patches, match_original=True, clip_on=False)
+        coll.set_zorder(0.99)
+        ax.add_collection(coll)
+        added.append(coll)
+    return added
+
+
+_LABEL_MARGIN_IN = 1.0     # blank border added around the circle when top-marker labels are drawn
+
+
+def _add_top_marker_labels(circos, circos_config, lopts, label_tsv, gene_tsvs, *,
+                            r_marker=101.0, r_label=112.0):
+    """Draw the labelled markers' (or genes') names radially outside the outer
+    ring, each joined to its marker by a short leader line (R14). Label angles
+    are spread with `circos_geometry.spread_labels()` so neighbours stay at
+    least `label_min_sep_deg` apart. Returns the number of labels drawn."""
+    if not os.path.exists(label_tsv):
+        return 0
+    # ver4-45: read the ranked candidate pool (falls back to the plain top-N table
+    # for results written by an older version).
+    _pool = _label_pool_path(label_tsv)
+    df = pd.read_csv(_pool if os.path.exists(_pool) else label_tsv, sep='\t', dtype={'chromosome': str})
+    if df.empty:
+        return 0
+    want = int(lopts['top'])
+    genes = _gene_names_for_markers(df, gene_tsvs)
+    sectors = {sec.name: sec for sec in circos.sectors}
+    items = []
+    seen = set()
+    for _, row in df.iterrows():
+        if len(items) >= want:                 # exactly `want` distinct labels (the pool is ranked)
+            break
+        sec = sectors.get(str(row['chromosome']))
+        if sec is None:
+            continue
+        text = genes.get(str(row['name']), str(row['name']))
+        if text in seen:                       # two hits in one gene: label it once, take the next-strongest candidate
+            continue
+        seen.add(text)
+        items.append((text, sec.x_to_rad(float(row['pos']), ignore_range_error=True)))
+    if len(items) < want:
+        print(f"[circos_plot] label_top_markers: asked for {want} labels but only {len(items)} distinct "
+              f"label(s) are available (candidate pool of {df.shape[0]} exhausted).")
+    if not items:
+        return 0
+    angles = [math.degrees(r) for _, r in items]
+    lo = min(math.degrees(sec.rad_lim[0]) for sec in circos.sectors)
+    hi = max(math.degrees(sec.rad_lim[1]) for sec in circos.sectors)
+    spread = circos_geometry.spread_labels(angles, lopts['min_sep'], lo=lo, hi=hi)
+    size = max(5.0, min(8.0, float(circos_config.get('label_size', 6)) * 1.5))
+
+    def _leader(rad0, rad1):
+        def draw(ax):
+            ax.plot([rad0, rad1], [r_marker, r_label - 1.0], color='0.35', linewidth=0.5,
+                    solid_capstyle='butt', clip_on=False)
+        return draw
+
+    for (text, rad0), ang in zip(items, spread):
+        circos.text(text, r=r_label, deg=ang, size=size, adjust_rotation=True,
+                    orientation='vertical', color='black')
+        circos._plot_funcs.append(_leader(rad0, math.radians(ang)))
+    return len(items)
+
+
+def _finish_circos_figure(fig, circos_config):
+    """The shared tail end of every `plot()` render (k=2's own historical
+    path, and both new k>=3 render paths Update ID ver4-25/R12 adds) -
+    opens the same small, fixed margin for the axis-unit caption line
+    every render has always had. Extracted verbatim, byte-for-byte, from
+    what used to be `plot()`'s own inline code (see AC12.3: this is a
+    SOURCE-level refactor only - the exact same computation, on the exact
+    same `fig`, still runs for k=2, so k=2's own OUTPUT is unaffected)
+    purely so the new k>=3 render paths don't have to duplicate it a
+    second and third time.
+
+    Requirement (bugfix - unit label overlapping a chromosome name): a
+    fixed-position fig.text(0.5, 0.02, ...) worked for a modest
+    chromosome count, but for a genome with MANY chromosomes (e.g. a real
+    26-sub-genome cotton assembly, A01-A13/D01-D13) some chromosome's own
+    name label inevitably ends up positioned right at the bottom of the
+    circle, where the unit label was also fixed - colliding with it
+    (confirmed with a real render at that scale during development).
+    Rather than trying to predict WHICH chromosome that will be
+    (unknowable in general - it depends on chromosome count, sizes, and
+    the start/end angles), this opens a small, fixed, DEDICATED margin
+    below the circle instead - unlike the legend (Requirement 13's own
+    correction, a separate file), a single line of caption text doesn't
+    need a variable-sized allowance, so growing the figure by a small
+    fixed amount and shifting the polar axes up within it by exactly that
+    much (so the circle's own on-page size is unchanged) reliably clears
+    space for it - verified empirically against a real 26-chromosome
+    render, not just assumed. Mutates `fig` in place; returns nothing."""
+    if _label_options(circos_config)['top'] > 0:
+        # ver4-31 R14: room for the radial marker / gene labels around the
+        # circle (the circle itself keeps its on-page size).
+        _m = _LABEL_MARGIN_IN
+        _w0, _h0 = fig.get_size_inches()
+        _p0 = fig.axes[0].get_position()
+        fig.set_size_inches(_w0 + 2 * _m, _h0 + 2 * _m)
+        fig.axes[0].set_position([(_p0.x0 * _w0 + _m) / (_w0 + 2 * _m), (_p0.y0 * _h0 + _m) / (_h0 + 2 * _m),
+                                   _p0.width * _w0 / (_w0 + 2 * _m), _p0.height * _h0 / (_h0 + 2 * _m)])
+    _extra_height_in = 0.6
+    _fig_width_in, _fig_height_in = fig.get_size_inches()
+    _polar_ax = fig.axes[0]
+    _old_pos = _polar_ax.get_position()
+    _old_y0_in = _old_pos.y0 * _fig_height_in
+    _old_height_in = _old_pos.height * _fig_height_in
+    _new_fig_height_in = _fig_height_in + _extra_height_in
+    fig.set_size_inches(_fig_width_in, _new_fig_height_in)
+    _polar_ax.set_position([
+        _old_pos.x0,
+        (_old_y0_in + _extra_height_in) / _new_fig_height_in,
+        _old_pos.width,
+        _old_height_in / _new_fig_height_in,
+    ])
+    fig.text(0.5, 0.02, _circos_axis_unit_label(circos_config), ha='center', va='bottom',
+             fontsize=9, color='black')
+
+
+def _circos_models_to_render(interactions_original, higher_order_ring_frame):
+    """The ordered list of model names ``plot()`` renders one interaction
+    figure for, for one (PHENOTYPE, POPULATION): every model with k=2 rows
+    (first-appearance order), then any model that has k>=3 rows only; the
+    sentinel ``['not_returned']`` when there is nothing at all (one plain
+    circos, no interaction links).
+
+    Factored out of ``plot()`` unchanged so ``circos_plot()``'s parallel
+    scheduler can enumerate the same render units ``plot()`` will iterate,
+    without duplicating (and eventually drifting from) that logic.
+    """
+    if higher_order_ring_frame is None:
+        higher_order_ring_frame = pd.DataFrame(columns=['model', 'order', 'members', 'value'])
+    if interactions_original.shape[0] != 0:
+        model_selected = interactions_original['model'].unique().tolist()
+    else:
+        model_selected = ['not_returned']
+    _hok_models = higher_order_ring_frame['model'].unique().tolist() if higher_order_ring_frame.shape[0] else []
+    if model_selected == ['not_returned'] and _hok_models:
+        model_selected = list(_hok_models)
+    else:
+        for _m in _hok_models:
+            if _m not in model_selected:
+                model_selected.append(_m)
+    return model_selected
+
+
+# --------------------------------------------------------------------------- #
+# ver4-31 R13: consensus ring - how many models put a region in their top
+# quantile level. A pure reduction over the per-model marker_effect_*.tsv files
+# `quantile_conversion()` already wrote; no new data path.
+# --------------------------------------------------------------------------- #
+
+CONSENSUS_SCOPES = ('base_models', 'all_models')
+_CONSENSUS_CMAP = 'Purples'
+_CONSENSUS_TRACK = '_consensus'
+
+
+def _consensus_options(circos_config):
+    """`{'on', 'level', 'scope'}` from `CIRCOS_CONFIG.consensus_ring` /
+    `.consensus_level` (0-9, default 9) / `.consensus_scope`."""
+    c = circos_config or {}
+    try:
+        level = min(max(int(c.get('consensus_level', 9)), 0), 9)
+    except (TypeError, ValueError):
+        level = 9
+    scope = str(c.get('consensus_scope', 'base_models') or 'base_models').strip().lower()
+    return {'on': bool(c.get('consensus_ring', False)), 'level': level,
+            'scope': scope if scope in CONSENSUS_SCOPES else 'base_models'}
+
+
+def _cytoband_cmap_with_consensus(cmap, n_max):
+    """A copy of `cmap` (or of pycirclize's default when `None`) that also
+    holds `consensus0 .. consensus<n_max>` - a light-to-dark `Purples` ramp -
+    for any of those keys it does not already define (a user-supplied entry
+    wins)."""
+    import matplotlib as _mpl
+    out = dict(cmap if cmap is not None else _pycirclize_config.CYTOBAND_COLORMAP)
+    ramp = _mpl.colormaps[_CONSENSUS_CMAP]
+    n_max = max(int(n_max), 1)
+    for k in range(n_max + 1):
+        out.setdefault(f'consensus{k}', _mpl.colors.to_hex(ramp(0.08 + 0.87 * k / n_max)))
+    return out
+
+
+def _colour_level(colour):
+    """Trailing quantile level of a colour key ('blue7' -> 7), else None."""
+    import re as _re
+    m = _re.search(r'(\d+)$', str(colour))
+    return int(m.group(1)) if m else None
+
+
+def _consensus_models(MODEL, scope):
+    """The models a consensus counts: every one (`all_models`) or only the base
+    models (`base_models`) - ensembles are functions of the base models, so
+    counting them would inflate the agreement."""
+    if scope == 'all_models':
+        return list(MODEL)
+    return [m for m in MODEL if not (is_naive_ensemble_label(m) or is_wopt_label(m))]
+
+
+def _build_consensus_tsv(model_tsvs, level, out_path, label_table=None, label_top=0):
+    """Reduce per-model `marker_effect_*.tsv` files (chromosome, start, end,
+    index, colour) to one consensus file at `out_path`: for every
+    (chromosome, start, end) region, the number of models whose quantile level
+    is >= `level`, written as the colour key `consensus<count>`. A region a
+    model does not list counts as "not in its top". Returns
+    `(out_path, n_models_counted)`.
+
+    ver4-45: when `label_table` is given (and `label_top` > 0) the regions are
+    also ranked - by consensus count, ties broken by the summed quantile level
+    across the counted models - and written as the top-marker label table (+
+    candidate pool) at that path, so 'Label source = consensus ring' costs no
+    extra file read."""
+    counts = {}
+    level_sums = {}
+    n_counted = 0
+    for path in model_tsvs:
+        df = pd.read_csv(path, sep='\t', dtype={'chromosome': str})
+        if df.empty:
+            continue
+        n_counted += 1
+        lv = df['colour'].map(_colour_level).fillna(-1).astype(int)
+        key_frame = pd.DataFrame({'chromosome': df['chromosome'].astype(str), 'start': df['start'],
+                                   'end': df['end'], 'top': (lv >= level).astype(int),
+                                   'lv': lv.clip(lower=0)})
+        per_file = key_frame.groupby(['chromosome', 'start', 'end'], sort=False)[['top', 'lv']].max()
+        for key, top, lvl in zip(per_file.index, per_file['top'].tolist(), per_file['lv'].tolist()):
+            counts[key] = counts.get(key, 0) + int(top)
+            level_sums[key] = level_sums.get(key, 0) + int(lvl)
+    rows = [{'chromosome': c, 'start': a, 'end': b, 'index': f'{c}:{a}-{b}', 'colour': f'consensus{n}'}
+            for (c, a, b), n in counts.items()]
+    _atomic_to_csv(pd.DataFrame(rows, columns=['chromosome', 'start', 'end', 'index', 'colour']),
+                   out_path, sep='\t', index=False)
+    if label_table is not None and int(label_top) > 0 and counts:
+        _lt = pd.DataFrame({
+            'chromosome': [k[0] for k in counts],
+            'start': [k[1] for k in counts],
+            'end': [k[2] for k in counts],
+            'name': [f"{k[0]}:{int((float(k[1]) + float(k[2])) / 2)}" for k in counts],
+            'value': [counts[k] for k in counts],
+            'tiebreak': [level_sums[k] for k in counts]})
+        _write_label_table(label_table, _lt, int(label_top))
+    return out_path, n_counted
+
+
+def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MODEL, circos_config, CYTOBAND_COLORMAP, POPULATION, RESULT_NAME, plot_dpi=600, legend_accumulator=None,
+         higher_order_ring_frame=None, interaction_orders=(2,), higher_order_layout='per_order', only_models=None):
     """ver4-5 (single session-wide legend): `legend_accumulator`, when
     provided, is a mutable dict shared across EVERY plot() call made
     during one circos_plot() invocation - see that function's own
@@ -1648,12 +3130,49 @@ def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MO
     default) is kept only so plot() still has a well-defined, harmless
     behaviour (accumulate nothing, save nothing) if ever called without
     one; circos_plot() itself always passes one.
+
+    Update ID ver4-25, R12 (new, additive parameters - I11/AC12.3):
+    `higher_order_ring_frame` - the DataFrame `higher_order_interaction()`
+    returns (columns `['model', 'order', 'members', 'value']`), already
+    resolved to genomic coordinates and normalised, for THIS (PHENOTYPE,
+    POPULATION) - `None`/empty (the default, and what every caller that
+    predates this feature passes implicitly) means there is nothing to
+    draw beyond k=2, and the ENTIRE per-model loop below runs exactly the
+    historical code path with exactly the historical output.
+    `interaction_orders` - which k values to actually draw this call,
+    default `(2,)` (today's only order, unconditionally, for a caller
+    that never passes this at all). `higher_order_layout` - `'per_order'`
+    (default, recommended) draws one file per (model, order), with k=2
+    keeping its historical filename; `'combined'` draws ONE file per
+    model spanning every requested order (k=2 chords plus every k>=3
+    hub glyph together), coloured by k (Okabe-Ito) rather than the usual
+    red/blue intra-/inter-chromosome split, with linestyle (solid/dashed)
+    carrying that intra-/inter- distinction instead.
+
+    Performance update (circos speed-up): `only_models`, when given (an
+    iterable of model names), restricts the per-model render loop below to
+    those models - the loop-invariant base (every marker-effect/gene ring,
+    ticks) is still built, once, but only for this subset's figures. It is
+    how ``circos_plot()`` hands DISJOINT slices of one (PHENOTYPE,
+    POPULATION)'s models to different worker processes. `None` (default)
+    renders every model exactly as before.
+
+    The k=2 renders no longer call ``circos.plotfig()`` once per model:
+    that call deep-copies and re-adds every ring's patches, and dominated
+    the cost of a many-model plot (cost ~ models x rings). The link-free
+    base figure is now built ONCE per plot() call and only each model's
+    own link patches are attached, saved and detached again - the same
+    pixels (links are drawn beneath the ring patches, as before), a
+    fraction of the work.
     """
-    
-    if interactions_original.shape[0] != 0:
-        model_selected = interactions_original['model'].unique().tolist()
-    else:
-        model_selected = ['not_returned']
+    if higher_order_ring_frame is None:
+        higher_order_ring_frame = pd.DataFrame(columns=['model', 'order', 'members', 'value'])
+    _requested_orders = sorted({int(o) for o in (interaction_orders or (2,))})
+    _only_models = None if only_models is None else set(only_models)
+
+    # (ver4-25, R12: also includes models that only have k>=3 rows - see
+    # `_circos_models_to_render()`.)
+    model_selected = _circos_models_to_render(interactions_original, higher_order_ring_frame)
 
     # ver4-4 R7.c (blueprint §2.7.2, PC-3): Circos.initialize_from_bed(...)
     # and every marker-effect / gene-region / tick track added below do
@@ -1706,11 +3225,43 @@ def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MO
     # `pd.unique(pop_source.loc[...])` read that already existed here,
     # just moved earlier - it depends only on `pop_source`/`POPULATION`/
     # `PHENOTYPE`, none of which the model loop below touches.
+    if len(MODEL) == 0:
+        _warn_no_model_data(PHENOTYPE, POPULATION)
+        return
     if gene_info is not None:
         gene_source = pd.unique(pop_source.loc[(pop_source['population'].astype(str)==str(POPULATION)) & (pop_source['phenotype']==str(PHENOTYPE)),'source'])
     else:
         gene_source = np.array([], dtype=object)
-    _n_rings_total = len(MODEL) + len(gene_source)
+    # ver4-31 R13: optional consensus ring (outermost), built from the per-model
+    # marker_effect_*.tsv files quantile_conversion() has already written.
+    _cons_opts = _consensus_options(circos_config)
+    _cons_path, _cons_n = None, 0
+    _lopts_cons = _label_options(circos_config)
+    _cons_for_labels = _lopts_cons['top'] > 0 and _lopts_cons['consensus']     # ver4-45: label source = consensus ring
+    if _cons_opts['on'] or _cons_for_labels:
+        _cons_models = _consensus_models(list(MODEL), _cons_opts['scope'])
+        if len(_cons_models) >= 2:
+            _cons_path, _cons_n = _build_consensus_tsv(
+                [_circos_intermediate_dir(RESULT_NAME)+'/marker_effect_'+m+'_'+PHENOTYPE+'_'+str(POPULATION)+'.tsv'
+                 for m in _cons_models],
+                _cons_opts['level'],
+                _circos_intermediate_dir(RESULT_NAME)+'/marker_effect_consensus_'+PHENOTYPE+'_'+str(POPULATION)+'.tsv',
+                label_table=_label_table_path(RESULT_NAME, PHENOTYPE, POPULATION) if _cons_for_labels else None,
+                label_top=_lopts_cons['top'] if _cons_for_labels else 0)
+            if not _cons_opts['on']:
+                _cons_path = None          # built for the labels only - the ring itself is not drawn
+        else:
+            print(f"[circos_plot] consensus_ring: only {len(_cons_models)} model(s) in scope "
+                  f"'{_cons_opts['scope']}' for {PHENOTYPE}/{POPULATION} - consensus ring"
+                  f"{' and consensus-based marker labels' if _cons_for_labels else ''} skipped.")
+            if _cons_for_labels:           # never label from a stale table of an earlier run
+                _stale = _label_table_path(RESULT_NAME, PHENOTYPE, POPULATION)
+                for _f in (_stale, _label_pool_path(_stale)):
+                    try:
+                        os.remove(_f)
+                    except OSError:
+                        pass
+    _n_rings_total = len(MODEL) + len(gene_source) + (1 if _cons_path else 0)
 
     # Update ID ver4-6, R2: `circos_config.get(..., <legacy default>)`
     # throughout this block is what makes an absent-key (pre-ver4-6)
@@ -1735,6 +3286,11 @@ def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MO
     # lost when a label is shortened for space - see
     # `_build_circos_legend_handles()`'s own new parameter.
     _truncated_ring_labels = {}
+    # ver4-95: MODEL_LABEL_STYLE ('full' default = unchanged). Display only - the ring's data, track
+    # name, colour and file names keep the full label; only the TEXT written on the ring is shortened,
+    # so a 'Super learner__Bayesian optimisation' ring is labelled 'Bayesian optimisation' (and
+    # fits a smaller seam gap). Labels that would clash keep their full text.
+    _ring_label_text_of = _ps.shown_labels(list(MODEL), circos_config)
 
     def _resolve_ring_label(raw_label, r_centre):
         """Defence 2 (blueprint §3.2): the renderer-side guard that makes
@@ -1781,6 +3337,14 @@ def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MO
     cnt = 0
     # Add genomic marker effects
     _colours_used_by_hue = {}  # e.g. {'blue': {'blue0', 'blue3', 'blue7'}, ...}
+    if _cons_path:
+        _r_lo, _r_hi, _r_centre = _ring_geometries[cnt]
+        _cons_colours = _add_cytoband_tracks_with_border(circos, (_r_lo, _r_hi), _cons_path,
+                                                          track_name=_CONSENSUS_TRACK, cytoband_cmap=CYTOBAND_COLORMAP)
+        _label_text, _label_size = _resolve_ring_label(f'Consensus (n/{_cons_n})', circos.tracks[-1].r_center - 1)
+        circos.text(_label_text, r=circos.tracks[-1].r_center-1, deg=0, size=_label_size, color="black")
+        cnt += 1
+        _colours_used_by_hue.setdefault('consensus', set()).update(_cons_colours)
     for i in range(len(MODEL)):
          _tsv_path = _circos_intermediate_dir(RESULT_NAME)+'/marker_effect_'+MODEL[i]+'_'+PHENOTYPE+'_'+str(POPULATION)+'.tsv'
          _r_lo, _r_hi, _r_centre = _ring_geometries[cnt]
@@ -1791,10 +3355,10 @@ def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MO
          # used to do purely to recover the same information (Requirement
          # 13's "only colours that actually appear on this plot" rule).
          _tsv_colours = _add_cytoband_tracks_with_border(circos, (_r_lo, _r_hi), _tsv_path, track_name=MODEL[i], cytoband_cmap=CYTOBAND_COLORMAP)
-         _label_text, _label_size = _resolve_ring_label(MODEL[i], circos.tracks[-1].r_center - 1)
+         _label_text, _label_size = _resolve_ring_label(_ring_label_text_of.get(MODEL[i], MODEL[i]), circos.tracks[-1].r_center - 1)
          circos.text(_label_text, r=circos.tracks[-1].r_center-1, deg=0, size=_label_size, color="black")
          cnt+=1
-         _hue = 'red' if MODEL[i] in ['ensemble', 'Linear transformation', 'Nelder Mead', 'Bayesian optimisation', 'Analytic least-squares'] else 'blue'
+         _hue = _ring_hue(MODEL[i], _ensemble_hue_rule(circos_config))      # ver4-31 R10
          _colours_used_by_hue.setdefault(_hue, set()).update(_tsv_colours)
     
     # Add known gene regions
@@ -1902,6 +3466,32 @@ def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MO
             label_formatter=lambda v: f"{v / circos_config['scale']:.0f}",
         )
 
+    # ver4-31 R14: top-marker / gene labels (loop-invariant, so added before the base
+    # figure is frozen; nothing happens when `label_top_markers` is 0).
+    _lopts_plot = _label_options(circos_config)
+    if _lopts_plot['top'] > 0:
+        _n_labelled = _add_top_marker_labels(
+            circos, circos_config, _lopts_plot, _label_table_path(RESULT_NAME, PHENOTYPE, POPULATION),
+            [_circos_intermediate_dir(RESULT_NAME)+'/gene_info_'+str(PHENOTYPE)+'_'+str(g)+'_'+str(POPULATION)+'.tsv'
+             for g in gene_source])
+        if _n_labelled == 0:
+            print(f"[circos_plot] label_top_markers: no labels for {PHENOTYPE}/{POPULATION} "
+                  f"(the label model has no data for it).")
+
+    # Region highlighting (optional, off unless CIRCOS_CONFIG['highlight_regions'] resolves to a
+    # region on this plot): the band / wedge / tags are loop-invariant like every ring above, so
+    # they are drawn here, once, before the base is frozen. `_hl_sfx` keeps a highlighted figure
+    # from overwriting the plain one of an earlier run.
+    _hl_regions, _hl_opts = _resolve_highlight(
+        circos, circos_config,
+        neutral_colours=(higher_order_layout == 'combined' and len(_requested_orders) >= 2
+                         and max(_requested_orders) >= 3))
+    _hl_sfx = '_highlight' if _hl_regions else ''
+    if _hl_regions:
+        _draw_highlight_regions(circos, _hl_regions, _hl_opts, circos_config)
+        if legend_accumulator is not None:
+            _merge_into_legend_accumulator(legend_accumulator, highlight_regions=_highlight_legend_regions(_hl_regions))
+
     # ver4-4 R7.c - see the note above `circos = Circos.
     # initialize_from_bed(...)` for the full rationale/verification
     # behind this truncation technique. Recorded ONCE, after every
@@ -1909,165 +3499,415 @@ def plot(interactions_original, chrom_info, gene_info, pop_source, PHENOTYPE, MO
     # below ever calls circos.link() for the first time.
     _base_patch_count = len(circos._patches)
 
+    # Update ID ver4-25, R12: 'combined' layout only actually combines
+    # anything when there are 2+ distinct requested orders, at least one
+    # >= 3 - otherwise (the overwhelming majority of runs, including
+    # EVERY run predating this feature, where `_requested_orders ==
+    # [2]` always) this is False and every model falls through to the
+    # SAME code path 'per_order' layout takes for k=2 below - so AC12.3
+    # (byte-identical output whenever only k=2 is requested) holds
+    # regardless of which layout radio button happens to be selected in
+    # the GUI.
+    _use_combined_layout = (
+        higher_order_layout == 'combined'
+        and len(_requested_orders) >= 2
+        and max(_requested_orders) >= 3
+    )
+
+    # Frozen (pickled), link-free, undrawn base figure for the k=2 renders,
+    # built lazily on the first k=2 render - see plot()'s docstring.
+    _shared_k2 = {'blob': None, 'ok': True}
+
     for n in range(len(model_selected)):
-        # Remove any chord links a PREVIOUS iteration of this SAME loop
-        # added, so this iteration starts from the same clean (no-link)
-        # state every time - a no-op on the very first iteration, since
-        # nothing has been added past _base_patch_count yet.
-        del circos._patches[_base_patch_count:]
+        model_name = model_selected[n]
+        if _only_models is not None and model_name not in _only_models:
+            continue
 
-        # Add marker-by-marker interactions
-        has_inter_chr_link_for_legend = False
-        has_intra_chr_link_for_legend = False
-        if interactions_original.shape[0] != 0:
-            interactions = interactions_original[interactions_original['model']==model_selected[n]].dropna().reset_index(drop=True)
-            # Requirement: link OPACITY (not width) encodes each link's
-            # relative importance ('value') - a higher value means a more
-            # solid/opaque (visually "thicker-looking") link, while every
-            # link is drawn at the same, fixed line width. 'value' itself
-            # is normalized to sum to 1 across whatever's currently
-            # displayed (see the `value / value.sum()` step above), so its
-            # absolute scale shifts with how many links are shown - using
-            # it as alpha directly (or via a fixed multiplier, as the old
-            # width-based version did) would make the same link look very
-            # different across plots with different link counts. Instead,
-            # min-max normalize WITHIN this plot's own displayed link set,
-            # into [link_alpha_min, 1.0] - the strongest link on any given
-            # plot is always fully opaque, the weakest is always still at
-            # least link_alpha_min visible (never fully invisible), and
-            # everything in between scales smoothly - regardless of how
-            # many links happen to be shown.
-            link_alpha_min = circos_config.get('link_alpha_min', 0.15)
-            # Fixed for every link - not user-configurable, since only
-            # opacity (above) is meant to vary by strength; a separate
-            # width control would just uniformly scale every line at once
-            # (no diagnostic value) and was removed from the GUI.
-            link_lw = 1.5
-            if interactions.shape[0] != 0:
-                v_min, v_max = interactions['value'].min(), interactions['value'].max()
-                if v_max > v_min:
-                    interactions['_alpha'] = link_alpha_min + (interactions['value'] - v_min) / (v_max - v_min) * (1.0 - link_alpha_min)
-                else:
-                    # Every displayed link has the same value (including the
-                    # common case of a single link) - nothing to contrast
-                    # against, so draw it fully opaque rather than an
-                    # arbitrary floor value.
-                    interactions['_alpha'] = 1.0
-            for ii in range(interactions.shape[0]):
-                region1 = (interactions.iloc[ii,0], interactions.iloc[ii,1], interactions.iloc[ii,2])
-                region2 = (interactions.iloc[ii,3], interactions.iloc[ii,4], interactions.iloc[ii,5])
-                if interactions.iloc[ii,0] != interactions.iloc[ii,3]:   #within chromosome or between chromosome
-                    colour = 'blue'
-                    has_inter_chr_link_for_legend = True
-                else:
-                    colour = 'red'
-                    has_intra_chr_link_for_legend = True
-                circos.link(region1, region2, lw=link_lw, alpha=float(interactions.loc[ii,'_alpha']), color=colour)
-                
-        # Store the circos plot
-        # Update ID ver4-6, R2 (blueprint §3.4/S3): `circos_config.get(
-        # 'figsize')` is absent (None) for every pre-ver4-6 config, in
-        # which case `circos.plotfig()` is called exactly as before this
-        # option existed (pycirclize's own (8, 8)-inch default) - I11,
-        # AC2.5. A configured figsize (e.g. widened for a many-ring plot)
-        # is forwarded as a square `(f, f)` tuple, matching pycirclize's
-        # own `figsize: tuple[float, float]` parameter.
-        _figsize_cfg = circos_config.get('figsize')
-        if _figsize_cfg:
-            fig = circos.plotfig(figsize=(_figsize_cfg, _figsize_cfg))
-        else:
-            fig = circos.plotfig()
-        # Requirement (bugfix - unit label overlapping a chromosome name):
-        # a fixed-position fig.text(0.5, 0.02, ...) worked for a modest
-        # chromosome count, but for a genome with MANY chromosomes (e.g.
-        # a real 26-sub-genome cotton assembly, A01-A13/D01-D13) some
-        # chromosome's own name label inevitably ends up positioned right
-        # at the bottom of the circle, where the unit label was also
-        # fixed - colliding with it (confirmed with a real render at that
-        # scale during development). Rather than trying to predict WHICH
-        # chromosome that will be (unknowable in general - it depends on
-        # chromosome count, sizes, and the start/end angles), this opens
-        # a small, fixed, DEDICATED margin below the circle instead -
-        # unlike the legend (Requirement 13's own correction, a separate
-        # file), a single line of caption text doesn't need a variable-
-        # sized allowance, so growing the figure by a small fixed amount
-        # and shifting the polar axes up within it by exactly that much
-        # (so the circle's own on-page size is unchanged) reliably clears
-        # space for it - verified empirically against a real 26-
-        # chromosome render, not just assumed.
-        _extra_height_in = 0.6
-        _fig_width_in, _fig_height_in = fig.get_size_inches()
-        _polar_ax = fig.axes[0]
-        _old_pos = _polar_ax.get_position()
-        _old_y0_in = _old_pos.y0 * _fig_height_in
-        _old_height_in = _old_pos.height * _fig_height_in
-        _new_fig_height_in = _fig_height_in + _extra_height_in
-        fig.set_size_inches(_fig_width_in, _new_fig_height_in)
-        _polar_ax.set_position([
-            _old_pos.x0,
-            (_old_y0_in + _extra_height_in) / _new_fig_height_in,
-            _old_pos.width,
-            _old_height_in / _new_fig_height_in,
-        ])
-        fig.text(0.5, 0.02, _circos_axis_unit_label(circos_config), ha='center', va='bottom',
-                 fontsize=9, color='black')
+        if _use_combined_layout:
+            # ================================================================
+            # Update ID ver4-25, R12: 'combined' layout - ONE render per
+            # model, spanning every requested order together. k=2's own
+            # chords and every k>=3 hub glyph share ONE colour scheme here
+            # (Okabe-Ito, keyed by k) instead of the usual red/blue
+            # intra-/inter-chromosome split - intra-/inter- is instead
+            # carried by LINESTYLE (solid/dashed), per the blueprint's own
+            # spec.
+            # ================================================================
+            del circos._patches[_base_patch_count:]
+            _combined_has_data = False
+            _combined_has_intra = False
+            _combined_has_inter = False
+            _combined_orders_drawn = set()
 
-        # Requirement 13 (correction - separate legend file): an earlier
-        # version tried to fit the legend INTO this same image, widening
-        # the figure and shrinking the polar axes' own reported bounding
-        # box to make room - this looked correct in isolated testing, but
-        # broke down on real plots: chromosome NAME labels are drawn well
-        # outside the polar axes' own nominal r-max (see the sector.text(
-        # ..., r=108, ...) call above - deliberately larger than the
-        # marker-effect rings' own r=100 so labels sit clearly outside
-        # them), so matplotlib's own ax.get_position() (a plain rectangle)
-        # never actually captured where those labels really render on the
-        # page - repositioning based on it could shrink the DECLARED axes
-        # bounds without preventing labels drawn OUTSIDE those bounds from
-        # still overlapping the legend, and (for a genuinely large,
-        # densely-labelled plot) the plot itself could still collide with
-        # a tall legend regardless of how the two were arranged on one
-        # shared canvas.
-        #
-        # ver4-5 (single session-wide legend, supersedes the earlier
-        # "separate PNG per plot" correction described above): rather
-        # than building this render's own legend handles and saving them
-        # to a dedicated '<...>_legend.png' right here, only the RAW
-        # ingredients that would have gone into that legend - which
-        # link-type colours actually appear on THIS render - are folded
-        # into the shared, session-wide `legend_accumulator` (colours/
-        # gene-colours were already merged in above, before this n-loop,
-        # since they don't vary with `n`). circos_plot() itself builds
-        # and saves the ONE combined legend, covering every phenotype/
-        # population/model plotted during its call, after its own loop
-        # over all of them has finished - see
-        # `_merge_into_legend_accumulator()` and the end of
-        # circos_plot(). The circos plot image itself is completely
-        # unaffected: `fig = circos.plotfig()` and the fig.text() unit
-        # label above are unchanged from before the legend feature
-        # existed, exactly as when each render still saved its own
-        # legend file.
-        if legend_accumulator is not None:
-            _merge_into_legend_accumulator(
-                legend_accumulator,
-                has_inter_chr_link=has_inter_chr_link_for_legend,
-                has_intra_chr_link=has_intra_chr_link_for_legend,
+            if 2 in _requested_orders and interactions_original.shape[0] != 0:
+                interactions = interactions_original[interactions_original['model'] == model_name].dropna().reset_index(drop=True)
+                if interactions.shape[0] != 0:
+                    link_alpha_min = circos_config.get('link_alpha_min', 0.15)
+                    link_lw = 1.5
+                    if _hl_regions:
+                        # colour already encodes k here, so highlighting only emphasises / fades
+                        interactions, _link_lws, _, _hl_style = _prepare_links_with_highlight(
+                            interactions, circos_config, link_lw, _hl_regions, _hl_opts)
+                        print(f"[circos_plot] highlight {PHENOTYPE}/{POPULATION}/{model_name} k=2: "
+                              f"{_highlight_counts_text(_hl_style, _hl_regions)}")
+                    else:
+                        interactions = _sort_links(interactions, circos_config)
+                        interactions['_alpha'], _link_lws, _ = _link_strength(interactions['value'], circos_config, link_lw)
+                    _k2_colour = _okabe_ito_colour_for_order(2)
+                    for ii in range(interactions.shape[0]):
+                        region1 = (interactions.iloc[ii, 0], interactions.iloc[ii, 1], interactions.iloc[ii, 2])
+                        region2 = (interactions.iloc[ii, 3], interactions.iloc[ii, 4], interactions.iloc[ii, 5])
+                        _is_intra = interactions.iloc[ii, 0] == interactions.iloc[ii, 3]
+                        if _is_intra:
+                            _combined_has_intra = True
+                        else:
+                            _combined_has_inter = True
+                        circos.link(region1, region2, lw=float(_link_lws.iloc[ii]), alpha=float(interactions.loc[ii, '_alpha']),
+                                    color=_k2_colour, linestyle='solid' if _is_intra else 'dashed')
+                    _combined_has_data = True
+                    _combined_orders_drawn.add(2)
+
+            _combined_hok_by_order = {}
+            for order in _requested_orders:
+                if order < 3:
+                    continue
+                hok_selected = higher_order_ring_frame[
+                    (higher_order_ring_frame['model'] == model_name) & (higher_order_ring_frame['order'] == order)
+                ] if higher_order_ring_frame.shape[0] else pd.DataFrame()
+                if hok_selected.shape[0]:
+                    _combined_hok_by_order[order] = hok_selected
+                    _combined_has_data = True
+                    _combined_orders_drawn.add(order)
+
+            if not _combined_has_data:
+                # Nothing at all (no k=2 rows, no k>=3 hyperedges) for this
+                # model under ANY requested order - skip entirely, no file
+                # written, mirroring 'per_order' layout's own per-(model,
+                # order) skip below.
+                continue
+
+            _figsize_cfg = circos_config.get('figsize')
+            fig = circos.plotfig(figsize=(_figsize_cfg, _figsize_cfg)) if _figsize_cfg else circos.plotfig()
+            _ax = fig.axes[0]
+            # r=100.0: the outermost ring edge - the one radius every
+            # chromosome sector shares in common regardless of which
+            # model's own marker-effect ring a hyperedge's individual
+            # members happen to sit closest to (unlike a k=2 chord, whose
+            # own r1/r2 pycirclize resolves per-sector via `get_lowest_r()`
+            # - not applicable here since a single hub glyph's spokes can
+            # originate from several different models' rings at once).
+            for order, hok_selected in _combined_hok_by_order.items():
+                _hl_state = {}
+                _has_intra, _has_inter = _draw_higher_order_glyphs(
+                    _ax, circos, hok_selected, 100.0,
+                    colourise=lambda is_intra, _order=order: _okabe_ito_colour_for_order(_order),
+                    # combined layout colours by k, so `link_colour_mode` does not apply
+                    circos_config=dict(circos_config, link_colour_mode='chrom'),
+                    hl=({'regions': _hl_regions, 'opts': _hl_opts, 'recolour': False} if _hl_regions else None),
+                    hl_state=_hl_state,
+                )
+                if _hl_regions:
+                    print(f"[circos_plot] highlight {PHENOTYPE}/{POPULATION}/{model_name} k={order}: "
+                          f"{_hl_state.get('n_hit', 0)} of {_hl_state.get('n_total', 0)} hyperedges touch the highlighted region(s)")
+                _combined_has_intra = _combined_has_intra or _has_intra
+                _combined_has_inter = _combined_has_inter or _has_inter
+
+            _finish_circos_figure(fig, circos_config)
+
+            if legend_accumulator is not None:
+                _merge_into_legend_accumulator(
+                    legend_accumulator,
+                    has_inter_chr_link=_combined_has_inter,
+                    has_intra_chr_link=_combined_has_intra,
+                    combined_orders_used=_combined_orders_drawn,
+                )
+
+            _phenotype_fs = _sanitize_path_component(PHENOTYPE)
+            _population_fs = _sanitize_path_component(POPULATION)
+            _model_fs = _sanitize_path_component(model_name)
+            _k_sorted = sorted(_combined_orders_drawn)
+            _k_suffix = f"k{_k_sorted[0]}-{_k_sorted[-1]}" if len(_k_sorted) > 1 else f"k{_k_sorted[0]}"
+            _plot_path = './Result/' + RESULT_NAME + '/circos_' + _phenotype_fs + '_' + _population_fs + '_interaction_' + _model_fs + '_' + _k_suffix + _hl_sfx + '.png'
+            _ps.save_figure(fig, _plot_path, dpi=plot_dpi, saver=_safe_savefig,
+                            extra_formats=_ps.extra_formats_of(circos_config))
+            plt.close(fig)
+            continue  # 'combined' layout fully handled this model
+
+        # ====================================================================
+        # 'per_order' layout (default, and every pre-ver4-25 caller's only
+        # option) - one render per (model, order), k=2 keeping its
+        # historical, unchanged filename and code path.
+        # ====================================================================
+        for order in _requested_orders:
+            # Remove any chord links/hub patches a PREVIOUS iteration of
+            # this SAME loop added, so this iteration starts from the same
+            # clean (no-link) state every time - a no-op on the very first
+            # iteration, since nothing has been added past
+            # _base_patch_count yet.
+            del circos._patches[_base_patch_count:]
+
+            if order == 2:
+                # ============================================================
+                # EXACTLY today's historical k=2 code path, byte-for-byte
+                # unchanged (AC12.3) - see git history / this function's
+                # own pre-ver4-25 form for provenance. `_finish_circos_
+                # figure()` (extracted, see its own docstring) replaces
+                # what used to be this block's own inline "extra height /
+                # unit label" code with an IDENTICAL computation - a
+                # source-level refactor only, never a behavioural one.
+                # ============================================================
+                has_inter_chr_link_for_legend = False
+                has_intra_chr_link_for_legend = False
+                _hl_style = None
+                _hl_hit_intra = _hl_hit_inter = _hl_dimmed = False
+                if interactions_original.shape[0] != 0:
+                    interactions = interactions_original[interactions_original['model']==model_selected[n]].dropna().reset_index(drop=True)
+                    # Requirement: link OPACITY (not width) encodes each link's
+                    # relative importance ('value') - a higher value means a more
+                    # solid/opaque (visually "thicker-looking") link, while every
+                    # link is drawn at the same, fixed line width. 'value' itself
+                    # is normalized to sum to 1 across whatever's currently
+                    # displayed (see the `value / value.sum()` step above), so its
+                    # absolute scale shifts with how many links are shown - using
+                    # it as alpha directly (or via a fixed multiplier, as the old
+                    # width-based version did) would make the same link look very
+                    # different across plots with different link counts. Instead,
+                    # min-max normalize WITHIN this plot's own displayed link set,
+                    # into [link_alpha_min, 1.0] - the strongest link on any given
+                    # plot is always fully opaque, the weakest is always still at
+                    # least link_alpha_min visible (never fully invisible), and
+                    # everything in between scales smoothly - regardless of how
+                    # many links happen to be shown.
+                    link_alpha_min = circos_config.get('link_alpha_min', 0.15)
+                    # Fixed for every link - not user-configurable, since only
+                    # opacity (above) is meant to vary by strength; a separate
+                    # width control would just uniformly scale every line at once
+                    # (no diagnostic value) and was removed from the GUI.
+                    link_lw = 1.5
+                    if interactions.shape[0] != 0:
+                        if _hl_regions:
+                            # Region highlighting: non-highlighted links first (faded, or
+                            # dropped in mode 'only'), highlighted ones last = on top.
+                            interactions, _link_lws, _link_s, _hl_style = _prepare_links_with_highlight(
+                                interactions, circos_config, link_lw, _hl_regions, _hl_opts)
+                            print(f"[circos_plot] highlight {PHENOTYPE}/{POPULATION}/{model_selected[n]}: "
+                                  f"{_highlight_counts_text(_hl_style, _hl_regions)}")
+                            if _hl_style['n_hit'] == 0:
+                                print(f"[circos_plot] highlight {PHENOTYPE}/{POPULATION}/{model_selected[n]}: no link among the "
+                                      f"{_hl_style['n_total']} displayed touches the requested region(s) - raise the number of "
+                                      f"interactions shown, or widen the region.")
+                        else:
+                            # ver4-31 R11: `link_sort` / `link_scale` / `link_lw_range`
+                            # (all absent by default = exactly the historical
+                            # min-max alpha, fixed width, file order) via the
+                            # shared `_link_strength()`.
+                            interactions = _sort_links(interactions, circos_config)
+                            interactions['_alpha'], _link_lws, _link_s = _link_strength(
+                                interactions['value'], circos_config, link_lw)
+                    _link_mode = _link_options(circos_config)['colour_mode']
+                    for ii in range(interactions.shape[0]):
+                        region1 = (interactions.iloc[ii,0], interactions.iloc[ii,1], interactions.iloc[ii,2])
+                        region2 = (interactions.iloc[ii,3], interactions.iloc[ii,4], interactions.iloc[ii,5])
+                        _intra = interactions.iloc[ii,0] == interactions.iloc[ii,3]
+                        if _hl_style is not None and _hl_style['hit'][ii]:
+                            # highlighted: the region's colour; line style (not colour) tells
+                            # within- from between-chromosome links.
+                            if _intra:
+                                _hl_hit_intra = True
+                            else:
+                                _hl_hit_inter = True
+                            circos.link(region1, region2, lw=float(_link_lws.iloc[ii]), alpha=float(interactions.loc[ii,'_alpha']),
+                                        color=_hl_regions[int(_hl_style['region'][ii])]['colour'],
+                                        linestyle='solid' if _intra else _hl.HIGHLIGHT_DASH)
+                            continue
+                        if _hl_style is not None and _hl_opts['dim'] == 'grey':
+                            _hl_dimmed = True
+                            circos.link(region1, region2, lw=float(_link_lws.iloc[ii]), alpha=float(interactions.loc[ii,'_alpha']),
+                                        color=_hl.DIM_GREY)
+                            continue
+                        if not _intra:   #within chromosome or between chromosome
+                            has_inter_chr_link_for_legend = True
+                        else:
+                            has_intra_chr_link_for_legend = True
+                        colour = _link_colour(_link_mode, _intra, _link_s.iloc[ii])
+                        _extra = {'linestyle': 'solid' if _intra else 'dashed'} if _link_mode == 'value' else {}
+                        circos.link(region1, region2, lw=float(_link_lws.iloc[ii]), alpha=float(interactions.loc[ii,'_alpha']),
+                                    color=colour, **_extra)
+
+                # Store the circos plot
+                # Update ID ver4-6, R2 (blueprint §3.4/S3): `circos_config.get(
+                # 'figsize')` is absent (None) for every pre-ver4-6 config, in
+                # which case `circos.plotfig()` is called exactly as before this
+                # option existed (pycirclize's own (8, 8)-inch default) - I11,
+                # AC2.5. A configured figsize (e.g. widened for a many-ring plot)
+                # is forwarded as a square `(f, f)` tuple, matching pycirclize's
+                # own `figsize: tuple[float, float]` parameter.
+                fig = None
+                _k2_link_artists = []
+                if _shared_k2['ok']:
+                    if _shared_k2['blob'] is None:
+                        # Build the link-free base ONCE: temporarily set this
+                        # model's freshly-added link patches aside so plotfig()
+                        # sees only the loop-invariant patches, then freeze the
+                        # still-UNDRAWN figure as a pickle blob. (The figure is
+                        # created with tight_layout=True, which re-runs on every
+                        # draw and is not idempotent, so re-saving ONE figure
+                        # object would yield slightly different image sizes for
+                        # the 2nd+ model - cloning a pristine, undrawn copy per
+                        # model reproduces the one-draw-per-figure result of
+                        # the original per-model plotfig() exactly.)
+                        _pending_links = circos._patches[_base_patch_count:]
+                        del circos._patches[_base_patch_count:]
+                        _figsize_cfg = circos_config.get('figsize')
+                        _base_fig = circos.plotfig(figsize=(_figsize_cfg, _figsize_cfg)) if _figsize_cfg else circos.plotfig()
+                        _finish_circos_figure(_base_fig, circos_config)
+                        circos._patches.extend(_pending_links)
+                        try:
+                            _shared_k2['blob'] = pickle.dumps(_base_fig, protocol=pickle.HIGHEST_PROTOCOL)
+                        except Exception as _exc:
+                            print(f"[circos_plot] NOTE: could not freeze the base figure for reuse ({_exc!r}); "
+                                  f"falling back to one full plotfig() per model (slower, same output).")
+                            _shared_k2['ok'] = False
+                        plt.close(_base_fig)
+                    if _shared_k2['ok']:
+                        fig = pickle.loads(_shared_k2['blob'])
+                        _k2_link_artists = _attach_link_patches(fig.axes[0], circos._patches[_base_patch_count:])
+                if fig is None:
+                    # Fallback / historical path: one full plotfig() per model.
+                    _figsize_cfg = circos_config.get('figsize')
+                    if _figsize_cfg:
+                        fig = circos.plotfig(figsize=(_figsize_cfg, _figsize_cfg))
+                    else:
+                        fig = circos.plotfig()
+                    _finish_circos_figure(fig, circos_config)
+
+                # Requirement 13 (correction - separate legend file): an earlier
+                # version tried to fit the legend INTO this same image, widening
+                # the figure and shrinking the polar axes' own reported bounding
+                # box to make room - this looked correct in isolated testing, but
+                # broke down on real plots: chromosome NAME labels are drawn well
+                # outside the polar axes' own nominal r-max (see the sector.text(
+                # ..., r=108, ...) call above - deliberately larger than the
+                # marker-effect rings' own r=100 so labels sit clearly outside
+                # them), so matplotlib's own ax.get_position() (a plain rectangle)
+                # never actually captured where those labels really render on the
+                # page - repositioning based on it could shrink the DECLARED axes
+                # bounds without preventing labels drawn OUTSIDE those bounds from
+                # still overlapping the legend, and (for a genuinely large,
+                # densely-labelled plot) the plot itself could still collide with
+                # a tall legend regardless of how the two were arranged on one
+                # shared canvas.
+                #
+                # ver4-5 (single session-wide legend, supersedes the earlier
+                # "separate PNG per plot" correction described above): rather
+                # than building this render's own legend handles and saving them
+                # to a dedicated '<...>_legend.png' right here, only the RAW
+                # ingredients that would have gone into that legend - which
+                # link-type colours actually appear on THIS render - are folded
+                # into the shared, session-wide `legend_accumulator` (colours/
+                # gene-colours were already merged in above, before this n-loop,
+                # since they don't vary with `n`). circos_plot() itself builds
+                # and saves the ONE combined legend, covering every phenotype/
+                # population/model plotted during its call, after its own loop
+                # over all of them has finished - see
+                # `_merge_into_legend_accumulator()` and the end of
+                # circos_plot(). The circos plot image itself is completely
+                # unaffected: `fig = circos.plotfig()` and the unit label
+                # applied by `_finish_circos_figure()` above are unchanged from
+                # before the legend feature existed, exactly as when each
+                # render still saved its own legend file.
+                if legend_accumulator is not None:
+                    _merge_into_legend_accumulator(
+                        legend_accumulator,
+                        has_inter_chr_link=has_inter_chr_link_for_legend,
+                        has_intra_chr_link=has_intra_chr_link_for_legend,
+                    )
+                    if _hl_regions:
+                        _merge_into_legend_accumulator(
+                            legend_accumulator, highlight_intra=_hl_hit_intra,
+                            highlight_inter=_hl_hit_inter, highlight_dimmed=_hl_dimmed)
+                # Bugfix (see module-level note above `_sanitize_path_component`):
+                # PHENOTYPE/POPULATION/model_selected[n] are free-text values that
+                # were never validated as filename-safe anywhere upstream - sanitise
+                # them here, immediately before they become part of a saved path,
+                # and save through `_safe_savefig()` rather than `fig.savefig()`
+                # directly.
+                _phenotype_fs = _sanitize_path_component(PHENOTYPE)
+                _population_fs = _sanitize_path_component(POPULATION)
+                if model_selected[n] == 'not_returned':
+                    _plot_path = './Result/'+RESULT_NAME+'/circos_'+_phenotype_fs+'_'+_population_fs+_hl_sfx+'.png'
+                    _ps.save_figure(fig, _plot_path, dpi=plot_dpi, saver=_safe_savefig,
+                            extra_formats=_ps.extra_formats_of(circos_config))
+                else:
+                    _model_fs = _sanitize_path_component(model_selected[n])
+                    _plot_path = './Result/'+RESULT_NAME+'/circos_'+_phenotype_fs+'_'+_population_fs+'_interaction_'+_model_fs+_hl_sfx+'.png'
+                    _ps.save_figure(fig, _plot_path, dpi=plot_dpi, saver=_safe_savefig,
+                            extra_formats=_ps.extra_formats_of(circos_config))
+                    if _hl_style is not None:
+                        _write_highlight_links_table(_plot_path, interactions, _hl_style, _hl_regions)
+                plt.close(fig)
+                # ============================================================
+                # end unchanged k=2 path
+                # ============================================================
+                continue
+
+            # ----------------------------------------------------------------
+            # Update ID ver4-25, R12: order >= 3 under 'per_order' layout -
+            # one hub-and-spoke-only render, its own new filename suffix.
+            # Skipped ENTIRELY (no file written) whenever this specific
+            # (model, order) combination has no surviving hyperedge - unlike
+            # k=2 above, there is no historical "always render, even if
+            # empty" precedent to preserve for a k that never existed before
+            # this feature.
+            # ----------------------------------------------------------------
+            if model_name == 'not_returned':
+                continue  # the sentinel only ever applies to the (empty) k=2 case
+            hok_selected = higher_order_ring_frame[
+                (higher_order_ring_frame['model'] == model_name) & (higher_order_ring_frame['order'] == order)
+            ] if higher_order_ring_frame.shape[0] else pd.DataFrame()
+            if hok_selected.shape[0] == 0:
+                continue
+
+            _figsize_cfg = circos_config.get('figsize')
+            fig = circos.plotfig(figsize=(_figsize_cfg, _figsize_cfg)) if _figsize_cfg else circos.plotfig()
+            _ax = fig.axes[0]
+            # 'per_order' layout keeps the SAME red/blue intra-/inter-
+            # chromosome convention every k=2 chord already uses (blueprint:
+            # "existing intra-chromosome ... / inter-chromosome palette") -
+            # only 'combined' layout colours by k instead (see above).
+            _hl_state = {}
+            _has_intra, _has_inter = _draw_higher_order_glyphs(
+                _ax, circos, hok_selected, 100.0,
+                colourise=lambda is_intra: 'red' if is_intra else 'blue',
+                circos_config=circos_config,
+                hl=({'regions': _hl_regions, 'opts': _hl_opts, 'recolour': True} if _hl_regions else None),
+                hl_state=_hl_state,
             )
-        # Bugfix (see module-level note above `_sanitize_path_component`):
-        # PHENOTYPE/POPULATION/model_selected[n] are free-text values that
-        # were never validated as filename-safe anywhere upstream - sanitise
-        # them here, immediately before they become part of a saved path,
-        # and save through `_safe_savefig()` rather than `fig.savefig()`
-        # directly.
-        _phenotype_fs = _sanitize_path_component(PHENOTYPE)
-        _population_fs = _sanitize_path_component(POPULATION)
-        if model_selected[n] == 'not_returned':
-            _plot_path = './Result/'+RESULT_NAME+'/circos_'+_phenotype_fs+'_'+_population_fs+'.png'
-            _safe_savefig(fig, _plot_path, dpi=plot_dpi)
-        else:
-            _model_fs = _sanitize_path_component(model_selected[n])
-            _plot_path = './Result/'+RESULT_NAME+'/circos_'+_phenotype_fs+'_'+_population_fs+'_interaction_'+_model_fs+'.png'
-            _safe_savefig(fig, _plot_path, dpi=plot_dpi)
+            _finish_circos_figure(fig, circos_config)
+            if _hl_regions:
+                print(f"[circos_plot] highlight {PHENOTYPE}/{POPULATION}/{model_name} k={order}: "
+                      f"{_hl_state.get('n_hit', 0)} of {_hl_state.get('n_total', 0)} hyperedges touch the highlighted region(s)")
+
+            if legend_accumulator is not None:
+                _merge_into_legend_accumulator(
+                    legend_accumulator,
+                    has_inter_chr_link=_has_inter,
+                    has_intra_chr_link=_has_intra,
+                    has_hub_glyph=True,
+                )
+                if _hl_regions:
+                    _merge_into_legend_accumulator(
+                        legend_accumulator, highlight_intra=_hl_state.get('hit_intra'),
+                        highlight_inter=_hl_state.get('hit_inter'), highlight_dimmed=_hl_state.get('dimmed'))
+
+            _phenotype_fs = _sanitize_path_component(PHENOTYPE)
+            _population_fs = _sanitize_path_component(POPULATION)
+            _model_fs = _sanitize_path_component(model_name)
+            _plot_path = './Result/'+RESULT_NAME+'/circos_'+_phenotype_fs+'_'+_population_fs+'_interaction_'+_model_fs+f'_k{order}'+_hl_sfx+'.png'
+            _ps.save_figure(fig, _plot_path, dpi=plot_dpi, saver=_safe_savefig,
+                            extra_formats=_ps.extra_formats_of(circos_config))
+            plt.close(fig)
+
 
 def _clamp_region_to_chromosome(df, mask, chrom_start, chrom_end):
     """Requirement (bugfix - a widened marker/gene position could come out
@@ -2174,13 +4014,64 @@ def _clean_population_label(pop):
     ever works for the all population' - every real, numeric population
     silently fails the same string comparison in the same way.
 
-    Converts a whole-number float (1.0, 2.0, ...) to its clean integer
-    string ('1', '2', ...); anything else (already a clean int/str, or
-    a non-numeric string like 'all') is returned as plain str(pop)
-    unchanged."""
-    if isinstance(pop, float) and pop.is_integer():
+    Converts a whole-number float (1.0, 2.0, ...), a numpy integer/float
+    scalar, AND the string form of a whole-number float ('1.0', '2.0',
+    ...) to its clean integer string ('1', '2', ...); anything else
+    (already a clean int/str, or a non-numeric string like 'all') is
+    returned as plain str(pop) unchanged.
+
+    The string form ('2.0') matters for SCENARIO='between': its
+    population labels are built by string concatenation ('1.0->2.0') from
+    the phenotype file's population values, so a float-promoted column
+    leaves the TEST half as the STRING '2.0' after the '->' split - which
+    the float-only check above never normalised, while the population
+    list handed in by the caller (raw numeric values, via
+    `_clean_population_label()`) WAS normalised to '2'. The two sides of
+    the very same comparison then disagreed ('2.0' vs '2'), every model
+    was dropped for that population, and plot() died on `MODEL[0]` (list
+    index out of range). Every population label - effect/interaction/
+    attention tables, the POPULATION list, the chromosome/gene info files
+    and the broadcast step - now goes through this ONE function, so they
+    can never disagree again."""
+    if isinstance(pop, (bool, np.bool_)):
+        return str(pop)
+    if isinstance(pop, (int, np.integer)):
         return str(int(pop))
-    return str(pop)
+    if isinstance(pop, (float, np.floating)):
+        return str(int(pop)) if float(pop).is_integer() else str(pop)
+    _s = str(pop)
+    if re.fullmatch(r'-?\d+\.0+', _s):
+        return _s.split('.')[0]
+    return _s
+
+
+def _warn_no_model_data(phenotype, population):
+    """Log (never raise) that no model has marker-effect data for this
+    (phenotype, population), so its circos plot is skipped - the previous
+    behaviour was an `IndexError: list index out of range` from
+    `MODEL[0]` inside plot(), which aborted every remaining plot too."""
+    print(f"[circos_plot] WARNING: no model has marker-effect data for phenotype={phenotype!r}, "
+          f"population={population!r} - this circos plot is skipped. (Usually a population label "
+          f"mismatch between the effect table and the population list, or a population that is "
+          f"never a test population in this run.)")
+
+
+def _between_test_population_label(pop):
+    """SCENARIO='between': the clean TEST-population label of a combined
+    'train->test' (or 'train->valid->test') population value - the last
+    '->' part, passed through `_clean_population_label()`. Safe for a value
+    with no '->' at all (returned cleaned, unsplit) and for non-string
+    values (an int/float population is first turned into its string)."""
+    return _clean_population_label(str(pop).split('->')[-1])
+
+
+def _remap_population_column(series, label_fn):
+    """`series.map(label_fn)` computed once per DISTINCT value (the
+    population column of a big effect/interaction table has a handful of
+    distinct values over millions of rows), returning a plain-string
+    Series on the original index."""
+    _mapping = {v: label_fn(v) for v in pd.unique(series)}
+    return series.map(_mapping).astype(str)
 
 
 def _broadcast_population_info(path, target_populations, description):
@@ -2307,61 +4198,180 @@ def _render_one_circos_plot(phenotype_value, population_value):
         ctx['effect_grouped_all'], ctx['effect_grouped_pop'], ctx['marker_info'], ctx['chrom_info'],
         phenotype_value, ctx['MODEL'], ctx['end_adjust'], population_value, ctx['WINDOW'],
         ctx['RESULT_NAME'], ctx['ASCENDING'],
+        ensemble_hue_rule=_ensemble_hue_rule(ctx['circos_config']),
+        label_cfg=ctx['circos_config'],
     )
     interaction_selected = interaction(
         ctx['interaction_groups'], ctx['interaction_model_order'], ctx['marker_info'], phenotype_value,
         ctx['circos_config'], population_value, ctx['RESULT_NAME'], ctx['attention_groups'], ctx['attention_model_order'],
+    )
+    # Update ID ver4-25, R12: the k>=3 analog of `interaction_selected`
+    # above - see `higher_order_interaction()`'s own docstring. Empty
+    # (correctly-columned) whenever `ctx['higher_order_groups']` is empty
+    # - i.e. every run this feature is not selected for.
+    higher_order_selected = higher_order_interaction(
+        ctx['higher_order_groups'], ctx['higher_order_model_order'], ctx['marker_info'], phenotype_value,
+        ctx['circos_config'], population_value, ctx['RESULT_NAME'], ctx['interaction_orders'],
     )
     local_legend_accumulator = _new_legend_accumulator()
     plot(
         interaction_selected, ctx['chrom_info'], ctx['gene_info'], ctx['pop_source'], phenotype_value, model_for_plot,
         ctx['circos_config'], ctx['CYTOBAND_COLORMAP'], population_value, ctx['RESULT_NAME'],
         plot_dpi=ctx['plot_dpi'], legend_accumulator=local_legend_accumulator,
+        higher_order_ring_frame=higher_order_selected, interaction_orders=ctx['interaction_orders'],
+        higher_order_layout=ctx['higher_order_layout'],
     )
     return local_legend_accumulator
 
 
-def _resolve_circos_plot_workers(requested):
-    """Effective worker-process count for circos_plot()'s optional
-    (phenotype, population) fan-out - daemon-safe, mirroring
+def _prepare_one_circos_unit(phenotype_value, population_value):
+    """Stage 1 of circos_plot()'s parallel fan-out for one (phenotype,
+    population): the cheap, ordering-sensitive preparation that used to sit
+    at the top of each serial-loop iteration - writes this unit's
+    marker-effect `.tsv` files (`quantile_conversion()`) and resolves its
+    link tables (`interaction()`/`higher_order_interaction()`). Returns
+    those three small results so the parent can slice the unit's models
+    into render chunks. Runs exactly once per unit, so no two workers ever
+    write the same `.tsv`."""
+    ctx = _CIRCOS_WORKER_CTX
+    model_for_plot = quantile_conversion(
+        ctx['effect_grouped_all'], ctx['effect_grouped_pop'], ctx['marker_info'], ctx['chrom_info'],
+        phenotype_value, ctx['MODEL'], ctx['end_adjust'], population_value, ctx['WINDOW'],
+        ctx['RESULT_NAME'], ctx['ASCENDING'],
+        ensemble_hue_rule=_ensemble_hue_rule(ctx['circos_config']),
+        label_cfg=ctx['circos_config'],
+    )
+    interaction_selected = interaction(
+        ctx['interaction_groups'], ctx['interaction_model_order'], ctx['marker_info'], phenotype_value,
+        ctx['circos_config'], population_value, ctx['RESULT_NAME'], ctx['attention_groups'], ctx['attention_model_order'],
+    )
+    higher_order_selected = higher_order_interaction(
+        ctx['higher_order_groups'], ctx['higher_order_model_order'], ctx['marker_info'], phenotype_value,
+        ctx['circos_config'], population_value, ctx['RESULT_NAME'], ctx['interaction_orders'],
+    )
+    return model_for_plot, interaction_selected, higher_order_selected
+
+
+def _render_one_circos_chunk(phenotype_value, population_value, model_for_plot, interaction_selected,
+                             higher_order_selected, only_models):
+    """Stage 2 of circos_plot()'s parallel fan-out: render the figures for
+    `only_models` (a slice of one (phenotype, population)'s models) from
+    the tables `_prepare_one_circos_unit()` produced. Splitting a unit's
+    models across workers is what lets a run with few phenotypes/populations
+    but many interaction-emitting models still use every core. Returns this
+    chunk's LOCAL legend accumulator (merged by the parent - see
+    `_render_one_circos_plot()`'s docstring for why it is returned rather
+    than shared)."""
+    ctx = _CIRCOS_WORKER_CTX
+    local_legend_accumulator = _new_legend_accumulator()
+    plot(
+        interaction_selected, ctx['chrom_info'], ctx['gene_info'], ctx['pop_source'], phenotype_value, model_for_plot,
+        ctx['circos_config'], ctx['CYTOBAND_COLORMAP'], population_value, ctx['RESULT_NAME'],
+        plot_dpi=ctx['plot_dpi'], legend_accumulator=local_legend_accumulator,
+        higher_order_ring_frame=higher_order_selected, interaction_orders=ctx['interaction_orders'],
+        higher_order_layout=ctx['higher_order_layout'], only_models=only_models,
+    )
+    return local_legend_accumulator
+
+
+def _available_cpu_count():
+    """CPUs this process may actually run on: the scheduler's affinity mask
+    when the OS exposes one (PBS/Slurm cgroup-limited jobs - where
+    ``os.cpu_count()`` reports the WHOLE node and would badly oversubscribe
+    the allocation), else ``os.cpu_count()``."""
+    try:
+        return max(1, len(os.sched_getaffinity(0)))
+    except (AttributeError, OSError):
+        return max(1, os.cpu_count() or 1)
+
+
+def _resolve_circos_plot_workers(requested, n_jobs=None):
+    """Effective worker-process count for circos_plot()'s optional parallel
+    fan-out - daemon-safe, mirroring
     `pipeline_utils.dataloader_num_workers()`/`nested_safe_n_jobs()`'s own
     fresh-per-call daemon check (never cached, since the correct answer
     depends on whichever process is actually about to call
     `ProcessPoolExecutor()`, not on whatever process originally read the
     config).
 
-    Returns ``1`` (fully serial - today's behaviour, byte-for-byte)
-    whenever:
-      - the CALLING process is itself an already-daemonic `multiprocessing`
-        worker (e.g. circos_plot() invoked from inside an
-        intra_batch_parallel/intra_task_parallel worker) - Python forbids
-        a daemonic process from spawning children at all, so a
-        `ProcessPoolExecutor()` would otherwise raise the moment it tried
-        to start, rather than degrading gracefully; and
-      - ``requested`` is absent, ``None``, or <= 1 - i.e. every existing
-        config/call site that predates this feature (no `CIRCOS_PLOT_
-        WORKERS` key at all) reproduces exactly today's serial loop.
+    Where the count comes from (fix: ``N_JOBS`` was previously ignored by
+    the circos step entirely, so a run configured with ``N_JOBS=6`` still
+    rendered every circos figure serially):
 
-    ``requested`` above the number of CPUs actually visible to this
-    process is capped down to `os.cpu_count()` - asking for more worker
-    processes than there are cores cannot make rendering faster and only
-    adds process-startup overhead for no benefit.
+      1. ``requested`` (``CIRCOS_PLOT_WORKERS``) when it is given - an
+         explicit circos-specific setting always wins; ``<= 1`` means
+         serial, exactly as before.
+      2. otherwise ``n_jobs`` (the run's ``N_JOBS``), using scikit-learn's
+         convention: a positive value is a worker count, ``-1`` means "every
+         CPU available to this process", ``0``/``None`` means serial.
+      3. otherwise ``1`` - fully serial, today's behaviour for a config
+         that has neither key.
+
+    Returns ``1`` unconditionally when the CALLING process is itself an
+    already-daemonic `multiprocessing` worker (e.g. circos_plot() invoked
+    from inside an intra_batch_parallel/intra_task_parallel worker) - Python
+    forbids a daemonic process from spawning children at all.
+
+    The result is capped at the CPUs actually available to this process
+    (`_available_cpu_count()`): more worker processes than cores cannot make
+    rendering faster and only adds process-startup overhead.
     """
     try:
         if multiprocessing.current_process().daemon:
             return 1
     except Exception:
         pass
-    try:
-        _requested = int(requested) if requested else 1
-    except (TypeError, ValueError):
-        _requested = 1
-    if _requested <= 1:
+    _ncpu = _available_cpu_count()
+    if requested is not None and requested != '':
+        try:
+            _requested = int(requested)
+        except (TypeError, ValueError):
+            return 1
+        if _requested <= 1:
+            return 1
+        return max(1, min(_requested, _ncpu))
+    if n_jobs is None:
         return 1
-    return max(1, min(_requested, os.cpu_count() or 1))
+    try:
+        _n_jobs = int(n_jobs)
+    except (TypeError, ValueError):
+        return 1
+    if _n_jobs == -1 or _n_jobs < -1:
+        # sklearn convention: -1 = all CPUs, -2 = all but one, ...
+        _n_jobs = max(1, _ncpu + 1 + _n_jobs)
+    if _n_jobs <= 1:
+        return 1
+    return max(1, min(_n_jobs, _ncpu))
 
 
-def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULATION, PHENOTYPE, circos_config, end_adjust, WINDOW, CYTOBAND_COLORMAP, RESULT_NAME, attention, SCENARIO, ASCENDING, gene_adjust=0, plot_dpi=600, n_workers=1):
+def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULATION, PHENOTYPE, circos_config, end_adjust, WINDOW, CYTOBAND_COLORMAP, RESULT_NAME, attention, SCENARIO, ASCENDING, gene_adjust=0, plot_dpi=600, n_workers=1,
+                interactions_hok=None, interaction_orders=(2,), higher_order_layout='per_order',
+                n_jobs=None):
+    """Update ID ver4-25, R12 (new, additive parameters - I11/AC12.3):
+    `interactions_hok` - Interaction_higher_order.csv's own table (or its
+    batch-merged/grouped equivalent - `ResultSet.interactions_hok()`/
+    `interactions_hok_grouped()`, mirroring exactly how `interactions`
+    itself is handed in either raw or pre-aggregated), `None`/empty (the
+    default, and what every caller that predates this feature passes
+    implicitly) meaning there is no k>=3 data anywhere in this run.
+    `interaction_orders` - which k values to actually draw, default
+    `(2,)` (today's only order, unconditionally). `higher_order_layout` -
+    `'per_order'` (default) or `'combined'` - see `plot()`'s own
+    docstring for what each means. Every one of these three is a no-op
+    (byte-identical output, AC12.3) whenever `interactions_hok` is empty
+    and/or `interaction_orders == [2]`, which is every run this feature
+    is not selected for.
+
+    Parallelism (`n_workers` / `n_jobs`): `n_workers` is the circos-specific
+    setting (``CIRCOS_PLOT_WORKERS``); `n_jobs` is the run's general
+    ``N_JOBS``. An explicit `n_workers` wins; when it is ``None`` the worker
+    count is taken from `n_jobs` (previously ``N_JOBS`` was ignored here and
+    circos always rendered serially). See `_resolve_circos_plot_workers()`.
+    The work is split per (phenotype, population) AND per model, so a run
+    with few traits/populations but many interaction-emitting models still
+    keeps every worker busy."""
+    if interactions_hok is None:
+        interactions_hok = pd.DataFrame()
 
     # ver4-4 R7.b - start every circos_plot() call from a clean
     # _load_combined_marker_info() cache: this run's own marker_info.csv/
@@ -2391,45 +4401,97 @@ def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULA
           f"figsize={circos_config.get('figsize') or '8.0 (pycirclize default)'} "
           f"({_resolved_note('figsize') if circos_config.get('figsize') else 'absent from config, using pycirclize default'}).")
 
+    # Region highlighting: log the resolved state unconditionally (same convention as the R2 line
+    # above), so a run's log always says whether this render highlights anything and why not.
+    _hl_cfg = _hl.highlight_options(circos_config)
+    if _hl_cfg['regions']:
+        print(f"[circos_plot] highlight: {len(_hl_cfg['regions'])} region(s) "
+              f"({'; '.join(r['chrom'] + ('' if r['start'] is None and r['end'] is None else ':' + _hl.format_position(r['start'] or 0, _hl_cfg['unit']) + '-' + (_hl.format_position(r['end'], _hl_cfg['unit']) if r['end'] is not None else 'end')) for r in _hl_cfg['regions'])}), "
+              f"mode={_hl_cfg['mode']!r}, match={_hl_cfg['match']!r}, colour_by={_hl_cfg['colour_by']!r}; "
+              f"plots that place at least one region are saved with the suffix '_highlight'.")
+    else:
+        print("[circos_plot] highlight: no regions configured (absent from config) - plots are not highlighted.")
+
+    # 'Only show links involving the highlighted regions': a selection-stage filter, so it must be
+    # known before the top-N% cut below. (None, None) - and circos_config untouched - otherwise.
+    _restrict_store, _restrict_hok = _highlight_restrict(circos_config, chrom_info, marker_info, RESULT_NAME)
+    if _restrict_hok is not None:
+        circos_config = dict(circos_config, _hl_restrict=_restrict_hok)
+
     pop_source =  data_conversion(chrom_info, gene_info, PHENOTYPE, RESULT_NAME, gene_adjust=gene_adjust)
     
-    if SCENARIO == 'between' and interactions.shape[0] != 0:
-        interactions['population'] = interactions['population'].str.split('->', expand=True).iloc[:,-1]
-    if SCENARIO == 'between' and interactions.shape[0] != 0:
-        attention['population'] = attention['population'].str.split('->', expand=True).iloc[:,-1]
-    if SCENARIO == 'between' and effect.shape[0] != 0:
-        effect['population'] = effect['population'].str.split('->', expand=True).iloc[:,-1]
-    if SCENARIO == 'between':
-        # Requirement (bugfix - gene ring silently missing for real
-        # populations, SCENARIO='between' specifically): interactions/
-        # attention/effect above all get their own 'population' column
-        # split on '->' (a 'between' scenario's own population values
-        # are combined train->test labels, e.g. 'Historical->2014') and
-        # only the test-population half kept - but POPULATION itself
-        # (this function's own parameter, used directly for every
-        # file-name/comparison in quantile_conversion()/interaction()/
-        # plot() below, and by the broadcast step in main_app.py before
-        # this function is even called) was never given the same
-        # treatment. Left uncombined, POPULATION[j] stays e.g.
-        # 'Historical->2014' - which never matches a gene/chromosome
-        # file correctly written under the clean, split label '2014'
-        # (by data_conversion(), from the broadcast file's own clean
-        # population column) - exactly the same 'gene ring silently
-        # missing, but not for the always-clean-string all' symptom as
-        # the earlier float-promotion bug, just triggered by a
-        # different upstream cause specific to this scenario.
-        POPULATION = [p.split('->')[-1] if isinstance(p, str) and '->' in p else p for p in POPULATION]
-    
-    # Requirement (bugfix): normalize every population value to its
-    # clean string form HERE, once, immediately - before it's used for
-    # ANY file-naming or comparison downstream (quantile_conversion(),
-    # interaction(), plot() all receive POPULATION[j] straight from
-    # this tuple) - see _clean_population_label()'s own docstring for
-    # why this specific normalization (float 1.0 -> '1', not '1.0') is
-    # necessary, not just a defensive nicety.
-    POPULATION = ('all',) + tuple(_clean_population_label(p) for p in POPULATION)
-        
+    # Update ID circos-oom-fix: the 'between'-scenario 'train->test' -> 'test' label
+    # split for interactions/attention is no longer an in-place rewrite of a
+    # (potentially enormous) 'population' column - the table is reduced by
+    # `interaction_reduce.PairSumStore`, which applies this label map to its
+    # tiny population dictionary and merges colliding labels by summing
+    # sum/count before the mean (see `_precompute_interaction_groups()`).
+    # (This also stops mutating the caller's own frame.)
+    # ver4-75: every label (between: the test half of 'train->test'; within: the
+    # label itself) goes through _clean_population_label(), so '2.0'/2/2.0 all
+    # become '2' - the same form POPULATION and the effect table use below.
+    _between_population_map = (_between_test_population_label if SCENARIO == 'between'
+                               else _clean_population_label)
+    # Update ID ver4-25, R12: the SAME 'between'-scenario population-label
+    # split every other interaction/attention/effect table above already
+    # gets - `interactions_hok` needs it for the identical reason (its own
+    # 'population' column is otherwise still the combined train->test
+    # label, which would never match a gene/chromosome file written under
+    # the clean, split label).
+    # ver4-75 (bugfix - "model[0] ... out of index" for between-population
+    # circos plots): the effect / k>=3 tables' 'population' column and the
+    # POPULATION list must end up as the SAME clean string for the same
+    # population, whatever type it arrived as (int, float-promoted 2.0, the
+    # string '2.0' left over from a float-promoted 'train->test' label, or a
+    # plain name). They used to be normalised by DIFFERENT code on each side
+    # (`.str.split('->', expand=True).iloc[:, -1]` with no clean-up on the
+    # tables; `_clean_population_label()` on the list), so a population whose
+    # label was '2.0' on one side and '2' on the other matched no effect row,
+    # quantile_conversion() dropped every model for it, and plot() then
+    # crashed on `MODEL[0]`. One function now does it for both sides, and
+    # the caller's own frames are no longer mutated (shallow copy below).
+    _population_label_fn = _between_test_population_label if SCENARIO == 'between' else _clean_population_label
+    if interactions_hok.shape[0] != 0:
+        interactions_hok = interactions_hok.copy(deep=False)
+        interactions_hok['population'] = _remap_population_column(interactions_hok['population'], _population_label_fn)
+    if effect.shape[0] != 0:
+        effect = effect.copy(deep=False)
+        effect['population'] = _remap_population_column(effect['population'], _population_label_fn)
+
+    # POPULATION (this function's own parameter, used for every file name /
+    # comparison in quantile_conversion()/interaction()/plot() below, and by
+    # the broadcast step in the callers before this function is called) gets
+    # the identical treatment: for SCENARIO='between' a combined 'Historical->2014'
+    # label is reduced to its test half '2014' (see the long-standing note
+    # on the gene ring silently missing for this scenario), and every value
+    # is cleaned to its canonical string form. Several combined labels
+    # ('A->2014', 'B->2014') reduce to the same test population, so
+    # duplicates are dropped (order kept) - a duplicate would otherwise
+    # render, and in parallel mode WRITE, the same files twice.
+    POPULATION = list(dict.fromkeys(_population_label_fn(p) for p in POPULATION))
+
+    # Sequential mode hands in GP()'s raw population list (every population
+    # named in the phenotype file), which can name a population that is never
+    # a test population in this run (e.g. every 'X->that' combination
+    # excluded) - no effect rows exist for it, so there is nothing to draw.
+    # Say so and skip it instead of crashing on an empty model list later.
+    if effect.shape[0] != 0:
+        _populations_with_effect = set(pd.unique(effect['population']))
+        _skipped_populations = [p for p in POPULATION if p not in _populations_with_effect]
+        if _skipped_populations:
+            print(f"[circos_plot] WARNING: no marker-effect rows for population(s) {_skipped_populations} "
+                  f"(populations present in the effect table: {sorted(_populations_with_effect)[:20]}); "
+                  f"no circos plot is generated for them.")
+            POPULATION = [p for p in POPULATION if p in _populations_with_effect]
+
+    POPULATION = ('all',) + tuple(POPULATION)
+
     MODEL = pd.unique(effect['model'])
+
+    # ver4-31 R13: the consensus ring's colour keys (consensus0..N) must be in
+    # the colour map that plot() AND the session legend read.
+    if _consensus_options(circos_config)['on']:
+        CYTOBAND_COLORMAP = _cytoband_cmap_with_consensus(CYTOBAND_COLORMAP, len(MODEL))
 
     # ver4-4 R7.f - compute the abs()'d, grouped-and-averaged marker-effect
     # frames used by quantile_conversion() exactly ONCE here, rather than
@@ -2475,10 +4537,25 @@ def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULA
     # attention data reaches this function (Sequential, in-process GUI
     # "Option B: run now", and Parallel Step 2 assemble), since all three
     # converge on this same shared `circos_plot()` call.
+    # Update ID circos-oom-fix: also performs the top-N%/top-M selection per key
+    # (circos_config=...), so `_interaction_groups`/`_attention_groups` hold
+    # only the rows that will be drawn - small enough to hand to every worker
+    # process of the fan-out below without multiplying memory.
     _interaction_groups, _interaction_model_order = _precompute_interaction_groups(
-        interactions, scope_model_order_by_population=True)
+        interactions, scope_model_order_by_population=True,
+        circos_config=circos_config, population_map=_between_population_map, restrict=_restrict_store)
     _attention_groups, _attention_model_order = _precompute_interaction_groups(
-        attention, scope_model_order_by_population=False)
+        attention, scope_model_order_by_population=False,
+        circos_config=circos_config, population_map=_between_population_map, restrict=_restrict_store)
+    # Update ID ver4-25, R12: the k>=3 analog of the two precomputes
+    # above - see `_precompute_higher_order_groups()`'s own docstring.
+    # `{}, {}` whenever `interactions_hok` is empty (every run this
+    # feature is not selected for), which makes `higher_order_
+    # interaction()` below return its own empty, correctly-columned frame
+    # for every (PHENOTYPE, POPULATION) call - i.e. AC12.3 holds all the
+    # way through this precompute too.
+    _higher_order_groups, _higher_order_model_order = _precompute_higher_order_groups(
+        interactions_hok, scope_model_order_by_population=True)
 
     # ver4-5 (single session-wide legend, replaces one '<...>_legend.png'
     # per circos plot image): one shared accumulator, created here and
@@ -2499,7 +4576,7 @@ def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULA
     # see `_resolve_circos_plot_workers()`'s own docstring. Only a
     # request for 2+ workers from a non-daemonic process takes the
     # parallel branch.
-    _effective_workers = _resolve_circos_plot_workers(n_workers)
+    _effective_workers = _resolve_circos_plot_workers(n_workers, n_jobs)
 
     if _effective_workers <= 1:
         for i in range(len(PHENOTYPE)):
@@ -2520,9 +4597,18 @@ def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULA
                 # return in a per-iteration local (`model_for_plot`) instead -
                 # quantile_conversion()'s own contract/return shape is
                 # unchanged.
-                model_for_plot = quantile_conversion(_effect_grouped_all, _effect_grouped_pop, marker_info, chrom_info, PHENOTYPE[i], MODEL, end_adjust, POPULATION[j], WINDOW, RESULT_NAME, ASCENDING)
+                model_for_plot = quantile_conversion(_effect_grouped_all, _effect_grouped_pop, marker_info, chrom_info, PHENOTYPE[i], MODEL, end_adjust, POPULATION[j], WINDOW, RESULT_NAME, ASCENDING,
+                                                    ensemble_hue_rule=_ensemble_hue_rule(circos_config),
+                                                    label_cfg=circos_config)
+                if len(model_for_plot) == 0:
+                    # ver4-75: nothing to draw for this (phenotype, population) - see
+                    # _warn_no_model_data(); plot() would otherwise die on MODEL[0].
+                    _warn_no_model_data(PHENOTYPE[i], POPULATION[j])
+                    continue
                 interaction_selected = interaction(_interaction_groups, _interaction_model_order, marker_info, PHENOTYPE[i], circos_config, POPULATION[j], RESULT_NAME, _attention_groups, _attention_model_order)
-                plot(interaction_selected, chrom_info, gene_info, pop_source, PHENOTYPE[i], model_for_plot, circos_config, CYTOBAND_COLORMAP, POPULATION[j],RESULT_NAME, plot_dpi=plot_dpi, legend_accumulator=_legend_accumulator)
+                higher_order_selected = higher_order_interaction(_higher_order_groups, _higher_order_model_order, marker_info, PHENOTYPE[i], circos_config, POPULATION[j], RESULT_NAME, interaction_orders)
+                plot(interaction_selected, chrom_info, gene_info, pop_source, PHENOTYPE[i], model_for_plot, circos_config, CYTOBAND_COLORMAP, POPULATION[j],RESULT_NAME, plot_dpi=plot_dpi, legend_accumulator=_legend_accumulator,
+                     higher_order_ring_frame=higher_order_selected, interaction_orders=interaction_orders, higher_order_layout=higher_order_layout)
     else:
         # Every (phenotype, population) pair reads the SAME read-only
         # inputs (only the SELECTION of which phenotype/population varies
@@ -2535,8 +4621,9 @@ def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULA
         # docstring for why that return-and-merge shape, rather than a
         # "shared" mutable accumulator, is what a process pool requires).
         print(f"[circos_plot] Rendering {len(PHENOTYPE) * len(POPULATION)} "
-              f"(phenotype, population) circos plots across {_effective_workers} "
-              f"worker processes.")
+              f"(phenotype, population) circos plot set(s), split per model, across "
+              f"{_effective_workers} worker processes "
+              f"(n_workers={n_workers!r}, n_jobs={n_jobs!r}).")
         _ctx = {
             'effect_grouped_all': _effect_grouped_all, 'effect_grouped_pop': _effect_grouped_pop,
             'marker_info': marker_info, 'chrom_info': chrom_info, 'gene_info': gene_info,
@@ -2545,38 +4632,79 @@ def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULA
             'interaction_model_order': _interaction_model_order, 'circos_config': circos_config,
             'attention_groups': _attention_groups, 'attention_model_order': _attention_model_order,
             'pop_source': pop_source, 'CYTOBAND_COLORMAP': CYTOBAND_COLORMAP, 'plot_dpi': plot_dpi,
+            # Update ID ver4-25, R12: the k>=3 analog of 'interaction_groups'/
+            # 'interaction_model_order' above, plus the two small config
+            # values `_render_one_circos_plot()` needs to call
+            # `higher_order_interaction()`/`plot()` the same way the serial
+            # loop above does.
+            'higher_order_groups': _higher_order_groups, 'higher_order_model_order': _higher_order_model_order,
+            'interaction_orders': interaction_orders, 'higher_order_layout': higher_order_layout,
         }
+        _n_units = len(PHENOTYPE) * len(POPULATION)
+        # How many model-slices to cut each unit into so that, in total,
+        # there are at least as many render tasks as workers. With many
+        # units (>= workers) one slice per unit is right - the per-slice
+        # setup cost (building the ring tracks) is paid once per unit.
+        _slices_per_unit = max(1, -(-_effective_workers // max(1, _n_units)))
         with ProcessPoolExecutor(
             max_workers=_effective_workers, mp_context=_MP_CONTEXT,
             initializer=_init_circos_plot_worker, initargs=(_ctx,),
         ) as _executor:
-            _futures = {
-                _executor.submit(_render_one_circos_plot, PHENOTYPE[i], POPULATION[j]): (PHENOTYPE[i], POPULATION[j])
-                for i in range(len(PHENOTYPE)) for j in range(len(POPULATION))
-            }
-            # as_completed(), not map(): a plot's rendering time can vary
-            # widely by how many markers/links it draws, so this drains
-            # whichever task finishes first rather than waiting on
-            # submission order - and still re-raises the FIRST exception
-            # any task hit (via .result()) exactly like the serial loop's
-            # own fail-fast behaviour would, identifying which (phenotype,
-            # population) pair it came from in the process.
-            for _future in as_completed(_futures):
-                _phenotype_value, _population_value = _futures[_future]
-                try:
-                    _local_legend_accumulator = _future.result()
-                except Exception:
-                    print(f"[circos_plot] FAILED while rendering phenotype={_phenotype_value!r} "
-                          f"population={_population_value!r} (see traceback below).")
-                    raise
-                _merge_into_legend_accumulator(
-                    _legend_accumulator,
-                    colours_used_by_hue=_local_legend_accumulator['colours_used_by_hue'],
-                    gene_colours_used=_local_legend_accumulator['gene_colours_used'],
-                    has_inter_chr_link=_local_legend_accumulator['has_inter_chr_link'],
-                    has_intra_chr_link=_local_legend_accumulator['has_intra_chr_link'],
-                    truncated_labels=_local_legend_accumulator['truncated_labels'],
-                )
+            # Two-stage pipeline. Stage 1 (per unit): write the marker-effect
+            # tsv files and resolve the link tables. Stage 2 (per unit, per
+            # slice of its models): render and save the figures. Stage-2 tasks
+            # are submitted the moment their unit's stage 1 finishes, so
+            # rendering starts while later units are still being prepared.
+            _pending = {}
+            for i in range(len(PHENOTYPE)):
+                for j in range(len(POPULATION)):
+                    _fut = _executor.submit(_prepare_one_circos_unit, PHENOTYPE[i], POPULATION[j])
+                    _pending[_fut] = ('prepare', PHENOTYPE[i], POPULATION[j])
+            try:
+                while _pending:
+                    _done, _ = wait(list(_pending), return_when=FIRST_COMPLETED)
+                    for _future in _done:
+                        _stage, _phenotype_value, _population_value = _pending.pop(_future)
+                        try:
+                            _result = _future.result()
+                        except Exception:
+                            print(f"[circos_plot] FAILED while {'preparing' if _stage == 'prepare' else 'rendering'} "
+                                  f"phenotype={_phenotype_value!r} population={_population_value!r} "
+                                  f"(see traceback below).")
+                            raise
+                        if _stage == 'prepare':
+                            _model_for_plot, _interaction_selected, _higher_order_selected = _result
+                            if len(_model_for_plot) == 0:
+                                _warn_no_model_data(_phenotype_value, _population_value)
+                                continue
+                            _models = _circos_models_to_render(_interaction_selected, _higher_order_selected)
+                            _k = max(1, min(_slices_per_unit, len(_models)))
+                            for _s in range(_k):
+                                _slice = _models[_s::_k]
+                                _rf = _executor.submit(
+                                    _render_one_circos_chunk, _phenotype_value, _population_value,
+                                    _model_for_plot, _interaction_selected, _higher_order_selected, _slice)
+                                _pending[_rf] = ('render', _phenotype_value, _population_value)
+                        else:
+                            _merge_into_legend_accumulator(
+                                _legend_accumulator,
+                                colours_used_by_hue=_result['colours_used_by_hue'],
+                                gene_colours_used=_result['gene_colours_used'],
+                                has_inter_chr_link=_result['has_inter_chr_link'],
+                                has_intra_chr_link=_result['has_intra_chr_link'],
+                                truncated_labels=_result['truncated_labels'],
+                                has_hub_glyph=_result['has_hub_glyph'],
+                                combined_orders_used=_result['combined_orders_used'],
+                                highlight_regions=_result.get('highlight_regions'),
+                                highlight_intra=_result.get('highlight_intra'),
+                                highlight_inter=_result.get('highlight_inter'),
+                                highlight_dimmed=_result.get('highlight_dimmed'),
+                            )
+            except BaseException:
+                # Fail fast like the serial loop: don't sit through every
+                # still-queued render before surfacing the error.
+                _executor.shutdown(wait=False, cancel_futures=True)
+                raise
 
     # ver4-5 (single session-wide legend): build and save the ONE
     # combined legend now that every plot() call above has finished
@@ -2591,7 +4719,14 @@ def circos_plot(effect, interactions, marker_info, chrom_info, gene_info, POPULA
         _legend_accumulator['colours_used_by_hue'], CYTOBAND_COLORMAP, _legend_accumulator['gene_colours_used'],
         _legend_accumulator['has_inter_chr_link'], _legend_accumulator['has_intra_chr_link'],
         truncated_labels=_legend_accumulator['truncated_labels'],
+        has_hub_glyph=_legend_accumulator['has_hub_glyph'],
+        combined_orders_used=_legend_accumulator['combined_orders_used'],
+        link_colour_mode=_link_options(circos_config)['colour_mode'],
+        highlight_regions=_legend_accumulator['highlight_regions'],
+        highlight_intra=_legend_accumulator['highlight_intra'],
+        highlight_inter=_legend_accumulator['highlight_inter'],
+        highlight_dimmed=_legend_accumulator['highlight_dimmed'],
     )
     _save_circos_legend(_legend_handles, _legend_handler_map,
                          './Result/'+RESULT_NAME+'/circos_legend.png',
-                         dpi=plot_dpi)
+                         dpi=plot_dpi, extra_formats=_ps.extra_formats_of(circos_config))

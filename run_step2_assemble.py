@@ -30,6 +30,7 @@ Workflow
 import argparse
 import json
 import os
+import plot_style as _plot_style   # ver4-31 R15
 import sys
 import time
 
@@ -37,7 +38,7 @@ import pandas as pd
 
 from pipeline_utils import (
     configure_r_environment, init_rpy2_conversion, TimestampedWriter, make_run_log_path,
-    result_dir_path, apply_scratch_tmp_dir,
+    result_dir_path, apply_scratch_tmp_dir, iterative_labels, super_learner_labels,   # ver4-77
 )
 
 
@@ -57,6 +58,10 @@ def main():
 
     with open(args.config, 'r', encoding='utf-8-sig') as f:
         cfg = json.load(f)
+
+    # ver4-54 (R6): a Tool config belongs to run_tool.py - refuse it here, before any run.
+    if cfg.get('RUN_KIND') == 'tool':
+        sys.exit("This is a Tool config - run it with run_tool.py")
 
     # Wrap stdout so every line this process prints gets a timestamp prefix
     # automatically, AND save it to Result/<RESULT_NAME>/logs/ - the same
@@ -80,6 +85,8 @@ def main():
     from assemble import load_for_step2
     from metric_summary import write_metric_summary
     from metric_plot import metric_plot
+    from accuracy_metrics_plot import (accuracy_metrics_plot, any_plot_requested as any_accuracy_plot_requested,
+                                       plot_enabled as accuracy_plot_enabled)
     from scatter_plot import scatter_plot
     from circos_plot import circos_plot, _broadcast_population_info, _clean_population_label
     from attention_histogram import attention_distribution
@@ -146,6 +153,17 @@ def main():
             'warning above for which batch(es) to re-run, then re-run Step 2.'
         )
 
+    # Requirements.md item 3 (multi-option update): a run whose result files
+    # carry the leading option column (two or more of BLUEs / BLUPs without
+    # GRM / BLUPs with GRM) is reported once per option (each into its own
+    # sub-folder) plus the cross-option plots - see reporting_pipeline.py.
+    # A single-option run never has the column and takes the unchanged
+    # chain below.
+    if getattr(result, 'options', None):
+        from reporting_pipeline import run_multi_option_reports
+        run_multi_option_reports(cfg, result, log=lambda m: print(f'[run_step2_assemble] {m}'))
+        return
+
     # Update ID 3, R3: the Metric_summary.xlsx workbook (or its CSV
     # degrade), written immediately once the results are available and
     # before the first plot - same position in every one of R3's four call
@@ -175,11 +193,14 @@ def main():
         model_labels = pd.unique(result.metric['model']).tolist()
     else:
         model_labels = result.models + cfg['W_OPT'] if cfg['W_OPT'] is not None else result.models
+        model_labels = list(model_labels) + iterative_labels(cfg)   # ver4-57
+        model_labels = list(model_labels) + super_learner_labels(cfg)   # ver4-77
 
     _t0 = time.time()
     _summary_paths = write_metric_summary(
         result.metric, cfg['RESULT_NAME'], create=cfg.get('METRIC_SUMMARY_CREATE', True),
-        model_order=model_labels,
+        model_order=model_labels, asreml_varcomp=result.asreml_varcomp(),
+        label_style=cfg.get('MODEL_LABEL_STYLE', 'full'),
     )
     if _summary_paths:
         print(f"[run_step2_assemble] Metric summary written: {', '.join(_summary_paths)} "
@@ -191,7 +212,30 @@ def main():
     # (source='combined' or 'batches', whichever load_for_step2() chose)
     # rather than re-reading anything from a hardcoded path.
     _t0 = time.time()
-    _dpt_terms = build_dpt_terms(result.prediction('test'), result.weight(), result.metric)
+    # ver4-25, R8 (design blueprint SS2, Stage 6): see run_sequential.py's
+    # identical block for the full rationale - `result.asreml_accuracy_
+    # ctx()` reads the SAME sidecar regardless of `source` ('combined' or
+    # 'batches'), so this works identically whichever load_for_step2()
+    # chose.
+    # ver4-25, R8 (design blueprint SS2, Stage 6; Stage 6 completion for
+    # 'full' mode): see run_sequential.py's identical block for the full
+    # rationale - `result.asreml_accuracy_ctx()`/`asreml_test_weights()`
+    # read the SAME sidecars regardless of `source` ('combined' or
+    # 'batches'), so this works identically whichever load_for_step2()
+    # chose.
+    _asreml_accuracy_ctx_for_dpt = result.asreml_accuracy_ctx()
+    _asreml_test_weights_for_dpt = result.asreml_test_weights()
+    _dpt_weight_resolver = None
+    if ((_asreml_accuracy_ctx_for_dpt is not None and _asreml_accuracy_ctx_for_dpt.shape[0] != 0)
+            or (_asreml_test_weights_for_dpt is not None and _asreml_test_weights_for_dpt.shape[0] != 0)):
+        import asreml_accuracy_metrics as _aam
+        _dpt_weight_resolver = _aam.ctx_resolver_from_frame(
+            _asreml_accuracy_ctx_for_dpt, _asreml_test_weights_for_dpt)
+
+    _dpt_terms = build_dpt_terms(
+        result.prediction('test'), result.weight(), result.metric,
+        sample_weight_resolver=_dpt_weight_resolver,
+    )
     _dpt_paths = write_dpt_summary(
         _dpt_terms, cfg['RESULT_NAME'], create=cfg.get('DPT_SUMMARY_CREATE', True),
         # Requirements.md item 1: ensemble labels only - see
@@ -200,10 +244,16 @@ def main():
         # plots) would otherwise reintroduce a permanently-blank column
         # per single-prediction model.
         model_order=dpt_model_order(model_labels),
+        label_style=cfg.get('MODEL_LABEL_STYLE', 'full'),
     )
     if _dpt_paths:
         print(f"[run_step2_assemble] Diversity Prediction Theorem summary written: "
               f"{', '.join(_dpt_paths)} (took {time.time() - _t0:.1f}s).")
+
+    # ver4-99 (R2) / ver4-103 (X03): marker / pair stability across iterations. Off unless
+    # STABILITY_SUMMARY_CREATE is true; never fatal (the call logs and returns on any failure).
+    from stability_summary import run_stability_report as _run_stability_report
+    _run_stability_report(cfg, cfg['RESULT_NAME'], lambda: result.effect(), print)
 
     # Requirement 6: once every batch's prediction scenarios have been
     # assembled, average every per-scenario LD decay CSV (written by each
@@ -232,8 +282,24 @@ def main():
 
     if cfg.get('METRIC_PLOT_CREATE', True):
         _t0 = time.time()
-        metric_plot(result.metric.copy(), model_labels, cfg['RESULT_NAME'], cfg['SCENARIO'], cfg.get('METRIC_PLOT_CONFIG'), PLOT_DPI=_metric_plot_dpi)
+        metric_plot(result.metric.copy(), model_labels, cfg['RESULT_NAME'], cfg['SCENARIO'], _plot_style.with_extra_formats(cfg.get('METRIC_PLOT_CONFIG'), cfg), PLOT_DPI=_metric_plot_dpi)
         print(f'[run_step2_assemble] Metric plots generated (took {time.time() - _t0:.1f}s).')
+
+    # Requirements.md (BLUEs/BLUPs accuracy-metrics phase), item 8/9 -
+    # see run_sequential.py's own identical block; Parallel Step 2 shares
+    # the same call, reading from the assembled `result.metric` frame
+    # rather than GP()'s own in-process return value.
+    if any_accuracy_plot_requested(cfg):
+        _t0 = time.time()
+        accuracy_metrics_plot(result.metric.copy(), model_labels, cfg['RESULT_NAME'], cfg['SCENARIO'],
+                               cfg.get('ACCURACY_METRICS_PLOT_CONFIG'),
+                               ACCURACY_BUBBLE_PLOT_CREATE=cfg.get('ACCURACY_BUBBLE_PLOT_CREATE', False),
+                               prediction_test=result.prediction('test'), cfg=cfg,
+                               # Marker effects feed the Czekanowski matrix's lower triangle; only
+                               # loaded when that plot is actually requested.
+                               effect=(result.effect(float32=_plot_effect_float32)
+                                       if accuracy_plot_enabled(cfg, 'czekanowski') else None))
+        print(f'[run_step2_assemble] Accuracy-metric plots generated (took {time.time() - _t0:.1f}s).')
 
     # Update ID ver4-9, R6: see run_sequential.py's own identical block for
     # the default-False rationale (I11) and naive_models resolution.
@@ -244,7 +310,7 @@ def main():
         _naive_for_plot = next((info['models'] for info in _members_for_plot.values() if info['is_naive']), None)
         _weight_plot_paths = weight_plot(
             _weight_for_plot, model_labels, cfg['RESULT_NAME'], cfg['SCENARIO'],
-            cfg.get('WEIGHT_PLOT_CONFIG'), PLOT_DPI=cfg.get('WEIGHT_PLOT_DPI', 300),
+            _plot_style.with_extra_formats(cfg.get('WEIGHT_PLOT_CONFIG'), cfg), PLOT_DPI=cfg.get('WEIGHT_PLOT_DPI', 300),
             naive_models=_naive_for_plot,
         )
         if _weight_plot_paths:
@@ -258,11 +324,16 @@ def main():
         # behaviour (exact-name matching only, or no QTL highlighting at
         # all if QTL is unset).
         scatter_plot(result.models, result.phenotype, result.prediction('test'), result.effect(float32=_plot_effect_float32),
-                     cfg['QTL'], cfg['SCATTER_CONFIG'], cfg['RESULT_NAME'],
+                     cfg['QTL'], _plot_style.with_extra_formats(cfg['SCATTER_CONFIG'], cfg), cfg['RESULT_NAME'],
                      MARKER_INFO=cfg.get('MARKER_INFO'),
                      QTL_WINDOW=cfg.get('QTL_WINDOW', 0.0),
                      QTL_WINDOW_MODE=cfg.get('QTL_WINDOW_MODE', 'all_in_window'),
-                     PLOT_DPI=_scatter_plot_dpi)
+                     PLOT_DPI=_scatter_plot_dpi,
+                     # Requirements.md item 4: see run_sequential.py's identical note.
+                     COLOR_BY_POPULATION=cfg.get('SCATTER_COLOR_BY_POPULATION', False),
+                     # Requirements.md item 5 (this session): see
+                     # run_sequential.py's identical note.
+                     NORMALIZE_MARKER_EFFECT=cfg.get('SCATTER_NORMALIZE_MARKER_EFFECT', True))
         print(f'[run_step2_assemble] Scatter plot matrix generated (took {time.time() - _t0:.1f}s).')
         # Update ID 3, R1: the test-prediction frame isn't needed again;
         # `effect` IS (circos_plot below), so it's kept resident.
@@ -317,15 +388,28 @@ def main():
         # raw result.attention() - it genuinely needs the individual
         # values for its histogram, unlike this call.
         circos_plot(result.effect(float32=_plot_effect_float32), result.interactions_grouped(), cfg['MARKER_INFO'], _chrom_info_path,
-                    _gene_info_path, result.population, result.phenotype, cfg['CIRCOS_CONFIG'],
+                    _gene_info_path, result.population, result.phenotype, _plot_style.with_extra_formats(cfg['CIRCOS_CONFIG'], cfg),
                     cfg['END_ADJUST'], cfg['WINDOW'], cfg['CYTOBAND_COLORMAP'],
                     cfg['RESULT_NAME'], result.attention_grouped(), cfg['SCENARIO'], cfg['ASCENDING'],
                     gene_adjust=cfg.get('GENE_ADJUST', 0), plot_dpi=_circos_plot_dpi,
+                    # Update ID ver4-25, R12: same OOM rationale as
+                    # `interactions_grouped()`/`attention_grouped()` above -
+                    # `interactions_hok_grouped()` is `ResultSet`'s own
+                    # bounded-memory, already-reduced k>=3 equivalent.
+                    # Absent from every config that predates this feature,
+                    # so `.get(..., (2,))`/`.get(..., 'per_order')`
+                    # reproduce today's k=2-only, unconditional render
+                    # exactly (I11/AC12.3).
+                    interactions_hok=result.interactions_hok_grouped(),
+                    interaction_orders=cfg.get('CIRCOS_INTERACTION_ORDERS', (2,)),
+                    higher_order_layout=cfg.get('CIRCOS_HIGHER_ORDER_LAYOUT', 'per_order'),
                     # Performance (multi-CPU circos-plot rendering): see
                     # run_sequential.py's own identical call for the
                     # rationale - same config key, same fully-serial
                     # default for every config that predates it.
-                    n_workers=cfg.get('CIRCOS_PLOT_WORKERS', 1))
+                    n_workers=cfg.get('CIRCOS_PLOT_WORKERS'),
+                    # N_JOBS fix: see run_sequential.py's identical call.
+                    n_jobs=cfg.get('N_JOBS'))
         print(f'[run_step2_assemble] Circos plot generated (took {time.time() - _t0:.1f}s).')
         result.release()
     print('[run_step2_assemble] Pipeline completed successfully.')

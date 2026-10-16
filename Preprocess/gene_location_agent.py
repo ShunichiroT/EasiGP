@@ -35,6 +35,17 @@ Two backends
   (not a silent fallback) if unavailable, since backend='crewai' was an
   explicit choice.
 
+Token-lean pipeline (default for 'claude_code')
+-----------------------------------------------
+The agent is the LAST of four tiers (see Preprocess.gene_location_resolver):
+prefilter -> persistent cache -> local GFF/GTF -> Ensembl REST -> agent. Only
+the genes no free tier could answer reach Claude, in ONE lean session
+(`--tools WebSearch`, a one-paragraph system prompt, no skills/MCP/settings,
+no file tools, answer returned as TSV text rather than written with Write/Bash),
+and whatever locus IDs it returns are re-checked by code against the annotation
+so exact coordinates never rest on the model's memory. `lean=False` restores
+the previous session-per-batch behaviour unchanged.
+
 Both backends are validated identically after they run: the resulting CSV is
 loaded through the exact same `Preprocess.gene_network_prior._load_location_lookup`
 column-resolution logic that a human-authored table would go through, so a
@@ -45,11 +56,16 @@ downstream in `build_gene_list`.
 import json
 import os
 import re
+import subprocess
 import warnings
 
 import pandas as pd
 
 from Preprocess.gene_network_prior import _load_location_lookup, build_gene_list
+from Preprocess.gene_location_resolver import (
+    resolve_without_model, resolve_ids_authoritatively,
+    MAX_PLAUSIBLE_GENE_BP,
+)
 from Preprocess.flash_p_integration import (
     _run_claude_headless, _summarize_permission_denials, _summarize_auto_mode_unavailable,
     _summarize_rate_limit, _claude_binary_not_found_message,
@@ -198,7 +214,7 @@ def _gene_id_batches(candidate_gene_ids, batch_size):
         yield candidate_gene_ids[i:i + batch_size]
 
 
-def curate_gene_locations_claude_code(candidate_gene_ids, species, output_csv, unit='bp',
+def _curate_gene_locations_claude_code_legacy(candidate_gene_ids, species, output_csv, unit='bp',
                                         cwd=None, claude_binary='claude', model=None,
                                         permission_mode='dontAsk',
                                         # Glob/Grep added alongside Read/Write/WebSearch -
@@ -440,6 +456,316 @@ def curate_gene_locations_claude_code(candidate_gene_ids, species, output_csv, u
 
 
 # ---------------------------------------------------------------------------
+# Backend 1 (default): tiered, token-lean Claude Code
+# ---------------------------------------------------------------------------
+
+DEFAULT_LEAN_BATCH_SIZE = 25
+
+LEAN_SYSTEM_PROMPT = (
+    "You are a plant-genome curator. Follow the user's output format exactly and output nothing "
+    "else. Never invent a coordinate or locus ID: write NA when you cannot verify it."
+)
+
+# Flags that remove fixed per-session overhead (tool schemas, skill list, MCP servers,
+# settings/CLAUDE.md, the default coding-agent system prompt, session files). If the installed
+# Claude Code rejects one of them the call is retried once without them - see _run_lean.
+_LEAN_FLAGS = ('--disable-slash-commands', '--strict-mcp-config', '--setting-sources', '',
+               '--no-session-persistence', '--effort', 'low')
+
+_UNKNOWN_FLAG = re.compile(r"unknown option|unrecognized|unexpected argument|invalid option|"
+                           r"unknown argument", re.I)
+
+_LAST_REPORT = {}
+
+
+def get_last_curation_report():
+    """Per-tier counts, skipped reasons, notes and the agent token ledger of the most
+    recent curate_gene_locations() call (empty dict before the first call)."""
+    return dict(_LAST_REPORT)
+
+
+def _lean_prompt(genes, hints, species, unit, expected_assembly, allow_web_fetch):
+    build = f" Reference build: {expected_assembly}." if expected_assembly else ""
+    fetch = ("WebFetch one authoritative page only when a search snippet cannot settle a gene."
+             if allow_web_fetch else "Do not fetch pages; search snippets are enough.")
+    lines = [f"{g} [{hints[g]}]" if hints.get(g) else g for g in genes]
+    return (
+        f"Species: {species}.{build} Unit: {unit}.\n"
+        f"For each gene below give the systematic locus ID, and the chromosome, start and end ({unit}) "
+        f"of its single locus in the official reference annotation (e.g. TAIR/Araport11, MaizeGDB, "
+        f"RAP-DB, NCBI).\n"
+        f"Method: you may recall the locus ID from memory, but coordinates must come from a search "
+        f"result you saw in this session. Run at most one WebSearch per gene and put several searches "
+        f"in the same turn. {fetch}\n"
+        f"Write NA instead of values if the symbol is not one real single-locus gene of this species "
+        f"(pathway, hormone, complex, other species), is ambiguous, or you could not verify it.\n"
+        f"Reply with ONLY tab-separated lines, no header, no prose, no code fence:\n"
+        f"gene<TAB>locus_id<TAB>chromosome<TAB>start<TAB>end<TAB>source   (NA rows: gene<TAB>NA)\n"
+        f"A gene with several loci gets one line per locus. Genes ([full name] when known):\n"
+        + "\n".join(lines)
+    )
+
+
+def _parse_agent_tsv(text, expected_genes):
+    """TSV text -> (rows, unresolved). rows: gene -> [locus dict]. Tolerant of a stray code
+    fence, a header line or comma/multi-space separators; strict about the gene set (a gene
+    the agent was not asked about is ignored)."""
+    expected = {g.lower(): g for g in expected_genes}
+    rows, na = {}, set()
+    for raw in str(text or '').splitlines():
+        line = raw.strip().strip('`').strip()
+        if not line or line.lower().startswith(('gene\t', 'gene,')):
+            continue
+        parts = [c.strip() for c in (line.split('\t') if '\t' in line else re.split(r'\s{2,}|,', line))]
+        gene = expected.get(parts[0].lower().split(' [')[0].strip())
+        if gene is None:
+            continue
+        if len(parts) < 2 or parts[1].upper() in ('NA', 'N/A', ''):
+            na.add(gene)
+            continue
+        if len(parts) < 5:
+            na.add(gene)
+            continue
+        try:
+            start, end = float(parts[3].replace(',', '')), float(parts[4].replace(',', ''))
+        except ValueError:
+            na.add(gene)
+            continue
+        rows.setdefault(gene, []).append({
+            'locus_id': '' if parts[1].upper() == 'NA' else parts[1], 'chromosome': parts[2],
+            'start': start, 'end': end, 'source': (parts[5] if len(parts) > 5 else '') or 'agent'})
+    unresolved = [g for g in expected_genes if g not in rows]
+    return rows, unresolved
+
+
+def _accumulate_usage(ledger, stdout):
+    """Add one session's usage to `ledger`; returns how many web searches/fetches it ran
+    (None when the output could not be parsed)."""
+    try:
+        data = json.loads(stdout)
+    except (ValueError, TypeError):
+        return None
+    usage = data.get('usage') or {}
+    tool_use = usage.get('server_tool_use') or {}
+    searches = int(tool_use.get('web_search_requests') or 0) + int(tool_use.get('web_fetch_requests') or 0)
+    ledger['web_searches'] = ledger.get('web_searches', 0) + searches
+    for key in ('input_tokens', 'output_tokens', 'cache_creation_input_tokens', 'cache_read_input_tokens'):
+        ledger[key] = ledger.get(key, 0) + int(usage.get(key) or 0)
+    ledger['cost_usd'] = round(ledger.get('cost_usd', 0.0) + float(data.get('total_cost_usd') or 0.0), 4)
+    ledger['turns'] = ledger.get('turns', 0) + int(data.get('num_turns') or 0)
+    ledger['sessions'] = ledger.get('sessions', 0) + 1
+    return searches
+
+
+def _run_lean(prompt, cwd, claude_binary, permission_mode, model, timeout_seconds, extra_env,
+              log_callback, allow_web_fetch):
+    tools = ['WebSearch'] + (['WebFetch'] if allow_web_fetch else [])
+    lean_args = ['--tools', ','.join(tools), '--system-prompt', LEAN_SYSTEM_PROMPT, *_LEAN_FLAGS]
+    result = _run_claude_headless(
+        prompt, cwd=cwd, claude_binary=claude_binary, permission_mode=permission_mode,
+        allowed_tools=tuple(tools), model=model, timeout_seconds=timeout_seconds,
+        extra_env=extra_env, log_callback=log_callback, extra_args=lean_args)
+    if result.returncode != 0 and _UNKNOWN_FLAG.search((result.stderr or '') + (result.stdout or '')):
+        print("[gene_location_agent] This Claude Code version rejected a token-saving flag - "
+              "retrying once with only --tools/--system-prompt.")
+        result = _run_claude_headless(
+            prompt, cwd=cwd, claude_binary=claude_binary, permission_mode=permission_mode,
+            allowed_tools=tuple(tools), model=model, timeout_seconds=timeout_seconds,
+            extra_env=extra_env, log_callback=log_callback,
+            extra_args=['--tools', ','.join(tools), '--system-prompt', LEAN_SYSTEM_PROMPT])
+    return result
+
+
+def curate_gene_locations_claude_code(candidate_gene_ids, species, output_csv, unit='bp',
+                                      cwd=None, claude_binary='claude', model=None,
+                                      permission_mode='dontAsk', timeout_seconds=420, extra_env=None,
+                                      batch_size=DEFAULT_LEAN_BATCH_SIZE, allow_web_fetch=False,
+                                      log_callback=None, *, lean=True, candidate_hints=None,
+                                      annotation_path=None, use_ensembl=True, expected_assembly=None,
+                                      marker_info_path=None, use_cache=True, cache_path=None,
+                                      retry_unresolved=False, **legacy_kwargs):
+    """Tiered gene-location curation; returns (table, resolved_ids, unresolved_ids) exactly like
+    the previous implementation. See the module docstring for the tiers.
+
+    Parameters beyond the legacy ones
+    ---------------------------------
+    candidate_hints : {gene_id: full_name} from the network's nodes ('fn'/'full_name'); shown to
+        the agent in [brackets] to disambiguate short symbols, and used by the prefilter.
+    annotation_path : species GFF3/GTF(.gz) - the most reliable free source (same build as the
+        markers); only 'bp'.
+    use_ensembl, expected_assembly : free batched Ensembl REST tier; `expected_assembly` (e.g.
+        'B73_RefGen_v5', 'TAIR10') rejects hits from a different build.
+    marker_info_path : if given, coordinates on chromosomes absent from the marker file are
+        rejected by the free tiers and flagged for agent rows.
+    use_cache / cache_path : persistent table of earlier answers (default
+        '<dir of output_csv>/gene_location_cache.csv'). Genes the agent explicitly could not
+        verify are remembered too and skipped next time unless retry_unresolved=True.
+    batch_size : genes per agent session for the RESIDUAL genes only. Fewer, larger sessions are
+        cheaper (fixed per-session overhead); the default 25 covers most residuals in one call.
+    lean : False runs the previous session-per-batch implementation unchanged.
+    """
+    if not lean:
+        passthrough = {k: v for k, v in legacy_kwargs.items()}
+        return _curate_gene_locations_claude_code_legacy(
+            candidate_gene_ids, species, output_csv, unit=unit, cwd=cwd, claude_binary=claude_binary,
+            model=model, permission_mode=permission_mode, timeout_seconds=timeout_seconds,
+            extra_env=extra_env, batch_size=batch_size, allow_web_fetch=allow_web_fetch,
+            log_callback=log_callback, **passthrough)
+
+    output_csv = os.path.abspath(output_csv)
+    cwd = cwd or os.path.dirname(output_csv) or '.'
+    os.makedirs(cwd, exist_ok=True)
+    hints = dict(candidate_hints or {})
+    cache_path = (cache_path or os.path.join(os.path.dirname(output_csv) or '.', 'gene_location_cache.csv')
+                  ) if use_cache else None
+
+    free = resolve_without_model(
+        candidate_gene_ids, species, unit=unit, cache_path=cache_path, annotation_path=annotation_path,
+        use_ensembl=use_ensembl, expected_assembly=expected_assembly, marker_info_path=marker_info_path,
+        hints=hints, retry_unresolved=retry_unresolved)
+    resolved = dict(free['resolved'])
+    resolver_of = {g: 'free' for g in resolved}
+    cache, chromosomes = free['cache'], free['chromosomes']
+    residual = list(free['residual'])
+    report = {'tiers': dict(free['tiers']), 'skipped': dict(free['skipped']), 'notes': list(free['notes']),
+              'agent_usage': {}, 'agent_genes': len(residual), 'failed_batches': {}}
+    t = free['tiers']
+    print(f"[gene_location_agent] {len(candidate_gene_ids)} candidate(s): prefilter dropped {t['prefilter']}, "
+          f"cache {t['cache']} (+{t['cached_unresolved']} cached-unresolved), annotation {t['annotation']}, "
+          f"Ensembl {t['ensembl']}; {len(residual)} left for the agent.")
+    for note in free['notes'][:10]:
+        print(f"[gene_location_agent]   note: {note}")
+
+    agent_na = set()
+    searched_session = {}   # gene -> web searches its session ran (0 = answered from memory)
+    if residual:
+        eff_mode = 'dontAsk' if permission_mode == 'auto' else permission_mode
+        if eff_mode != permission_mode:
+            print("[gene_location_agent] Lean lookups expose only the read-only WebSearch tool, so "
+                  "'auto' is run as 'dontAsk' (no per-action classifier calls).")
+        batches = list(_gene_id_batches(residual, max(1, int(batch_size))))
+        for idx, batch in enumerate(batches, start=1):
+            prompt = _lean_prompt(batch, hints, species, unit, expected_assembly, allow_web_fetch)
+            print(f"[gene_location_agent] Agent session {idx}/{len(batches)}: {len(batch)} gene(s) (lean).")
+            try:
+                result = _run_lean(prompt, cwd, claude_binary, eff_mode, model, timeout_seconds,
+                                   extra_env, log_callback, allow_web_fetch)
+            except FileNotFoundError as e:
+                raise RuntimeError(_claude_binary_not_found_message(claude_binary, e)) from e
+            except subprocess.TimeoutExpired:
+                report['failed_batches'][idx] = (batch, 'timeout')
+                warnings.warn(f"[gene_location_agent] Agent session {idx}/{len(batches)} timed out; its "
+                              f"{len(batch)} gene(s) stay unresolved (other results are kept).")
+                continue
+            n_searches = _accumulate_usage(report['agent_usage'], result.stdout)
+            if result.returncode != 0:
+                rate_note = _summarize_rate_limit(result.stdout)
+                notes = [n for n in (rate_note, _summarize_permission_denials(result.stdout),
+                                     _summarize_auto_mode_unavailable(result.stdout)) if n]
+                report['failed_batches'][idx] = (batch, f"exit {result.returncode}: " + " | ".join(notes))
+                warnings.warn(f"[gene_location_agent] Agent session {idx}/{len(batches)} failed "
+                              f"(exit {result.returncode}) {' | '.join(notes)}")
+                if rate_note:  # account-wide ceiling: further sessions would burn tokens for nothing
+                    for j, later in enumerate(batches[idx:], start=idx + 1):
+                        report['failed_batches'][j] = (later, 'not attempted (rate/session limit)')
+                    break
+                continue
+            try:
+                text = json.loads(result.stdout).get('result')
+            except (ValueError, TypeError, AttributeError):
+                text = result.stdout
+            got, unresolved_here = _parse_agent_tsv(text, batch)
+            for g, loci in got.items():
+                resolved[g] = loci
+                resolver_of[g] = 'agent'
+                searched_session[g] = n_searches
+            agent_na.update(unresolved_here)
+
+        # verify what the agent returned: exact coordinates by locus ID from code, not from memory
+        agent_ids = {l['locus_id'] for g in resolved if resolver_of.get(g) == 'agent'
+                     for l in resolved[g] if l.get('locus_id')}
+        authoritative = resolve_ids_authoritatively(
+            agent_ids, species, annotation_path=annotation_path if unit == 'bp' else None,
+            use_ensembl=use_ensembl and unit == 'bp', chromosomes=chromosomes,
+            expected_assembly=expected_assembly) if agent_ids and unit == 'bp' else {}
+        for g in [g for g in resolved if resolver_of.get(g) == 'agent']:
+            fixed = []
+            for l in resolved[g]:
+                auth = authoritative.get(l.get('locus_id'))
+                if auth:
+                    if abs(auth['start'] - l['start']) > 1000 or abs(auth['end'] - l['end']) > 1000:
+                        report['notes'].append(f"{g}: agent coordinates corrected from "
+                                               f"{l['chromosome']}:{int(l['start'])}-{int(l['end'])} to the "
+                                               f"authoritative {auth['chromosome']}:{auth['start']}-{auth['end']} "
+                                               f"for {l['locus_id']}")
+                    l = dict(auth, source=auth['source'] + ' (ID from agent)')
+                    resolver_of[g] = 'agent+verified'
+                elif searched_session.get(g) == 0:
+                    # nothing in code or in a search backs these coordinates: say so in the table
+                    l = dict(l, source=(l.get('source') or 'agent') + ' [UNVERIFIED: answered from model memory, no search run]')
+                    report['notes'].append(f"{g}: agent answered from memory without a web search and no "
+                                           f"annotation/Ensembl check was possible - treat as unverified")
+                if l['end'] < l['start']:
+                    report['notes'].append(f"{g}: agent row end < start - dropped")
+                    continue
+                if l['end'] - l['start'] > MAX_PLAUSIBLE_GENE_BP:
+                    report['notes'].append(f"{g}: agent locus is {int(l['end'] - l['start'])} bp long - "
+                                           f"check it is a gene, not a region")
+                if chromosomes is not None and re.sub(r'(?i)^chr', '', str(l['chromosome'])) not in chromosomes:
+                    report['notes'].append(f"{g}: chromosome '{l['chromosome']}' is not in the marker file "
+                                           f"(check naming/build) - kept, but it will map to no SNP")
+                fixed.append(l)
+            if fixed:
+                resolved[g] = fixed
+            else:
+                resolved.pop(g)
+                agent_na.add(g)
+        # remember agent answers; only explicit NA is cached as unresolved (failed sessions are not)
+        if cache is not None:
+            for g in [g for g in resolved if resolver_of.get(g, '').startswith('agent')]:
+                cache.put(species, unit, g, 'resolved', resolved[g], resolver_of[g])
+            failed = {x for b, _ in report['failed_batches'].values() for x in b}
+            for g in agent_na - failed:
+                cache.put(species, unit, g, 'unresolved', [], 'agent')
+    if cache is not None:
+        cache.save()
+
+    columns = CANONICAL_COLUMNS[unit]
+    out_rows = []
+    for g in candidate_gene_ids:
+        for l in resolved.get(g, []):
+            out_rows.append({columns[0]: g, columns[1]: l['start'], columns[2]: l['end'],
+                             columns[3]: l['chromosome'], columns[4]: l.get('locus_id', ''),
+                             columns[5]: l.get('source', ''), 'Resolver': resolver_of.get(g, 'free')})
+    if not out_rows:
+        raise RuntimeError(
+            f"No gene location could be resolved for any of the {len(candidate_gene_ids)} candidate gene(s). "
+            f"Per-tier counts: {free['tiers']}; failed agent sessions: {report['failed_batches']}.")
+    os.makedirs(os.path.dirname(output_csv) or '.', exist_ok=True)
+    pd.DataFrame(out_rows, columns=columns + ['Resolver']).to_csv(output_csv, index=False)
+
+    usage = report['agent_usage']
+    if usage:
+        print(f"[gene_location_agent] Agent token ledger: {usage.get('sessions', 0)} session(s), "
+              f"{usage.get('turns', 0)} turn(s), input {usage.get('input_tokens', 0)} + cache-write "
+              f"{usage.get('cache_creation_input_tokens', 0)} + cache-read {usage.get('cache_read_input_tokens', 0)}, "
+              f"output {usage.get('output_tokens', 0)}, cost ${usage.get('cost_usd', 0):.4f}.")
+    else:
+        print("[gene_location_agent] No agent tokens used.")
+    if report['failed_batches']:
+        lost = sorted({x for b, _ in report['failed_batches'].values() for x in b})
+        print(f"[gene_location_agent] Agent sessions failed for: {lost}. Re-run with just these "
+              f"genes (cache keeps every other answer).")
+
+    table, resolved_ids, unresolved_ids = _validate_curated_csv(output_csv, candidate_gene_ids, unit)
+    report['resolved'] = resolved_ids
+    report['unresolved'] = unresolved_ids
+    _LAST_REPORT.clear()
+    _LAST_REPORT.update(report)
+    return table, resolved_ids, unresolved_ids
+
+
+# ---------------------------------------------------------------------------
 # Backend 2: CrewAI (optional)
 # ---------------------------------------------------------------------------
 
@@ -568,6 +894,13 @@ def curate_gene_locations(candidate_gene_ids, species, output_csv, backend='clau
         raise ValueError(f"backend must be 'claude_code' or 'crewai', got {backend!r}")
 
 
+def node_hints(candidate_genes):
+    """{gene_id: full name} from the network's node dicts ('fn' compact schema, 'full_name'
+    verbose schema) - the disambiguation hint the lean prompt shows in [brackets]."""
+    return {g['id']: (g.get('fn') or g.get('full_name'))
+            for g in candidate_genes if g.get('fn') or g.get('full_name')}
+
+
 def curate_and_build_gene_list(candidate_genes, species, output_csv, unit='bp',
                                  backend='claude_code', **kwargs):
     """Convenience wrapper chaining curation straight into
@@ -579,6 +912,8 @@ def curate_and_build_gene_list(candidate_genes, species, output_csv, unit='bp',
     `build_gene_list`'s own expected input.
     """
     candidate_gene_ids = [g['id'] for g in candidate_genes]
+    if backend == 'claude_code':
+        kwargs.setdefault('candidate_hints', node_hints(candidate_genes))
     curate_gene_locations(candidate_gene_ids, species, output_csv, backend=backend,
                            unit=unit, **kwargs)
     return build_gene_list(candidate_genes, output_csv, unit=unit)

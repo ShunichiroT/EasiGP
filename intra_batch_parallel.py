@@ -87,6 +87,7 @@ import os
 import random
 import re
 import shutil
+import inspect
 import time
 import traceback
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -95,7 +96,12 @@ from typing import Dict, List, Optional, Tuple
 import pandas as pd
 
 import checkpoint_utils as _ckpt
-from pipeline_utils import configure_r_environment, init_rpy2_conversion, install_gpu_semaphore, result_dir_path
+from pipeline_utils import (
+    configure_r_environment, init_rpy2_conversion, install_gpu_semaphore, result_dir_path,
+    ensure_memo_dir_env, release_memo_dir_env, gpu_arbiter_for_workers,
+    ensure_telemetry_dir_env, release_telemetry_dir_env,   # ver4-56 (R1)
+    apply_worker_thread_limits,
+)
 
 # ---------------------------------------------------------------------------
 # Update ID 2, Defect D2 fix (see PATCH_NOTES_D2.md).
@@ -359,9 +365,62 @@ from Preprocess.LD_decay_plot import unique_path
 # ordinary dict (insertion-ordered in modern Python, but not part of its
 # documented contract), so this module pins its own explicit order rather
 # than relying on that incidentally.
+#
+# Update ID ver4-12, R11 (design blueprint SS2.11, Appendix A finding A6):
+# A6 observes that `assemble.py::_assemble_streaming()` and
+# `intra_task_parallel.py::merge_model_groups_into_task()` both iterate
+# `checkpoint_utils.RESULT_FILE_NAMES` GENERICALLY, so a new key merges
+# through those two "for free". THIS tuple is the one place in the tree
+# that does NOT iterate the registry generically - it is independently
+# pinned, exactly as the comment above already says - so the two new
+# ASReml keys ('asreml_pheno', 'asreml_varcomp') must be added here
+# explicitly, or Width-2 (intra-batch, task-level) fan-out would silently
+# drop ASReml output when merging one outer batch's isolated per-task
+# folders back into that batch's own standard files. Not called out in
+# the design blueprint's own touch-point list for this file (only the
+# _PROTECTED_RESULT_FILE_RE fix below was) - recorded as an addition in
+# the ver4-12 Change Summary SS7.
 _MERGE_KEY_ORDER = (
     'record', 'result_train', 'result_valid', 'result_test', 'effect',
     'interactions', 'attention_total', 'weight', 'hp_record', 'stats',
+    'asreml_pheno', 'asreml_varcomp',
+    # ver4-25, R9-S0/R3 (design blueprint stage 3): added for the
+    # identical reason as the two keys above - this tuple is
+    # independently pinned, not generic, so every new checkpoint_utils.
+    # RESULT_FILE_NAMES key added for ASReml must be listed here by hand.
+    'asreml_fit_timing', 'asreml_accuracy_ctx',
+    # ver4-25, R8 Stage 6 completion: added for the identical reason as
+    # every other ASReml key above - this tuple is independently pinned,
+    # not generic, so a new checkpoint_utils.RESULT_FILE_NAMES key must
+    # be listed here by hand or Width-2 (intra-batch, task-level) fan-out
+    # would silently drop 'full'-mode test-weight-matrix output when
+    # merging one outer batch's isolated per-task folders back into that
+    # batch's own standard files.
+    'asreml_test_weights',
+    # ver4-25, Stage 9 (design blueprint R12): added for the identical
+    # reason as every key above - this tuple is independently pinned,
+    # not generic, so 'interactions_hok' (checkpoint_utils.
+    # RESULT_FILE_NAMES' own key for Interaction_higher_order.csv) must
+    # be listed here by hand or Width-2 (intra-batch, task-level) fan-out
+    # would silently drop every k>=3 marker-set interaction row when
+    # merging one outer batch's isolated per-task folders back into that
+    # batch's own standard files.
+    'interactions_hok',
+    # ver4-7, R1 ("Per-Set GRM Generation for GBLUP") - added for the
+    # identical reason as every other ASReml key above - this tuple is
+    # independently pinned, not generic, so a new checkpoint_utils.
+    # RESULT_FILE_NAMES key must be listed here by hand or Width-2
+    # (intra-batch, task-level) fan-out would silently drop the 3
+    # diagnostic GRM matrices when merging one outer batch's isolated
+    # per-task folders back into that batch's own standard files.
+    'grm_train', 'grm_valid', 'grm_test',
+    # ver4-57, R4: added for the identical reason as every key above - this tuple is
+    # independently pinned, not generic, so 'iter_rounds' (checkpoint_utils.RESULT_FILE_NAMES'
+    # key for Iterative_ensemble_rounds.csv) must be listed here by hand or Width-2
+    # (intra-batch, task-level) fan-out would silently drop the Iterative ensemble's per-round
+    # diagnostics when merging one outer batch's isolated per-task folders back into its own
+    # standard files.
+    'iter_rounds',
 )
 
 
@@ -397,7 +456,29 @@ def _task_already_complete(result_name: str, batch_id: int, task_index: int) -> 
     return os.path.isfile(metric_path) and not os.path.isfile(checkpoint_path)
 
 
-def _worker_init(r_path: Optional[str], r_blas_threads: Optional[int], gpu_semaphore) -> None:
+def fanout_thread_resources(gp_kwargs: dict, pool_width: int) -> Optional[dict]:
+    """Thread-budget hand-off for a fan-out worker (ver4-35, R1.e1): the
+    small resources dict ``_worker_init`` passes to
+    ``pipeline_utils.apply_worker_thread_limits``, or None (legacy - nothing
+    is capped) unless ``ACCELERATION['worker_thread_limits']`` is on.
+
+    The budget is the run's ``N_JOBS`` when positive - it already arrives
+    divided by ``N_CPU_WORKERS`` (see the reclaim note in ``run_batch``'s
+    serial branch) - otherwise the visible CPU count split over `pool_width`
+    concurrent workers. Always >= 1."""
+    acceleration = gp_kwargs.get('ACCELERATION')
+    if not isinstance(acceleration, dict) or not acceleration.get('worker_thread_limits', False):
+        return None
+    try:
+        n_jobs = int(gp_kwargs.get('N_JOBS') or 0)
+    except (TypeError, ValueError):
+        n_jobs = 0
+    budget = n_jobs if n_jobs > 0 else max(1, (os.cpu_count() or 1) // max(1, int(pool_width)))
+    return {'accel_worker_thread_limits': True, 'n_jobs': budget}
+
+
+def _worker_init(r_path: Optional[str], r_blas_threads: Optional[int], gpu_semaphore,
+                 thread_resources: Optional[dict] = None) -> None:
     """Runs once per worker PROCESS, before it handles any task -
     initialises this process's own R environment/rpy2 conversion context
     (required: R/rpy2 state is per-process, never safely shared - see
@@ -408,7 +489,12 @@ def _worker_init(r_path: Optional[str], r_blas_threads: Optional[int], gpu_semap
     `_startup_jitter()`), and the R/rpy2 setup calls are each wrapped in
     `_retry_transient_mount_error()` - both aimed at the same production
     failure (every worker's startup import hitting a network scratch
-    mount in the same ~1s window - see the note above `_MP_CONTEXT`)."""
+    mount in the same ~1s window - see the note above `_MP_CONTEXT`).
+
+    ver4-35, R1.e1: `thread_resources` (from `fanout_thread_resources`; None
+    = legacy) caps this process's native OpenMP/BLAS pools at its own budget
+    - they were created at full node size when the spawned worker imported
+    numpy/torch, before any divided thread variable could take effect."""
     _startup_jitter()
     _retry_transient_mount_error(
         lambda: configure_r_environment(r_path, r_blas_threads=r_blas_threads),
@@ -417,6 +503,8 @@ def _worker_init(r_path: Optional[str], r_blas_threads: Optional[int], gpu_semap
     _retry_transient_mount_error(init_rpy2_conversion, what="init_rpy2_conversion")
     if gpu_semaphore is not None:
         install_gpu_semaphore(gpu_semaphore)
+    if thread_resources:
+        apply_worker_thread_limits(thread_resources)
 
 
 def _run_isolated_task(gp_kwargs: dict, task_index: int) -> Tuple[int, bool, Optional[str]]:
@@ -492,7 +580,10 @@ def _run_in_fresh_worker(fn, args: tuple, r_path: Optional[str], r_blas_threads:
     try:
         with ProcessPoolExecutor(
             max_workers=1, mp_context=_MP_CONTEXT,
-            initializer=_worker_init, initargs=(r_path, r_blas_threads, gpu_semaphore),
+            initializer=_worker_init,
+            initargs=(r_path, r_blas_threads, gpu_semaphore,
+                      fanout_thread_resources(args[0] if args and isinstance(args[0], dict)
+                                              else {}, 1)),
         ) as pool:
             future = pool.submit(fn, *args)
             return future.result()
@@ -655,8 +746,36 @@ retry_transient_mount_error = _retry_transient_mount_error
 # model-group count on top of Phase 2's task count.
 # ---------------------------------------------------------------------------
 _PROTECTED_RESULT_FILE_RE = re.compile(
-    r'^(' + '|'.join(re.escape(os.path.splitext(name)[0]) for name in _ckpt.RESULT_FILE_NAMES.values())
+    r'^(' + '|'.join(re.escape(os.path.splitext(os.path.basename(name))[0])
+                      for name in _ckpt.RESULT_FILE_NAMES.values())
     + r')(_\d+)?\.[A-Za-z0-9]+$'
+)
+# Update ID ver4-12, R11a (design blueprint SS2.11a, RK-4, Appendix A
+# finding A10): two of `checkpoint_utils.RESULT_FILE_NAMES`'s values now
+# embed a SUBFOLDER ('ASReml/ASReml_phenotype.csv') rather than sitting
+# directly under `Result/<RESULT_NAME>/`. Before this fix,
+# `_PROTECTED_RESULT_FILE_RE` above was built from the RAW (non-basename)
+# `os.path.splitext(name)[0]`, which for that value yields the fragment
+# 'ASReml/ASReml_phenotype' - a pattern that can never match a plain
+# `os.listdir()` entry (`os.listdir()` never returns a string containing a
+# path separator). The regex fix above (basename first) makes the FILES
+# inside `ASReml/` matchable in principle, but `relocate_side_artefacts()`
+# below lists TOP-LEVEL entries - and the top-level entry for these two
+# files is the DIRECTORY NAME 'ASReml' itself, which matches neither the
+# (file-shaped) regex above nor `_PROTECTED_CHECKPOINT_RE`. Without this
+# extra guard, the entire 'ASReml/' directory would be treated as an
+# unmatched top-level entry and RELOCATED (as a "side artefact") before
+# intra_task_parallel.py's own tier-1 merge (which reads these files via
+# the ordinary, RESULT_FILE_NAMES-driven `result_file_paths()`) ever gets
+# a chance to read it - silently losing Parallel-mode ASReml output. The
+# fix is a SEPARATE guard (not folded into the file regex, which only
+# ever matches FILES) checked in the `relocate_side_artefacts()` loop
+# below, derived from the registry - never hard-coded - so a future
+# RESULT_FILE_NAMES key that nests into some OTHER subfolder is protected
+# automatically, with no further edit needed here.
+_PROTECTED_RESULT_SUBDIRS = frozenset(
+    os.path.dirname(name).split(os.sep)[0]
+    for name in _ckpt.RESULT_FILE_NAMES.values() if os.path.dirname(name)
 )
 _PROTECTED_CHECKPOINT_RE = re.compile(r'^\.checkpoint(_\d+)?\.json(\.tmp)?$')
 _SCRATCH_TIER_DIR_NAMES = ('.intra_batch_parallel', '.intra_task_parallel')
@@ -738,6 +857,15 @@ def relocate_side_artefacts(src_result_name: str, dst_result_name: str) -> None:
     for entry in sorted(os.listdir(src_dir)):
         if _PROTECTED_RESULT_FILE_RE.match(entry) or _PROTECTED_CHECKPOINT_RE.match(entry):
             continue
+        # Update ID ver4-12, R11a (RK-4) - see _PROTECTED_RESULT_SUBDIRS'
+        # own module-level comment: a top-level entry that is itself a
+        # PROTECTED SUBFOLDER (currently only 'ASReml') is left alone here
+        # entirely - neither relocated NOR recursed into - so its contents
+        # remain exactly where intra_task_parallel.py's tier-1 merge (or
+        # this module's own tier-2 merge) expects to read them from via
+        # the ordinary RESULT_FILE_NAMES-driven paths.
+        if entry in _PROTECTED_RESULT_SUBDIRS:
+            continue
         if entry in _SCRATCH_TIER_DIR_NAMES:
             # Defensive only - a leaf task/group folder should never
             # itself contain another tier's scratch directory; skip
@@ -755,11 +883,31 @@ def relocate_side_artefacts(src_result_name: str, dst_result_name: str) -> None:
     if moved_any:
         print(f"[intra_batch_parallel] Relocated side artefact(s) (LD-decay data, BGLR MCMC "
               f"traces, PLINK-derived marker info, gene-coordinate CSVs, or similar) from "
-              f"'{src_dir}' into '{dst_dir}' before discarding the scratch folder (F1 fix - "
-              f"see the ver4-3 design blueprint Appendix B).")
+              f"'{src_dir}' into '{dst_dir}' before discarding the scratch folder (F1 fix).")
 
 
-def run_batch_with_intra_batch_parallelism(
+def run_batch_with_intra_batch_parallelism(*args, **kwargs):
+    """Public entry point (signature and behaviour exactly those of
+    :func:`_run_batch_with_intra_batch_parallelism`, documented there).
+
+    ver4-33, R1.c: installs ``EASIGP_MEMO_DIR`` (``Result/<outer
+    RESULT_NAME>/_memo``) for the duration of the call - if unset - so every
+    worker process this batch spawns, and every isolated per-task sub-run,
+    shares ONE preprocessing memo. An outer value always wins, and the
+    variable is removed again only if this call set it."""
+    bound = inspect.signature(_run_batch_with_intra_batch_parallelism).bind(*args, **kwargs).arguments
+    memo_set_here = ensure_memo_dir_env(bound['gp_kwargs'].get('RESULT_NAME'))
+    # ver4-56 (R1): worker processes inherit the TOP-LEVEL telemetry folder, never the
+    # per-task isolated `_intra_batch/...` one (an outer value always wins).
+    telemetry_set_here = ensure_telemetry_dir_env(bound['gp_kwargs'].get('RESULT_NAME'))
+    try:
+        return _run_batch_with_intra_batch_parallelism(*args, **kwargs)
+    finally:
+        release_telemetry_dir_env(telemetry_set_here)
+        release_memo_dir_env(memo_set_here)
+
+
+def _run_batch_with_intra_batch_parallelism(
     gp_kwargs: dict,
     n_cpu_workers: int,
     n_gpu_slots: int = 0,
@@ -998,7 +1146,13 @@ def run_batch_with_intra_batch_parallelism(
     # process is spawned via the same explicit _MP_CONTEXT as every other
     # worker process this module creates, for the same fork-safety reason
     # (see the module-level note beside _MP_CONTEXT's own definition).
-    gpu_semaphore = _MP_CONTEXT.Manager().Semaphore(n_gpu_slots) if n_gpu_slots > 0 else None
+    # ver4-33, R1.h: the legacy Manager().Semaphore unless
+    # ACCELERATION['gpu_device_round_robin'] is on and >1 CUDA device is
+    # visible - then a round-robin device-token pool (gpu_slot() pins each
+    # holder to its own device instead of all landing on cuda:0).
+    gpu_semaphore = gpu_arbiter_for_workers(
+        gp_kwargs.get('ACCELERATION'), n_gpu_slots, gp_kwargs.get('GPU_SLOTS_PER_DEVICE', 1),
+        _MP_CONTEXT.Manager()) if n_gpu_slots > 0 else None
     r_path = gp_kwargs.get('R_PATH')
     r_blas_threads = gp_kwargs.get('R_BLAS_THREADS')
 
@@ -1035,7 +1189,9 @@ def run_batch_with_intra_batch_parallelism(
     if to_run:
         with ProcessPoolExecutor(
             max_workers=min(n_cpu_workers, len(to_run)), mp_context=_MP_CONTEXT,
-            initializer=_worker_init, initargs=(r_path, r_blas_threads, gpu_semaphore),
+            initializer=_worker_init,
+            initargs=(r_path, r_blas_threads, gpu_semaphore,
+                      fanout_thread_resources(gp_kwargs, min(n_cpu_workers, len(to_run)))),
         ) as pool:
             futures = {
                 pool.submit(_run_isolated_task, _sub_kwargs_for(i), i): i for i in to_run

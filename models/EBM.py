@@ -72,7 +72,7 @@ def _ebm_effect(fitted_ebm, marker_names):
     return pd.DataFrame(effect_full).T
 
 
-def EBM(train, valid, test, params):
+def EBM(train, valid, test, params, *, sample_weight_ctx=None):
 
     learning_rate = params[0]
     max_leaves = int(params[1])
@@ -92,6 +92,8 @@ def EBM(train, valid, test, params):
     if valid.shape[0] != 0:
         valid_x, valid_y = valid.iloc[:, :-1], valid.iloc[:, -1]
     test_x, test_y = test.iloc[:, :-1], test.iloc[:, -1]
+    # ver4-25, R8 - see models/RF.py's identical comment.
+    _w_fit = sample_weight_ctx.w_fit if sample_weight_ctx is not None else None
 
     _resources = get_active_compute_resources()
     _ebm_cls = _ebm_regressor_cls()
@@ -118,7 +120,7 @@ def EBM(train, valid, test, params):
     if _interactions_arg != 'all_default':
         _ebm_kwargs['interactions'] = _interactions_arg
     ebm = _ebm_cls(**_ebm_kwargs)
-    ebm.fit(train_x, train_y)
+    ebm.fit(train_x, train_y, sample_weight=_w_fit)
 
     predicted = np.asarray(ebm.predict(test_x)).ravel()
     if valid.shape[0] != 0:

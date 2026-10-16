@@ -7,9 +7,11 @@ from bayes_opt import BayesianOptimization, SequentialDomainReductionTransformer
 from .ensemble_regularization import (
     diversity_regularizer, ensemble_mse_objective, apply_naive_shrinkage, read_regularization_settings,
     analytic_simplex_weights, select_weights_with_floor, stick_breaking_to_simplex,
-    simplex_to_stick_breaking,
+    simplex_to_stick_breaking, _weighted_row_mean,
 )
-from pipeline_utils import get_active_compute_resources, nested_safe_n_jobs
+from pipeline_utils import get_active_compute_resources, nested_safe_n_jobs, safe_regression_metrics
+import blue_weights
+from asreml_accuracy_metrics import compute_accuracy_metrics_row, ACCURACY_METRIC_COLUMNS
 
 try:
     from bayes_opt.acquisition import ExpectedImprovement
@@ -176,7 +178,8 @@ def _bayesian_single_search(seed, model_selected, minimum_boundary, maximum_boun
                              objective_mode, diversity_penalty, diversity_method,
                              vectorised, data_valid, pred_matrix, actual_valid_arr,
                              e_minus_d, equal_weight_val, use_batch, liar,
-                             simplex_search=True, analytic_probe=None):
+                             simplex_search=True, analytic_probe=None,
+                             valid_w=None, valid_W=None):
     """Returns (best_target, best_weights) - a plain float and a 1-D
     numpy array of length ``len(model_selected)`` ALWAYS expressed in raw,
     len(model_selected)-dimensional weight-SHARE space (regardless of
@@ -209,6 +212,16 @@ def _bayesian_single_search(seed, model_selected, minimum_boundary, maximum_boun
         evaluates the closed-form least-squares optimum too, not merely
         uses it as a floor after the fact (see Bayesian()'s own R5/R6
         integration below).
+    valid_w, valid_W : ver4-25, R8 (design blueprint SS2, Stage 6) -
+        optional BLUE-reliability SCORING weights for this SAME
+        validation split (diagonal `valid_w`/full `valid_W` - see
+        `blue_weights.scoring_for()`), passed as PLAIN numpy arrays
+        (never a `BlueWeightContext` object itself - keeps this
+        function's own picklability for the W_OPT_BAYES_RESTARTS
+        process fan-out, I13). Both `None` (every pre-ver4-25 caller) is
+        a byte-identical no-op (I11) - see `Bayesian()`'s own docstring
+        for why this is the validation-split SCORING weight, not
+        `sample_weight_ctx.w_fit`.
     """
     K = len(model_selected)
     use_simplex = bool(simplex_search) and K >= 2
@@ -254,15 +267,21 @@ def _bayesian_single_search(seed, model_selected, minimum_boundary, maximum_boun
             return target
 
         if objective_mode == 'ensemble_mse':
+            # ver4-25, R8: valid_w/valid_W are None (a no-op splat)
+            # whenever weighting is off - I11.
             first_term = ensemble_mse_objective(
                 weights, w_sum, data_valid, model_selected,
                 pred_matrix=(pred_matrix if vectorised else None),
                 actual=(actual_valid_arr if vectorised else None),
+                w=valid_w, W=valid_W,
             )
         elif vectorised:
             # R1.d - see this function's own module-level note above for
-            # the full derivation.
-            first_term = float(np.mean(e_minus_d @ weights) / (K * w_sum))
+            # the full derivation. ver4-25, R8: the per-row mean over
+            # validation individuals becomes the SAME weighted mean used
+            # by the loop-based branch below when weighting is on
+            # (byte-identical np.mean() otherwise - I11).
+            first_term = _weighted_row_mean(e_minus_d @ weights, w=valid_w, W=valid_W) / (K * w_sum)
         else:
             # Original (pre-ver4-5), byte-for-byte loop-based computation.
             second_term = data_valid.loc[:, model_selected + ['actual']]
@@ -272,7 +291,9 @@ def _bayesian_single_search(seed, model_selected, minimum_boundary, maximum_boun
                 third_term.iloc[:, i] = (third_term.iloc[:, i] - mean_value).pow(2) * weights[i]
             second_term = second_term.iloc[:, :-1].div(w_sum, axis=1).mean(axis=1)
             third_term = third_term.iloc[:, :-1].div(w_sum, axis=1).mean(axis=1)
-            first_term = (second_term - third_term).mean()
+            # ver4-25, R8: weighted mean when weighting is on
+            # (byte-identical .mean() otherwise - I11).
+            first_term = _weighted_row_mean((second_term - third_term).to_numpy(), w=valid_w, W=valid_W)
 
         first_term = first_term + diversity_regularizer(weights, w_sum, diversity_penalty, diversity_method)
 
@@ -381,8 +402,21 @@ def _bayesian_single_search(seed, model_selected, minimum_boundary, maximum_boun
     return best['target'], best['weights']
 
 
-def Bayesian(data_train, data_valid, data_test, record, effect, weight, MODEL, HPARAMETERS_OPT):
-    
+def Bayesian(data_train, data_valid, data_test, record, effect, weight, MODEL, HPARAMETERS_OPT,
+             asreml_accuracy_ctx=None, *, sample_weight_ctx=None):
+    """ver4-25, R8 (design blueprint SS2, Stage 6): `sample_weight_ctx`
+    (a `blue_weights.BlueWeightContext`, or `None` - every pre-ver4-25
+    caller, a strict no-op - I11) applies this task's shared BLUE-
+    reliability scoring weights (Fairness Principle P8) to the search
+    objective (threaded through to every restart - including a
+    joblib-dispatched one - as plain, picklable `valid_w`/`valid_W`
+    arrays, never the context object itself), the R6 analytic seed/probe
+    and the R5.2b validation floor, and this method's own final
+    test-score row - see `Nelder_Mead.py`'s identical docstring (the
+    same mechanism, the same reasoning for why this is the validation-
+    split SCORING weight rather than `ctx.w_fit`) and
+    `_bayesian_single_search()`'s own `valid_w`/`valid_W` docstring."""
+
     minimum_boundary = HPARAMETERS_OPT[0]
     maximum_boundary = HPARAMETERS_OPT[1]
     iteration = HPARAMETERS_OPT[2]
@@ -460,6 +494,15 @@ def Bayesian(data_train, data_valid, data_test, record, effect, weight, MODEL, H
     _row_mean_pred = pred_matrix.mean(axis=1)
     e_minus_d = (pred_matrix - actual_valid_arr[:, None]) ** 2 - (pred_matrix - _row_mean_pred[:, None]) ** 2
 
+    # ver4-25, R8: the validation-split SCORING weight (diagonal `w` or
+    # full `W`) - `{}` (unweighted no-op) whenever weighting is off.
+    # Extracted as plain numpy arrays (never the BlueWeightContext object
+    # itself) so they remain trivially picklable for the
+    # W_OPT_BAYES_RESTARTS process fan-out (I13).
+    _valid_weight_kwargs = blue_weights.scoring_for(sample_weight_ctx, 'valid')
+    _valid_w = _valid_weight_kwargs.get('w')
+    _valid_W = _valid_weight_kwargs.get('W')
+
     # ver4-4 §4a / ver4-5 R1.d precedent - default-on accelerations that
     # change a run's RESULTS at floating-point-rounding level (summation
     # order), not merely wall-clock time, are announced unconditionally,
@@ -473,7 +516,7 @@ def Bayesian(data_train, data_valid, data_test, record, effect, weight, MODEL, H
               "(W_OPT_VECTORISED_OBJECTIVE=True, default) - agrees with the original "
               "loop-based computation to 1e-12 relative, but floating-point summation "
               "order differs. Set W_OPT_VECTORISED_OBJECTIVE=false to restore the exact "
-              "pre-ver4-5 computation.")
+              "original computation.")
 
     # Update ID ver4-6 (R5/R6/R7) - three further top-level config flags,
     # read via the SAME process-global compute-resources dict this
@@ -493,7 +536,8 @@ def Bayesian(data_train, data_valid, data_test, record, effect, weight, MODEL, H
     # receives the SAME probe/floor candidate) - probed alongside equal
     # weighting in every restart (R6.4), and handed to the validation
     # floor below as an extra candidate.
-    analytic_w = analytic_simplex_weights(pred_matrix, actual_valid_arr) if w_opt_analytic_seed else None
+    analytic_w = analytic_simplex_weights(pred_matrix, actual_valid_arr, **_valid_weight_kwargs) \
+        if w_opt_analytic_seed else None
 
     # ver4-6 R7.2(c)/AC-R7.3: negative weights are structurally
     # unreachable under a stick-breaking simplex map (every share is
@@ -505,14 +549,14 @@ def Bayesian(data_train, data_valid, data_test, record, effect, weight, MODEL, H
         print(f"[GP] NOTE: Bayesian optimisation weight search - Minimum boundary="
               f"{minimum_boundary} is negative, but W_OPT_SIMPLEX_SEARCH=True means every "
               f"candidate weight is non-negative by construction (a stick-breaking map onto "
-              f"the probability simplex - ver4-6 R7.2(b)); negative weights are unreachable "
+              f"the probability simplex); negative weights are unreachable "
               f"regardless of this setting. Set W_OPT_SIMPLEX_SEARCH=False to restore the "
               f"literal per-weight box semantics.")
 
     # ver4-6 R5.2a/AC-R5.5: the resolved objective and its source,
     # printed unconditionally (I11) for this weight-optimisation method.
     _objective_source = 'explicit HYPERPARAMETERS_OPT entry' if len(HPARAMETERS_OPT) > 6 else \
-        'default (ver4-6: ensemble_mse fallback - see read_regularization_settings)'
+        'default (ensemble_mse fallback - see read_regularization_settings)'
     print(f"[GP] Bayesian optimisation weight search: objective_mode={objective_mode!r} "
           f"({_objective_source}), w_opt_analytic_seed={w_opt_analytic_seed}, "
           f"w_opt_validation_floor={w_opt_validation_floor}, "
@@ -528,6 +572,9 @@ def Bayesian(data_train, data_valid, data_test, record, effect, weight, MODEL, H
         use_batch=w_opt_bayes_batch, liar=w_opt_bayes_liar,
         # ver4-6 R6/R7: threaded through to every restart identically.
         simplex_search=w_opt_simplex_search, analytic_probe=analytic_w,
+        # ver4-25, R8: plain, picklable arrays (or None) - identical for
+        # every restart, exactly like every other entry in this dict.
+        valid_w=_valid_w, valid_W=_valid_W,
     )
 
     if w_opt_bayes_restarts <= 1:
@@ -599,7 +646,7 @@ def Bayesian(data_train, data_valid, data_test, record, effect, weight, MODEL, H
         _extra_candidates = [('analytic', analytic_w)] if analytic_w is not None else None
         w, _wopt_chosen_label, _wopt_diag = select_weights_with_floor(
             w, pred_matrix, actual_valid_arr, shrinkage_alpha=shrinkage_alpha,
-            extra_candidates=_extra_candidates,
+            extra_candidates=_extra_candidates, **_valid_weight_kwargs,
         )
         print(f"[GP] Bayesian optimisation weight search: floor selected {_wopt_chosen_label!r} "
               f"(validation MSE - {_wopt_diag}).")
@@ -641,14 +688,29 @@ def Bayesian(data_train, data_valid, data_test, record, effect, weight, MODEL, H
     actual_test =  data_test_selected.iloc[:,-1].tolist()
     
     ## Calculate the metrics
-    mse = mean_squared_error(actual_test, predicted_test)
-    r = scipy.stats.pearsonr(actual_test, predicted_test)[0]
-    
+    # ver4-25, R8: safe_regression_metrics() (never raises on a NaN
+    # prediction column - see Nelder_Mead.py's identical note) plus,
+    # when weighting is on, the SAME weighted Pearson/MSE every model's
+    # own row already reports, unweighted copies kept alongside - the
+    # central-recompute pattern (SS6.3).
+    actual_test_arr = np.asarray(actual_test, dtype=float)
+    predicted_test_arr = np.asarray(predicted_test, dtype=float)
+    r_unweighted, mse_unweighted = safe_regression_metrics(actual_test_arr, predicted_test_arr)
+    _test_weight_kwargs = blue_weights.scoring_for(sample_weight_ctx, 'test')
+    if _test_weight_kwargs:
+        r, mse = safe_regression_metrics(actual_test_arr, predicted_test_arr, **_test_weight_kwargs)
+    else:
+        r, mse = r_unweighted, mse_unweighted
+
     ## Store the metrics
     record = pd.concat([record, pd.DataFrame(record.iloc[-1,:]).T]).reset_index(drop=True)
     record.loc[record.shape[0]-1,'model'] = 'Bayesian optimisation'
     record.loc[record.shape[0]-1,'Pearson correlation'] = r
     record.loc[record.shape[0]-1,'MSE'] = mse
+    if sample_weight_ctx is not None:
+        record.loc[record.shape[0]-1, 'Pearson correlation (unweighted)'] = r_unweighted
+        record.loc[record.shape[0]-1, 'MSE (unweighted)'] = mse_unweighted
+        record.loc[record.shape[0]-1, 'metric_weighting'] = sample_weight_ctx.mode
 
     ## Weight the predicted phenotypes for the validation set
     predicted_valid = []
@@ -670,8 +732,24 @@ def Bayesian(data_train, data_valid, data_test, record, effect, weight, MODEL, H
     data_valid['Bayesian'] = predicted_valid
     data_train['Bayesian'] = predicted_train
 
+    # Requirements.md (BLUEs/BLUPs accuracy-metrics phase) - see
+    # models/Nelder_Mead.py's identical block for the full explanation.
+    if asreml_accuracy_ctx:
+        _new_metrics = compute_accuracy_metrics_row(
+            list(predicted_test), data_test['id'].tolist() if 'id' in data_test.columns else [],
+            r, asreml_accuracy_ctx,
+        )
+        for _col, _val in _new_metrics.items():
+            record.loc[record.shape[0]-1, _col] = _val
+
     ## Extract weights
-    weight_sample = pd.DataFrame(record.iloc[record.shape[0]-1,:]).T.drop(['Pearson correlation', 'MSE'],axis=1)
+    # Requirements.md (BLUEs/BLUPs accuracy-metrics phase) - see
+    # models/Nelder_Mead.py's identical block for the full explanation.
+    weight_sample = pd.DataFrame(record.iloc[record.shape[0]-1,:]).T.drop(
+        ['Pearson correlation', 'MSE'] + list(ACCURACY_METRIC_COLUMNS)
+        + list(blue_weights.METRIC_WEIGHTING_EXTRA_COLUMNS),
+        axis=1, errors='ignore'
+    )
     weight_sample['model'] = 'Bayesian optimisation' 
     
     weight_sample = pd.concat([weight_sample.reset_index(drop=True), weight_extracted.reset_index(drop=True)], axis=1)
@@ -680,16 +758,22 @@ def Bayesian(data_train, data_valid, data_test, record, effect, weight, MODEL, H
     weight_extracted_normalised = _safe_row_normalize(weight_extracted)
     
     ## Calculate weighted effects
+    # F1 fix: the accumulator used to be created only when i == 0, so a first model without effect rows
+    # (e.g. explainability off for it) raised UnboundLocalError on the next model, and no effect rows at all
+    # raised it at the end. It now starts from the first model that HAS effect rows (identical result when
+    # every model has them) and the ensemble effect row is skipped when no model has any.
+    effect_weighted = None
     for i in range(len(model_selected)):
         if effect[effect['model']==model_selected[i]].shape[0] != 0:
-            if i == 0:
+            if effect_weighted is None:
                 effect_weighted = _safe_row_normalize(effect[effect['model']==model_selected[i]].tail(1).iloc[:,5:].abs().reset_index(drop=True)).mul(weight_extracted_normalised[model_selected[i]], axis=0).reset_index(drop=True)
             else:
                 effect_weighted += _safe_row_normalize(effect[effect['model']==model_selected[i]].tail(1).iloc[:,5:].abs().reset_index(drop=True)).mul(weight_extracted_normalised[model_selected[i]], axis=0).reset_index(drop=True)
  
-    effect = pd.concat([effect, pd.DataFrame(effect.iloc[effect.shape[0]-1,:]).T]).reset_index(drop=True)
-    effect.loc[effect.shape[0]-1,'model'] = 'Bayesian optimisation'
+    if effect_weighted is not None:
+        effect = pd.concat([effect, pd.DataFrame(effect.iloc[effect.shape[0]-1,:]).T]).reset_index(drop=True)
+        effect.loc[effect.shape[0]-1,'model'] = 'Bayesian optimisation'
     
-    effect.loc[effect.shape[0]-1,list(effect_weighted.columns)] = effect_weighted.values
+        effect.loc[effect.shape[0]-1,list(effect_weighted.columns)] = effect_weighted.values
 
     return record, effect, data_test, data_valid, data_train, weight

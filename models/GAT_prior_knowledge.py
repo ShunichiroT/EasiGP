@@ -16,8 +16,11 @@ from torch_geometric.explain import Explainer, CaptumExplainer
 from pipeline_utils import (
     get_active_compute_resources, apply_torch_compute_settings, gpu_slot,
     dataloader_num_workers, torch_eval_batch_size, split_batched_edge_attention,
+    is_lean_search_fit,
 )
 from models.interaction_extraction import tree_shap_interactions
+from models.gat_search import lean_search_fit, topology_for, undirected_edge_index
+from models.gat_stability import gat_stable
 
 # ver4-4 R3.a (blueprint §2.3.2, root-cause finding R3.a): n_estimators and
 # the SHAP-interaction sample count below used to be inline literals. Lifted
@@ -30,7 +33,12 @@ _RF_N_ESTIMATORS = 500
 _SHAP_INTERACTION_SAMPLE_SIZE = 50
 
 
-def GAT_prior_knowledge(data_train, data_valid, data_test, params):
+@gat_stable('GAT_prior_knowledge')
+def GAT_prior_knowledge(data_train, data_valid, data_test, params, *, sample_weight_ctx=None):
+    # ver4-25, R8 (design blueprint SS2, Stage 6): the internal
+    # topology-deciding RF (below) AND this model's own GAT training
+    # loop (further down - see `tmp.w`/the weighted loss at its own
+    # training loop) are BOTH weighted with the SAME shared `_w_fit`.
    
     if data_valid.shape[0] != 0:
         VALID = True
@@ -56,80 +64,59 @@ def GAT_prior_knowledge(data_train, data_valid, data_test, params):
     # Interaction.csv for this model unless this is explicitly turned on.
     emit_interaction = params[10] if len(params) > 10 else False
 
-    ## Train RF & extract interactions
+    ## Train RF & extract interactions (-> the graph topology)
 
     train_x, train_y = data_train.iloc[:,:-1], data_train.iloc[:,-1]
 
-    # ver4-4 R3.a: sklearn defaults n_jobs to 1 (one core) when not passed
-    # explicitly - this RandomForestRegressor fits on the FULL marker set
-    # and its SHAP interactions define this model's entire graph topology
-    # (architecture doc §9.3), making it one of the most expensive
-    # single-threaded steps in the tree despite every OTHER RF in the
-    # codebase already being threaded (root-cause finding R3.a).
+    # ver4-4 R3.a: sklearn defaults n_jobs to 1 (one core) when not passed explicitly -
+    # this forest fits on the FULL marker set and its SHAP interactions define this
+    # model's entire graph topology (architecture doc §9.3), so it is threaded.
     _resources = get_active_compute_resources()
-    rf = RandomForestRegressor(
-        n_estimators=_RF_N_ESTIMATORS, random_state=40,
-        n_jobs=_resources['n_jobs'],
+    # ver4-25, R8: the topology forest is weighted with the SAME shared fitting weight
+    # every other model uses (fairness principle P8).
+    _w_fit = sample_weight_ctx.w_fit if sample_weight_ctx is not None else None
+
+    # ver4-46, R3: the forest + pairwise TreeSHAP + top-`top_rate` selection moved,
+    # unchanged, into models/gat_search.py::compute_topology(). Its inputs are the
+    # training genotypes/phenotype/weights and `top_rate` (not a tunable field), so
+    # every candidate of a hyperparameter search recomputed the identical result;
+    # `topology_for()` returns it from an exact content-addressed cache inside a
+    # tuning call (search fits and the confirmatory fit) and is a plain call of
+    # compute_topology() everywhere else (I11). Still the shared extractor of ver4-5 R2
+    # (`tree_shap_interactions`, reduce='sum_then_abs' - this file's own reduction order
+    # - governs the model's PREDICTIONS, so it is kept byte-for-byte; same quantile,
+    # same '>=' operator).
+    _topology = topology_for(
+        train_x, train_y, _w_fit, top_rate,
+        n_jobs=_resources['n_jobs'], rf_trees=_RF_N_ESTIMATORS,
+        shap_samples=_SHAP_INTERACTION_SAMPLE_SIZE,
     )
-    rf.fit(train_x, train_y)
 
-    # Update ID ver4-5, R2 (blueprint §4.4): the pairwise-SHAP matrix this
-    # model has ALWAYS computed here (purely to decide its own graph
-    # topology - see module docstring) now goes through the SAME shared
-    # extractor models/RF.py and Preprocess/data_driven_prior_network.py
-    # use, instead of a third private copy of the same abs()/sum()/
-    # triangle/melt arithmetic. reduce='sum_then_abs' is this file's OWN
-    # pre-existing reduction order (deliberately different from RF.py's
-    # abs-then-sum order - see interaction_extraction.tree_shap_
-    # interactions()'s own docstring), passed explicitly so this call is a
-    # numeric no-op for the topology this model builds below. marker1/
-    # marker2 in the returned frame are real marker NAMES (verified
-    # equivalent, up to a harmless marker1<->marker2 swap a symmetric
-    # matrix's two triangles produce, to this function's own previous
-    # positional-pair implementation - see the Change Summary).
-    _pair_named = tree_shap_interactions(
-        rf, shap.sample(train_x, _SHAP_INTERACTION_SAMPLE_SIZE), train_x.columns,
-        n_jobs=_resources['n_jobs'], reduce='sum_then_abs',
-    )
-    # Same top-`top_rate`% edge-selection threshold this model has always
-    # applied to decide which marker pairs become graph edges - unchanged
-    # (this governs the model's own PREDICTIONS, not just what gets
-    # reported, so it is deliberately kept byte-for-byte identical to
-    # before: same quantile, same '>=' operator - only the matrix this
-    # threshold is applied to now comes from the shared extractor above).
-    _pair_named = _pair_named[
-        _pair_named['value'] >= np.quantile(_pair_named['value'].to_numpy(), 1 - (top_rate / 100))
-    ].reset_index(drop=True)
+    # Requirement 2 (near-zero marginal cost): when this model is asked to EMIT its
+    # interaction pairs, this IS that same, already-computed, already-filtered pair set -
+    # with real marker names, ready to write to Interaction.csv (gated by
+    # model_registry.emits_interactions()).
+    sample_interaction = _topology.as_named_frame(train_x.columns) if emit_interaction else pd.DataFrame()
 
-    # Requirement 2 (near-zero marginal cost, blueprint §1): when this
-    # model is asked to EMIT its interaction pairs, this IS that same,
-    # already-computed, already-filtered pair set above - no second
-    # computation, no second threshold - with real marker names, ready to
-    # write straight to Interaction.csv (see genomic_prediction.py's
-    # accumulation step, gated by model_registry.emits_interactions()).
-    sample_interaction = _pair_named.copy() if emit_interaction else pd.DataFrame()
+    # The torch graph construction below needs POSITIONAL indices; `pair` keeps its
+    # historical shape (an unnamed two-column frame read positionally by
+    # edges_from/edges_to below). int64 is guaranteed even for an EMPTY selection.
+    pair = pd.DataFrame({0: _topology.pos1, 1: _topology.pos2}).astype(np.int64)
 
-    # The torch graph-construction code below needs POSITIONAL indices
-    # (edge_index must be integer node positions, not names) - map back
-    # via this task's own column order, which is exactly the same
-    # `marker_names` tree_shap_interactions() was given above, so this
-    # mapping is guaranteed complete (every name in _pair_named came from
-    # train_x.columns in the first place). `pair` keeps its historical
-    # shape (an unnamed 2-column-plus-value frame, columns 0/1 read
-    # positionally by edges_from/edges_to below) so nothing downstream of
-    # this point needs to change.
-    _col_pos = {name: pos for pos, name in enumerate(train_x.columns)}
-    # .astype(np.int64) is a defensive dtype fix, not a behaviour change:
-    # an EMPTY _pair_named (no pair survived the top_rate threshold above)
-    # would otherwise map to a float64 (pandas' own empty-Series default),
-    # not the integer dtype torch.from_numpy()/edges_from/edges_to below
-    # expect - guarding this edge case explicitly rather than relying on
-    # torch to tolerate it.
-    pair = pd.DataFrame({
-        0: _pair_named['marker1'].map(_col_pos),
-        1: _pair_named['marker2'].map(_col_pos),
-    }).astype(np.int64)
-    
+    # ver4-46, R1: lean validation-only fit inside a hyperparameter-SEARCH fit - see
+    # models/GAT_fully_connected.py's identical block and models/gat_search.py. The
+    # undirected edge index is computed once (the topology is shared by every individual).
+    if VALID and is_lean_search_fit():
+        _m = train_x.shape[1]
+        _predicted_valid = lean_search_fit(
+            geno_train=train_x, y_train=train_y.to_numpy(),
+            geno_valid=data_valid.iloc[:, :-1], w_fit=_w_fit,
+            edge_index=undirected_edge_index(pair.iloc[:, 0].values, pair.iloc[:, 1].values, _m),
+            n_markers=_m, neuron=neuron, dropout=dropout, lrate=lrate, decay=decay,
+            epochs=epoch, bsize=bsize, heads=heads, attention_arg=True)
+        return (float('nan'), float('nan'), pd.DataFrame(), [], _predicted_valid, [],
+                pd.DataFrame(), pd.DataFrame())
+
     ## Preprocess the data so that it can be converted into a graph format    
     if VALID:
         data_QTL_train,data_QTL_valid, data_QTL_test = data_train.iloc[:,:-1].reset_index(drop=True), data_valid.iloc[:,:-1].reset_index(drop=True), data_test.iloc[:,:-1].reset_index(drop=True)
@@ -168,6 +155,10 @@ def GAT_prior_knowledge(data_train, data_valid, data_test, params):
         edges_from_train_tmp, edges_to_train_tmp = edges_from, edges_to
         tmp.x = torch.from_numpy(data_QTL_melt_train_tmp.to_numpy(dtype=float)).to(torch.float)
         tmp.y = torch.from_numpy(data_pheno_train_tmp).to(torch.float)
+        if _w_fit is not None:
+            # ver4-25, R8: see models/GAT_infinitesimal.py's identical
+            # comment - built exactly like `tmp.y` above.
+            tmp.w = torch.from_numpy(np.expand_dims(np.array(_w_fit[kk], dtype=float), axis=0)).to(torch.float)
         tmp.edge_index = torch.stack([torch.from_numpy(edges_from_train_tmp).to(torch.long),torch.from_numpy(edges_to_train_tmp).to(torch.long)], dim=0)
         tmp = T.ToUndirected()(tmp)
         data_train += [tmp]
@@ -270,7 +261,13 @@ def GAT_prior_knowledge(data_train, data_valid, data_test, params):
                 optimizer.zero_grad()
                 with torch.autocast(device_type=device.type, enabled=use_amp):
                     out = model(batch.x,batch.edge_index,batch.batch,None)
-                    loss = F.mse_loss(torch.squeeze(out), batch.y)
+                    if _w_fit is None:
+                        loss = F.mse_loss(torch.squeeze(out), batch.y)
+                    else:
+                        # ver4-25, R8: Sum(w_i*r_i^2)/Sum(w_i) - see
+                        # models/GAT_infinitesimal.py's identical comment.
+                        _sq_err = (torch.squeeze(out) - batch.y) ** 2
+                        loss = (_sq_err * batch.w).sum() / batch.w.sum().clamp_min(1e-12)
                 scaler.scale(loss).backward()
                 scaler.step(optimizer)
                 scaler.update()

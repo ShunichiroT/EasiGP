@@ -1,13 +1,17 @@
 """
 diversity_summary.py
 =====================
-Update ID ver4-9, R5 (design blueprint SS2.2).
+Update ID ver4-9, R5 (design blueprint SS2.2); Update ID ver4-11, R6
+(Requirements.md items 1-2).
 
-Reports the four Diversity Prediction Theorem (DPT) quantities Tomura et
-al. 2026 (`diag010.pdf` Eq. 1 p.7, Eq. 4 p.7) define for an ensemble
-prediction, for EVERY ensemble label found in a run's own `Metric.csv` -
-the naive (equal-weight) ensemble INCLUDED as a first-class row, not a
-special case (see `resolve_ensemble_members()`'s own docstring for why).
+Reports the Diversity Prediction Theorem (DPT) quantities Tomura et al.
+2026 (G3 16(6):jkag090, "Ensemble-based genomic prediction for maize
+flowering time ...", the article shipped alongside this update - Eq. (4)
+p.4 for the three terms, Eq. (5) p.4 for the coefficient of variation)
+define for an ensemble prediction, for EVERY ensemble label found in a
+run's own `Metric.csv` - the naive (equal-weight) ensemble INCLUDED as a
+first-class row, not a special case (see `resolve_ensemble_members()`'s
+own docstring for why).
 
 Computed ENTIRELY from three files a run has already written to disk
 (`Prediction_result_test.csv`, `Weight.csv`, `Metric.csv`) - `GP()` is not
@@ -21,21 +25,82 @@ label, over the TEST split, with `w_i` normalised so `sum(w_i) == 1`,
 (the WEIGHTED mean - see below for why), and `<.>` = mean over
 individuals in the split:
 
-    first_term  = <(M_w - V)^2>                    Many-Model error   (Eq. 1, term 1)
-    second_term = sum_i w_i * <(M_i - V)^2>         Average-Model error (Eq. 1, term 2)
-    third_term  = sum_i w_i * <(M_i - M_w)^2>       Diversity of model predictions (Eq. 1, term 3)
-    ratio_term  = third_term / second_term          Eq. 4, p.7 (blank when second_term == 0)
+    first_term  = <(M_w - V)^2>                    Many-Model error    (Eq. 4, term 1)
+    second_term = sum_i w_i * <(M_i - V)^2>         Average-Model error (Eq. 4, term 2)
+    third_term  = sum_i w_i * <(M_i - M_w)^2>       Diversity of model predictions (Eq. 4, term 3)
+    ratio_term  = third_term / second_term          EasiGP-internal only - NOT in the article, see below
 
 Defining `M_w` as the WEIGHTED mean (not the naive, equal-weight mean
 `models/Nelder_Mead.py::_raw_objective` uses internally) is the design
 decision that makes `first_term == second_term - third_term` an EXACT
 algebraic identity for weighted ensembles as well as naive ones - the
-weighted bias/ambiguity decomposition. Setting `w_i = 1/N` reduces it to
-Eq. 1 verbatim, and makes `first_term` identically equal to that
-scenario's own naive-ensemble MSE (`Metric.csv`'s own MSE for the
-`ensemble`/`ensemble__<algo>` model) - both are enforced as a FATAL
-`ValueError` (the identity) and checked by Phase 3 (the naive-MSE
-equality), never silently allowed to drift.
+weighted bias/ambiguity decomposition (Krogh and Vedelsby 1995), a strict
+generalisation of Eq. (4) to an arbitrary weight vector that sums to 1.
+Setting `w_i = 1/N` reduces it to Eq. (4) verbatim, and makes `first_term`
+identically equal to that scenario's own naive-ensemble MSE (`Metric.csv`'s
+own MSE for the `ensemble`/`ensemble__<algo>` model) - both are enforced
+as a FATAL `ValueError` (the identity) and checked by Phase 3 (the
+naive-MSE equality), never silently allowed to drift.
+
+Requirements.md item 1 - investigation and resolution
+-------------------------------------------------------
+Item 1 asked whether the DPT calculation is "truly correct", flagging
+that `ratio_term` (third/second) is HIGHER for the naive ensemble than
+for a weighted ensemble, and higher even in scenarios where the
+individual models are LESS diverse - both counterintuitive if
+`ratio_term` is read as "the" diversity measure.
+
+The three terms themselves ARE correct: the algebraic identity
+`first_term == second_term - third_term` is derived directly from the
+definition of `M_w` above (it holds for ANY weight vector summing to 1 -
+verified analytically and enforced at runtime in `build_dpt_terms()`
+below, never silently allowed to drift), and reduces exactly to Eq. (4)
+when weights are equal. There is no bug in `first_term`/`second_term`/
+`third_term`.
+
+`ratio_term`, however, is NOT a quantity the article defines (it is an
+EasiGP-internal addition, and the previous revision of this module
+mis-cited it as being from the DPT equation itself) and it is
+mathematically the wrong tool for the two comparisons item 1 makes,
+for two independent reasons that were confirmed numerically:
+
+1. A weighted ensemble's own `w_i` down-weights whichever models
+   contribute most to `third_term` at the SAME time as it down-weights
+   their contribution to `second_term`; concentrating weight onto a
+   subset of models shrinks the weighted ambiguity term (`third_term`)
+   from ANY underlying model set, diverse or not, simply because the
+   models carrying the largest deviations from `M_w` are exactly the
+   ones a good optimiser assigns the least weight. A naive ensemble
+   cannot do this (`w_i` is fixed at `1/N`), so its `third_term` - and
+   hence `ratio_term` - is systematically larger for the SAME
+   underlying models. This alone explains the "naive > weighted"
+   observation without any of the individual models being more or less
+   diverse.
+2. For models whose prediction errors are of similar magnitude,
+   `third_term / second_term` under equal weighting tends toward
+   `(N-1)/N` (a function of the CONTRIBUTING-MODEL COUNT `N` only),
+   essentially independent of how large the disagreement between models
+   actually is - so `ratio_term` alone cannot be trusted to rank
+   "more diverse" against "less diverse" scenarios either.
+
+Neither of these is a computational error - they are real properties of
+a within-scenario RATIO of two already-averaged quantities. This is
+precisely why the article does not use such a ratio to compare diversity
+levels at all: it instead reports the MEAN and the COEFFICIENT OF
+VARIATION (CV, Eq. (5) p.4) of each of the three raw terms, computed
+across a run's own replicate prediction scenarios for one fixed
+weighting scheme - never as a ratio, and never by comparing two
+DIFFERENT weight vectors against each other. Requirements.md item 2's CV
+addition (`DPT_CV_TERMS`, `cv_statistic()`, the `<term> CV` columns/
+blocks below) is that metric, implemented verbatim from Eq. (5), and is
+the scientifically-supported way to compare diversity levels - within
+one ensemble label, across scenarios/phenotypes - that this module now
+provides. `ratio_term` itself is left in place (it remains an
+arithmetically valid quantity some readers may still find useful as a
+per-scenario diagnostic) but is no longer mis-cited as being defined by
+the DPT equation, and this docstring is the authoritative explanation for
+why it should not be used, by itself, to compare diversity ACROSS
+ensemble labels with different weight vectors.
 
 `models/Nelder_Mead.py`, `models/Bayesian_optimisation.py`,
 `models/Linear_transformation.py` and every other weight-optimiser file
@@ -48,6 +113,48 @@ MSE, and the numbers this module reports are NOT expected to equal it
 future run selects - i.e. would change users' results - which is out of
 scope for a reporting-only requirement and would be a silent scientific
 change.
+
+ver4-95 - why a weighted label's terms are smaller than the naive ensemble's
+-------------------------------------------------------------------------------
+Reported again as "the naive ensemble's terms are on a different scale from the weighted
+ones". Re-checked: the arithmetic is the same for every label (`w_i = 1/N` for the naive one,
+the `Weight.csv` row for a weighted one, one code path), and with identical weights the two give
+identical terms. The scale differs because the weights differ: a weighted ensemble (the Super
+learner above all, whose cross-validated weights collapse onto the strongest members) sits close
+to its heaviest members, so both `second_term` (the weighted average member error) and
+`third_term` (the weighted spread of members around `M_w`) fall - `third_term` fastest - while
+`first_term` stays near the naive value. The long sheets now report `n_models` and
+`n_effective = 1 / sum(w_i^2)` next to the terms so this can be read off directly. Two things
+CAN make the comparison unlike-for-like, and are now logged (nothing is recomputed): the two
+labels combining different model sets (e.g. the Super learner leaves bio-prior models out), and a
+label whose own prediction is not the plain weighted sum of the Step 9 member columns in
+`Prediction_result_test.csv` (Super learner refitted on train+valid or pooled, Iterative
+ensemble, Linear-transformation network) - for those `first_term` differs from the MSE of the
+label's own column, and the NOTE says so.
+
+Requirements.md item 2 - coefficient of variation (Eq. 5, p.4)
+------------------------------------------------------------------
+    CV_hat_termj = sigma_termj / mu_termj
+
+where `sigma_termj`/`mu_termj` are the (sample, ddof=1) standard
+deviation and mean of term `j` - `first_term`, `second_term` or
+`third_term` (`DPT_CV_TERMS`; `ratio_term` is excluded, since it is not
+one of the article's own three DPT terms - see the note on `ratio_term`
+above) - taken across every `(population, phenotype, ratio, sample)`
+prediction scenario within whatever group is being summarised (the SAME
+rows `six_statistics()` already summarises with `median`/`mean` for that
+group - `cv_statistic()` below is a sibling estimator over the identical
+grouping, not a re-derivation). Matches the article's own usage exactly
+at the phenotype-only level ("The CV was estimated per trait for each
+dataset") - the wide 'summary' sheet's pivot blocks are grouped by
+`['phenotype', 'model']` alone, precisely that level; the three
+long-format sheets additionally report it at the finer
+phenotype+population and phenotype+population+ratio levels this module
+already breaks every other statistic out at, which is a superset of the
+article's own reporting granularity, not a departure from it. A blank
+(`NaN`) CV means fewer than 2 scenarios contributed, or the term's mean
+was exactly 0 in that group (every contributing model predicted every
+individual perfectly) - never a silently wrong number.
 
 Layout: the same block-stacked "summary" sheet layout R1-R4 introduced in
 `metric_summary.py` (`pivot_data_rows`/`pivot_block_rows`/
@@ -82,6 +189,7 @@ import pandas as pd
 
 from metric_summary import (
     PIVOT_STATISTICS, six_statistics, write_pivot_worksheet, write_pivot_csv,
+    apply_label_style_to_tables,
 )
 from pipeline_utils import canonical_model_order, _is_naive_ensemble_label, _is_wopt_label
 
@@ -122,6 +230,16 @@ def dpt_model_order(model_labels):
 
 DPT_TERMS = ('first_term', 'second_term', 'third_term', 'ratio_term')
 
+# Requirements.md item 2: the three terms Eq. (5) p.4 actually defines a
+# CV for - the article's own equation is over "term j" of Eq. (4), which
+# has exactly three terms. `ratio_term` is an EasiGP-internal addition
+# (see the module docstring's "Requirements.md item 1" section for why it
+# is not a safe cross-ensemble diversity measure) and is deliberately
+# excluded here - a CV of a ratio-of-terms is not the quantity Eq. (5)
+# defines and would invite exactly the same mis-citation this update
+# fixes elsewhere in this module.
+DPT_CV_TERMS = ('first_term', 'second_term', 'third_term')
+
 DPT_TERM_TITLES = {
     'first_term': 'Many-Model error (first term)',
     'second_term': 'Average-Model error (second term)',
@@ -137,31 +255,54 @@ DPT_TERM_TITLES = {
 DPT_SHEET_NAMES = ('phenotype', 'phenotype_population', 'phenotype_population_ratio')
 DPT_LEVEL_KEYS = (('phenotype',), ('phenotype', 'population'), ('phenotype', 'population', 'ratio'))
 
-# The 24 block titles the DPT 'summary' sheet carries - DPT_TERMS outer
-# (in DPT_TERM_TITLES' own human-readable form), PIVOT_STATISTICS inner
-# (the SAME six statistics, same estimator, same rounding/blank rules
-# R1-R4 define - imported from metric_summary, never re-derived).
+# The first 24 of the DPT 'summary' sheet's block titles - DPT_TERMS
+# outer (in DPT_TERM_TITLES' own human-readable form), PIVOT_STATISTICS
+# inner (the SAME six statistics, same estimator, same rounding/blank
+# rules R1-R4 define - imported from metric_summary, never re-derived).
+# 3 more (Requirements.md item 2, Eq. (5) CV) are appended below, making
+# 27 in total.
 DPT_BLOCK_TITLES = tuple(f'{DPT_TERM_TITLES[t]} {s}' for t in DPT_TERMS for s in PIVOT_STATISTICS)
 
+# Requirements.md item 2: three more blocks, ONE per DPT_CV_TERMS, each
+# the Eq. (5) coefficient of variation (`cv_statistic()` below) - APPENDED
+# after the original 24 (never inserted mid-list), so every pre-existing
+# block keeps its own position - the same append-only discipline
+# `HPARAMETERS` fields, `RESULT_FILE_NAMES`, etc. already follow elsewhere
+# in this codebase (architecture doc SS4.4).
+DPT_CV_BLOCK_TITLES = tuple(f'{DPT_TERM_TITLES[t]} CV' for t in DPT_CV_TERMS)
+DPT_BLOCK_TITLES = DPT_BLOCK_TITLES + DPT_CV_BLOCK_TITLES
+
 # The three long-format sheets report a NARROWER subset of the six
-# statistics (median, mean, and the mean's own standard error) per term -
-# the wide 'summary' sheet above is where the full six-statistic,
-# 24-block breakdown lives; the long sheets stay closer to
-# build_metric_summary()'s own precedent (median/mean only, no SE at
-# all) while still surfacing ONE dispersion figure per term.
+# statistics (median, mean, and the mean's own standard error) per term,
+# PLUS (Requirements.md item 2) the Eq. (5) coefficient of variation for
+# the three terms in DPT_CV_TERMS - the wide 'summary' sheet above is
+# where the full six-statistic, 27-block breakdown lives; the long sheets
+# stay closer to build_metric_summary()'s own precedent (median/mean only,
+# no SE at all) while still surfacing ONE dispersion figure (mean SE) and
+# ONE relative-diversity figure (CV) per term.
 _DPT_LONG_STAT_SUFFIXES = ('median', 'mean', 'mean standard error')
 
-DPT_SUMMARY_NOTE = (
-    "Diversity Prediction Theorem terms (Tomura et al. 2026, diag010.pdf Eq. 1 p.7 / Eq. 4 p.7), "
-    "reported on the TEST split using each ensemble's own WEIGHTED mean prediction (naive "
-    "ensembles use equal weight, w_i = 1/N, over their own contributing models - see "
-    "resolve_ensemble_members()). These values are NOT on the same scale as "
-    "models/Nelder_Mead.py's internal optimisation objective (_raw_objective), which is "
-    "evaluated on the VALIDATION split using an EQUAL-weight mean regardless of the candidate "
-    "weight vector - the two are intentionally different quantities and are not expected to "
-    "agree. 'ratio_term' (third/second) is blank, not infinite, whenever the second term is "
-    "exactly zero (every contributing model predicted perfectly for that scenario)."
-)
+# ver4-95: (terms column, aggregation) of the two trailing diagnostic columns of the long
+# sheets - 'n_models median' and 'n_effective mean' (effective number of models, 1 / sum(w^2)).
+_DPT_LONG_EXTRA_COLUMNS = (('n_models', 'median'), ('n_effective', 'mean'))
+
+#DPT_SUMMARY_NOTE = (
+#    "Diversity Prediction Theorem terms (Tomura et al. 2026, G3 16(6):jkag090, Eq. (4) p.4 for "
+#    "the first/second/third term, Eq. (5) p.4 for the coefficient of variation 'CV' blocks/"
+#    "columns), reported on the TEST split using each ensemble's own WEIGHTED mean prediction "
+#    "(naive ensembles use equal weight, w_i = 1/N, over their own contributing models - see "
+#    "resolve_ensemble_members()). These values are NOT on the same scale as "
+#    "models/Nelder_Mead.py's internal optimisation objective (_raw_objective), which is "
+#   "evaluated on the VALIDATION split using an EQUAL-weight mean regardless of the candidate "
+#    "weight vector - the two are intentionally different quantities and are not expected to "
+#    "agree. 'ratio_term' (third/second) is an EasiGP-internal addition, NOT defined by the "
+#    "article, and is blank, not infinite, whenever the second term is exactly zero (every "
+#    "contributing model predicted perfectly for that scenario); it should NOT, by itself, be "
+#    "used to compare diversity levels across ensemble labels that use different weight vectors "
+#    "(e.g. naive vs weighted) - see this module's own docstring ('Requirements.md item 1') for "
+#   "why, and use the 'CV' blocks/columns instead, exactly as Eq. (5) defines them. A blank "
+#    "'CV' cell means fewer than 2 contributing scenarios, or a mean of exactly 0, in that group."
+#)
 
 # The five metadata columns of Weight.csv / Metric.csv that are never
 # themselves a contributing-model column.
@@ -187,13 +328,87 @@ _PREDICTION_TEST_METADATA_COLS = ('id', 'population', 'ratio', 'phenotype', 'sam
 # this too, but only when a same-tuning-group weighted label happens to
 # also be present - this list closes the gap unconditionally, at the
 # source, rather than relying solely on that cross-check).
-_WOPT_COLUMN_PREFIXES = ('Linear transformation', 'Nelder-Mead', 'Bayesian', 'Analytic least-squares')
+# ver4-26, R2/R_last item 6: 'Joint Bayesian' appended - the new
+# JOINT_W_OPT combination method's own prediction-column name
+# (genomic_prediction.py's new Step 11 `elif` branch writes
+# `result_{test,valid,train}_sample['Joint Bayesian'] = ...`), distinct
+# from its record/effect/weight 'model' LABEL ('Joint Bayesian
+# optimisation' - see pipeline_utils._WOPT_LABEL_PREFIXES), matching the
+# SAME label-vs-column distinction 'Bayesian optimisation'/'Bayesian'
+# already establishes just above.
+# ver4-57, R2: 'Iterative ensemble' appended - the opt-in iterative ensemble's prediction column
+# carries the same name as its record/effect/weight label (genomic_prediction.py Step 11c).
+# ver4-77, R2: 'Super learner' appended - the opt-in Super learner's prediction column carries the
+# same name as its record/effect/weight label (genomic_prediction.py Step 11d).
+_WOPT_COLUMN_PREFIXES = (
+    'Linear transformation', 'Nelder-Mead', 'Bayesian', 'Analytic least-squares', 'Joint Bayesian',
+    'Iterative ensemble', 'Super learner',
+)
 
 
 def _is_wopt_column(name) -> bool:
     return isinstance(name, str) and any(
         name == p or name.startswith(p + '__') for p in _WOPT_COLUMN_PREFIXES
     )
+
+
+# ver4-95: record/weight 'model' LABEL -> Prediction_result_test.csv COLUMN, for the two weighted
+# methods whose column name differs from their label (see _WOPT_COLUMN_PREFIXES above).
+_WOPT_LABEL_TO_COLUMN = {
+    'Nelder Mead': 'Nelder-Mead', 'Bayesian optimisation': 'Bayesian',
+    'Joint Bayesian optimisation': 'Joint Bayesian',
+}
+
+
+def _label_prediction_column(label, columns):
+    """The ``Prediction_result_test.csv`` column holding ensemble label ``label``'s OWN test
+    prediction, or ``None`` when it is not there. Used only by the first-term consistency check
+    in `build_dpt_terms()`."""
+    if label in columns:
+        return label
+    base, sep, suffix = str(label).partition('__')
+    mapped = _WOPT_LABEL_TO_COLUMN.get(base)
+    if mapped is not None:
+        candidate = mapped + (sep + suffix if sep else '')
+        if candidate in columns:
+            return candidate
+    return None
+
+
+def cv_statistic(grouped: "pd.core.groupby.DataFrameGroupBy", value_col: str) -> "pd.Series":
+    """Requirements.md item 2 - Eq. (5), p.4:
+
+        CV_hat_termj = sigma_termj / mu_termj
+
+    A sibling estimator to `metric_summary.six_statistics()`, over the
+    IDENTICAL grouping (same `grouped` object, same `value_col` - one of
+    `DPT_CV_TERMS`): `sigma_termj` is the (sample, ddof=1) standard
+    deviation of `value_col` within each group, `mu_termj` its mean - both
+    computed across every `(population, phenotype, ratio, sample)`
+    prediction scenario row that falls in that group (never across models,
+    never within a single scenario - see the module docstring's
+    "Requirements.md item 2" section for why this is the correct
+    granularity, matching the article's own "per trait" usage exactly at
+    the phenotype-only grouping).
+
+    Blank (`NaN`), never `inf`/silently wrong, when:
+      - fewer than 2 non-NaN observations contributed to the group
+        (a CV, like a standard error, is undefined for `n_eff < 2`);
+      - the group's mean is exactly 0 (division by zero - the DPT terms
+        are sums/means of squared errors, so this only occurs when every
+        contributing model predicted every individual in every scenario
+        of the group perfectly).
+
+    Rounded to 6 dp, matching `six_statistics()`'s own numeric statistics
+    (never left for a caller to round, for the same reason that function
+    documents).
+    """
+    count = grouped[value_col].count()
+    mean = grouped[value_col].mean()
+    std = grouped[value_col].std(ddof=1)
+    _enough = (count >= 2) & mean.notna() & (mean != 0)
+    return (std / mean).where(_enough).round(6)
+
 
 _TERM_SCENARIO_KEYS = ('population', 'phenotype', 'ratio', 'sample')
 
@@ -330,20 +545,74 @@ def resolve_ensemble_members(
         print(f"[diversity_summary] Resolved ensemble label {label!r} ({source}): "
               f"{len(models)} contributing model(s): {models}.")
 
+    # ver4-95: terms of two labels are only on a common footing when they average over the SAME
+    # models. The same-tuning-group cross-check above cannot see a Super learner row (its label
+    # suffix is the weight METHOD, not a tuning group), and the Super learner leaves bio-prior
+    # models out (never fitted out of fold), so say plainly when a naive label and a weighted
+    # label do not share their member set - that alone moves every term.
+    for naive_label, naive_info in members.items():
+        if not naive_info['is_naive']:
+            continue
+        for weighted_label, weighted_info in members.items():
+            if weighted_info['is_naive']:
+                continue
+            only_naive = sorted(set(naive_info['models']) - set(weighted_info['models']))
+            only_weighted = sorted(set(weighted_info['models']) - set(naive_info['models']))
+            if only_naive or only_weighted:
+                print(f"[diversity_summary] NOTE: {naive_label!r} ({len(naive_info['models'])} "
+                      f"models) and {weighted_label!r} ({len(weighted_info['models'])} models) "
+                      f"do not combine the same models - only in {naive_label!r}: {only_naive}; "
+                      f"only in {weighted_label!r}: {only_weighted}. Their DPT terms are over "
+                      f"different model sets, so their scales are not directly comparable.")
+
     return members
 
 
 def build_dpt_terms(
     prediction_test: "pd.DataFrame", weight: "pd.DataFrame", metric: "pd.DataFrame",
+    *, sample_weight_resolver=None,
 ) -> "pd.DataFrame":
     """PURE. One row per `(population, phenotype, ratio, sample, model)`
     for every ensemble label `resolve_ensemble_members()` resolves (naive
     included - it goes through this IDENTICAL path, not a separate
     branch: `w_i = 1/N` is simply what gets substituted for its weight
     vector). Columns: `population, phenotype, ratio, sample, model,
-    n_models, first_term, second_term, third_term, ratio_term`. Empty
+    n_models, first_term, second_term, third_term, ratio_term,
+    n_effective` (ver4-95: `n_effective = 1 / sum(w_i^2)`, the effective
+    number of models; `n_models` for the naive ensemble). Empty
     frame in (either `prediction_test` or `metric`) -> empty frame out;
     never raises for that reason.
+
+    sample_weight_resolver : ver4-25, R8 (design blueprint SS2, Stage 6;
+        Stage 6 completion for 'full' mode) - optional callable, called
+        per scenario as `sample_weight_resolver(population, phenotype,
+        ratio, sample, ids=<this scenario's own group['id'] list>)`
+        (mirroring `models/ensemble.py::_metric()`'s own
+        `asreml_accuracy_ctx_resolver` call convention exactly, `ids=`
+        included). Returns either `None` (nothing resolved), a ctx-shaped
+        dict with `'test_weights'` (`{id: weight}`, diagonal mode) and/or
+        `'test_weight_matrix'` (`(W, id_list)`, full mode) keys - or, for
+        backward compatibility with a resolver written before the
+        'full'-mode extension, a BARE `{id: weight}` dict (treated
+        identically to a ctx dict's own `'test_weights'` entry). A
+        resolver that raises `TypeError` on the `ids=` keyword (an even
+        older-style resolver) is retried with the original 4-positional-
+        argument call - see `models/ensemble.py::_metric()`'s identical
+        fallback for the full rationale. `None` (the default - every
+        pre-ver4-25 caller) is a byte-identical `np.mean(...)`-based
+        computation throughout (I11).
+
+        Turns every `<...>` mean-over-TEST-individuals in the three DPT
+        terms into the SAME `mean_W(...)` blueprint SS2 R8 defines for
+        every other weighted metric this run reports (diagonal: a 1-D
+        `w`; full: a dense `W`, via `1'Wa / 1'W1`) - NOT to be confused
+        with `w`, the per-scenario ENSEMBLE COMBINING weight vector
+        (naive `1/N`, or a fitted weighted-ensemble method's own
+        `Weight.csv` row) computed just below, which is a completely
+        different, unrelated quantity. A scenario with no resolvable
+        weight (weighting off, or a resolver miss) falls back to the
+        SAME unweighted computation automatically - never fatal, never
+        silently wrong.
 
     Raises
     ------
@@ -352,7 +621,10 @@ def build_dpt_terms(
         `1e-9 * max(1.0, abs(second_term))` - an ARITHMETIC INVARIANT, not
         a data condition (see the module docstring for why `M_w` is
         defined as the weighted mean specifically so this identity always
-        holds). A violation means the contributing-model set or the
+        holds - this holds under ANY PSD per-individual weighting too,
+        including the `mean_W` this function now optionally applies, per
+        blueprint SS2 R8's own "the DPT identity holds exactly under any
+        PSD W" note). A violation means the contributing-model set or the
         weights were resolved incorrectly for that scenario/label, and
         silently writing the resulting number would put a wrong value in
         a published table - this fails loudly instead, naming the
@@ -361,7 +633,7 @@ def build_dpt_terms(
         (architecture doc SS4.3).
     """
     columns = ['population', 'phenotype', 'ratio', 'sample', 'model', 'n_models',
-               'first_term', 'second_term', 'third_term', 'ratio_term']
+               'first_term', 'second_term', 'third_term', 'ratio_term', 'n_effective']
     if prediction_test is None or prediction_test.shape[0] == 0 or metric is None or metric.shape[0] == 0:
         return pd.DataFrame(columns=columns)
 
@@ -375,11 +647,97 @@ def build_dpt_terms(
         weight_indexed = weight.set_index(_index_cols)
 
     rows: "list[dict]" = []
+    _own_mse_mismatch: "dict[str, list]" = {}     # label -> [scenarios checked, mismatching]
     _zero_second_term_count = 0
+    _weighted_scenario_count = 0
+    _full_weighted_scenario_count = 0
+
+    def _resolve_scenario_weighting(pop, phen, rat, samp, ids):
+        """`(w, W)` - exactly one of the two is non-`None` (or both
+        `None`, unweighted) - see `sample_weight_resolver`'s own
+        docstring above for every shape this tolerates."""
+        if sample_weight_resolver is None:
+            return None, None
+        try:
+            _res = sample_weight_resolver(pop, phen, rat, samp, ids=ids)
+        except TypeError:
+            try:
+                _res = sample_weight_resolver(pop, phen, rat, samp)
+            except Exception:
+                return None, None
+        except Exception:
+            return None, None
+        if not _res:
+            return None, None
+        if isinstance(_res, dict) and ('test_weights' in _res or 'test_weight_matrix' in _res):
+            _matrix = _res.get('test_weight_matrix')
+            if _matrix is not None:
+                return None, _matrix
+            return (_res.get('test_weights') or None), None
+        # Backward compatibility: a bare {id: weight} dict, the
+        # resolver's own pre-Stage-6-completion contract.
+        return (_res or None), None
 
     for scenario_key, group in prediction_test.groupby(list(_TERM_SCENARIO_KEYS), sort=False, dropna=False):
         pop, phen, rat, samp = scenario_key
         actual = group['actual'].to_numpy(dtype=float)
+
+        # ver4-25, R8: resolved ONCE per scenario (not per label - every
+        # ensemble label sharing this scenario's own test individuals
+        # uses the SAME BLUE-reliability weight, per Fairness Principle
+        # P8). `None` whenever the resolver is absent, has nothing for
+        # this scenario, or 'id' is missing from `prediction_test` (an
+        # older run's own file shape) - falls back to unweighted below.
+        blue_w = None
+        blue_W = None
+        if sample_weight_resolver is not None and 'id' in group.columns:
+            _ids_for_scenario = [str(_id) for _id in group['id']]
+            _w_by_id, _matrix_info = _resolve_scenario_weighting(pop, phen, rat, samp, _ids_for_scenario)
+            if _matrix_info is not None:
+                _Wfull, _mids = _matrix_info
+                # `_mids` is `_ids_for_scenario`'s own order by
+                # construction (the exact `ids` just passed to the
+                # resolver above) - no re-alignment needed.
+                if _Wfull is not None:
+                    blue_W = np.asarray(_Wfull, dtype=float)
+                    _weighted_scenario_count += 1
+                    _full_weighted_scenario_count += 1
+            elif _w_by_id:
+                _w_arr = np.array([_w_by_id.get(str(_id), np.nan) for _id in group['id']], dtype=float)
+                if np.all(np.isfinite(_w_arr)) and float(np.sum(_w_arr)) > 0:
+                    blue_w = _w_arr
+                    _weighted_scenario_count += 1
+
+        def _wmean(values):
+            """Scalar mean_W over TEST individuals - `values` is a
+            (n_individuals,) array; byte-identical `np.mean()` when
+            neither `blue_w` nor `blue_W` is set (I11). `blue_W` (dense,
+            full mode) takes precedence over `blue_w` (diagonal) - the
+            two are never both set for the same scenario by construction
+            (`_resolve_scenario_weighting()` returns at most one)."""
+            if blue_W is not None:
+                ones = np.ones(len(values))
+                denom = float(ones @ blue_W @ ones)
+                if not np.isfinite(denom) or denom == 0:
+                    return float(np.mean(values))
+                return float(ones @ blue_W @ values) / denom
+            if blue_w is None:
+                return float(np.mean(values))
+            return float(np.sum(blue_w * values)) / float(np.sum(blue_w))
+
+        def _wmean_cols(matrix):
+            """Per-column mean_W over TEST individuals - `matrix` is
+            (n_individuals, n_models); byte-identical `np.mean(...,
+            axis=0)` when neither `blue_w` nor `blue_W` is set (I11)."""
+            if blue_W is not None:
+                ones = np.ones(matrix.shape[0])
+                denom = float(ones @ blue_W @ ones)
+                if not np.isfinite(denom) or denom == 0:
+                    return np.mean(matrix, axis=0)
+                return (ones @ blue_W @ matrix) / denom
+            if blue_w is None:
+                return np.mean(matrix, axis=0)
+            return (blue_w[:, None] * matrix).sum(axis=0) / np.sum(blue_w)
 
         for label, info in members.items():
             model_cols = info['models']
@@ -426,10 +784,10 @@ def build_dpt_terms(
                 w = w_raw / w_sum
 
             weighted_mean = preds @ w  # (n_individuals,)
-            first_term = float(np.mean((weighted_mean - actual) ** 2))
-            per_model_mse = np.mean((preds - actual[:, None]) ** 2, axis=0)
+            first_term = _wmean((weighted_mean - actual) ** 2)
+            per_model_mse = _wmean_cols((preds - actual[:, None]) ** 2)
             second_term = float(np.dot(w, per_model_mse))
-            per_model_div = np.mean((preds - weighted_mean[:, None]) ** 2, axis=0)
+            per_model_div = _wmean_cols((preds - weighted_mean[:, None]) ** 2)
             third_term = float(np.dot(w, per_model_div))
 
             residual = abs(first_term - (second_term - third_term))
@@ -452,17 +810,57 @@ def build_dpt_terms(
             else:
                 ratio_term = third_term / second_term
 
+            # ver4-95: effective number of models, 1 / sum(w_i^2) (= N for equal weights, 1 when
+            # one model carries all the weight). The terms of a weighted label shrink with it
+            # (a concentrated ensemble sits close to its heaviest members, so both the
+            # average-model error and the diversity term fall) - this is what separates a
+            # weighted label's scale from the naive one's on the SAME models.
+            n_effective = float(1.0 / np.sum(w ** 2))
+
+            # ver4-95: consistency check, log only. For an ensemble that is exactly the weighted
+            # sum of the member columns in this file, first_term must equal the MSE of its OWN
+            # prediction column. It does not for a Super learner refitted on train+valid, a pooled
+            # Super learner row, an Iterative ensemble or a Linear-transformation network: their
+            # weights apply to refitted / transformed predictions that are not in the file, so the
+            # terms describe the Step 9 columns re-combined, not the ensemble's own prediction.
+            # Skipped under BLUE weighting (the file's MSE is then a weighted one).
+            if blue_w is None and blue_W is None:
+                own_col = _label_prediction_column(label, group.columns)
+                if own_col is not None:
+                    own_mse = float(np.mean((group[own_col].to_numpy(dtype=float) - actual) ** 2))
+                    seen = _own_mse_mismatch.setdefault(label, [0, 0])
+                    seen[0] += 1
+                    if abs(first_term - own_mse) > 1e-6 * max(1.0, abs(own_mse)):
+                        seen[1] += 1
+
             rows.append({
                 'population': pop, 'phenotype': phen, 'ratio': rat, 'sample': samp,
                 'model': label, 'n_models': n_models,
                 'first_term': first_term, 'second_term': second_term,
                 'third_term': third_term, 'ratio_term': ratio_term,
+                'n_effective': n_effective,
             })
 
     if _zero_second_term_count:
         print(f"[diversity_summary] NOTE: {_zero_second_term_count} scenario/label row(s) had a "
               f"second_term of exactly 0 (every contributing model predicted perfectly) - "
               f"'ratio_term' left blank for those rows rather than reporting infinity.")
+    for _label, (_checked, _bad) in _own_mse_mismatch.items():
+        if _bad:
+            print(f"[diversity_summary] NOTE: for {_bad} of {_checked} scenario(s) of {_label!r} "
+                  f"the first term (MSE of the member columns combined with this label's weights) "
+                  f"differs from the MSE of the label's own prediction column. The label's "
+                  f"prediction was not formed as a plain weighted sum of the Step 9 member "
+                  f"columns in Prediction_result_test.csv (e.g. a Super learner refitted on "
+                  f"train+valid, its pooled row, an Iterative ensemble or a Linear-"
+                  f"transformation network), or the member set differs; its DPT terms describe "
+                  f"those columns re-combined with its weights.")
+    if sample_weight_resolver is not None:
+        print(f"[diversity_summary] BLUE-reliability weighting resolver was given - "
+              f"{_weighted_scenario_count} scenario(s) had a usable weight and were computed with "
+              f"mean_W ({_full_weighted_scenario_count} of those via a dense 'full'-mode matrix, "
+              f"the rest via a diagonal 'w' vector); every other scenario fell back to the "
+              f"ordinary unweighted mean.")
 
     return pd.DataFrame(rows, columns=columns) if rows else pd.DataFrame(columns=columns)
 
@@ -475,15 +873,22 @@ def build_dpt_summary(
     `long_sheets` - keyed by `DPT_SHEET_NAMES`, one row per level-key x
         model, columns `<level keys...>, model, n`, then
         `f'{term} {stat}'` for every `term` in `DPT_TERMS` and `stat` in
-        `_DPT_LONG_STAT_SUFFIXES` (median/mean/mean standard error) -
-        `n` is the plain row count for that group (matching
+        `_DPT_LONG_STAT_SUFFIXES` (median/mean/mean standard error),
+        THEN (Requirements.md item 2) `f'{term} CV'` for every `term` in
+        `DPT_CV_TERMS` (Eq. (5), via `cv_statistic()` - APPENDED after the
+        `_DPT_LONG_STAT_SUFFIXES` columns, never interleaved with them, so
+        every pre-existing column keeps its own position) - `n` is the
+        plain row count for that group (matching
         `metric_summary.build_metric_summary()`'s own `n` convention,
         never `n_eff`).
-    `pivot_blocks` - keyed by `DPT_BLOCK_TITLES` (the 24 block titles),
-        phenotype-indexed, ensemble-model-columned, using the SAME six
-        statistics `metric_summary.six_statistics()` computes (identical
-        estimator, identical rounding, identical blank rules - imported,
-        not re-derived).
+    `pivot_blocks` - keyed by `DPT_BLOCK_TITLES` (27 block titles: the
+        original 24, PLUS 3 Eq. (5) CV blocks - Requirements.md item 2 -
+        APPENDED after them), phenotype-indexed, ensemble-model-columned,
+        using the SAME six statistics `metric_summary.six_statistics()`
+        computes (identical estimator, identical rounding, identical
+        blank rules - imported, not re-derived) plus `cv_statistic()`
+        (this module's own sibling estimator, same grouping) for the 3
+        CV blocks.
 
     `model_order` : the exact ensemble-label column order for
         `pivot_blocks` (and the model row order within each `long_sheets`
@@ -522,6 +927,23 @@ def build_dpt_summary(
                 merge_frame = stats[stat_name].rename(col_name).reset_index()
                 wide = wide.merge(merge_frame, on=group_cols, how='left')
 
+        # Requirements.md item 2: the Eq. (5) CV columns, ONE per
+        # DPT_CV_TERMS - appended after every _DPT_LONG_STAT_SUFFIXES
+        # column above (never interleaved), matching col_order below.
+        for term in DPT_CV_TERMS:
+            col_name = f'{term} CV'
+            merge_frame = cv_statistic(_grouped_for_stats, term).rename(col_name).reset_index()
+            wide = wide.merge(merge_frame, on=group_cols, how='left')
+
+        # ver4-95: how many models the label combines, and how many of them effectively carry
+        # the weight (1 / sum(w^2)): APPENDED after the CV columns, never interleaved. A weighted
+        # label with n_effective well below n_models is close to its heaviest members, which is
+        # why its second and third terms are smaller than the naive ensemble's on the same models.
+        for extra_col, how in _DPT_LONG_EXTRA_COLUMNS:
+            extra = getattr(_grouped_for_stats[extra_col], how)().round(3)
+            wide = wide.merge(extra.rename(f'{extra_col} {how}').reset_index(),
+                              on=group_cols, how='left')
+
         sort_keys = wide[list(keys)].astype(str).copy()
         sort_keys['_model_rank'] = wide['model'].map(model_rank)
         order = sort_keys.sort_values(by=list(keys) + ['_model_rank'], kind='mergesort').index
@@ -529,7 +951,7 @@ def build_dpt_summary(
 
         col_order = list(keys) + ['model', 'n'] + [
             f'{t} {s}' for t in DPT_TERMS for s in _DPT_LONG_STAT_SUFFIXES
-        ]
+        ] + [f'{t} CV' for t in DPT_CV_TERMS] + [f'{c} {h}' for c, h in _DPT_LONG_EXTRA_COLUMNS]
         long_sheets[sheet_name] = wide[col_order]
 
     grouped_pm = terms.groupby(['phenotype', 'model'], sort=False, dropna=False)
@@ -543,15 +965,30 @@ def build_dpt_summary(
             pivot.columns.name = 'model'
             pivot_blocks[f'{DPT_TERM_TITLES[term]} {stat}'] = pivot
 
+    # Requirements.md item 2: 3 more blocks, ONE per DPT_CV_TERMS, the
+    # Eq. (5) coefficient of variation - grouped identically
+    # (['phenotype', 'model']) to every block above, and to the article's
+    # own "per trait" usage. Appended after the 24 blocks above so their
+    # own dict insertion order - and hence DPT_BLOCK_TITLES' matching
+    # order - is preserved.
+    for term in DPT_CV_TERMS:
+        cv_series = cv_statistic(grouped_pm, term)
+        pivot = cv_series.unstack('model')
+        pivot = pivot.reindex(index=phenotype_order, columns=_order)
+        pivot.index.name = 'phenotype'
+        pivot.columns.name = 'model'
+        pivot_blocks[f'{DPT_TERM_TITLES[term]} CV'] = pivot
+
     return long_sheets, pivot_blocks
 
 
 def write_dpt_summary(
     terms: "pd.DataFrame", RESULT_NAME: str, *, create: bool = True,
     model_order: "list[str] | None" = None,
+    label_style: str = 'full',
 ) -> "list[str]":
     """Writes `Result/<RESULT_NAME>/Diversity_prediction_theorem.xlsx` -
-    'summary' sheet FIRST (the 24 blocks, `DPT_BLOCK_TITLES`), then the
+    'summary' sheet FIRST (the 27 blocks, `DPT_BLOCK_TITLES`), then the
     three long sheets (`DPT_SHEET_NAMES`) - mirroring
     `metric_summary.write_metric_summary()`'s own layout exactly.
     Degrades to `Diversity_prediction_theorem.csv` (the pivot table) plus
@@ -571,6 +1008,11 @@ def write_dpt_summary(
     _raw_objective`'s own internal value - see the module docstring and
     `DPT_SUMMARY_NOTE` (appended as a trailing row of the 'summary'
     sheet/CSV) for the full explanation.
+
+    `label_style` (ver4-95, config key `MODEL_LABEL_STYLE`): 'full' (default, unchanged) or 'short';
+    'short' drops the ``'Super learner__'`` prefix from the model labels written to the sheets /
+    CSVs (`pipeline_utils.display_label_map`; a label whose short text would clash keeps its full
+    text). The terms themselves are never recomputed.
     """
     if not create:
         return []
@@ -583,6 +1025,9 @@ def write_dpt_summary(
     long_sheets, pivot_blocks = build_dpt_summary(terms, model_order=model_order)
     _pivot_model_order = model_order if model_order is not None else pd.unique(terms['model']).tolist()
     _pivot_model_order = canonical_model_order(_pivot_model_order)
+    # ver4-95: order / aggregation fixed on the full labels; only the written text is shortened
+    long_sheets, pivot_blocks, _pivot_model_order = apply_label_style_to_tables(
+        long_sheets, pivot_blocks, _pivot_model_order, label_style)
     result_dir = './Result/' + RESULT_NAME + '/'
     os.makedirs(result_dir, exist_ok=True)
 
@@ -597,7 +1042,7 @@ def write_dpt_summary(
                 long_sheets[sheet_name].to_excel(writer, sheet_name=sheet_name, index=False)
             if pivot_blocks:
                 write_pivot_worksheet(writer.book, pivot_blocks, _pivot_model_order, sheet_name='summary',
-                                       block_titles=DPT_BLOCK_TITLES, note=DPT_SUMMARY_NOTE)
+                                       block_titles=DPT_BLOCK_TITLES)#, note=DPT_SUMMARY_NOTE)
         print(f"[diversity_summary] Diversity Prediction Theorem summary written: {xlsx_path}")
         return [xlsx_path]
     except (ImportError, ValueError):
@@ -605,7 +1050,7 @@ def write_dpt_summary(
         if pivot_blocks:
             pivot_path = f'{result_dir}Diversity_prediction_theorem.csv'
             write_pivot_csv(pivot_blocks, _pivot_model_order, pivot_path,
-                             block_titles=DPT_BLOCK_TITLES, note=DPT_SUMMARY_NOTE)
+                             block_titles=DPT_BLOCK_TITLES)#, note=DPT_SUMMARY_NOTE)
             csv_paths.append(pivot_path)
         for sheet_name in DPT_SHEET_NAMES:
             path = f'{result_dir}Diversity_prediction_theorem_{sheet_name}.csv'

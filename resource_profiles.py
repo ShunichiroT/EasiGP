@@ -128,22 +128,39 @@ OTHER (none of them are about the underlying per-model cost table):
    explicit note explaining why, rather than silently guessing.
 
 --------------------------------------------------------------------------
-ver4-4 Stage 6 (RK-6) - suggest_compute_layout() is UNREFERENCED.
+ver4-4 Stage 6 (RK-6) - suggest_compute_layout() was UNREFERENCED (stale).
 --------------------------------------------------------------------------
 ``suggest_compute_layout()`` (and the model-capability tables/
-``_shapley_enabled()`` immediately above it) has no caller anywhere in
-this codebase as of ``ver4-4`` - the GUI panel that used to call it was
-deleted in Stage 2 (R2). See that function's own docstring for the full
-disclosure; kept updated (not deleted) as reference material / a possible
-future re-integration point only.
+``_shapley_enabled()`` immediately above it) had no caller as of ``ver4-4``
+(the GUI panel that used to call it was deleted in Stage 2, R2). That is no
+longer true: ``estimate_resources()`` calls it for its ``coordinated_*``
+keys. ver4-56 corrected this note; the function itself is unchanged.
+
+--------------------------------------------------------------------------
+ver4-56 (R3) - MEASURED, calibrated recommendation (``estimate_resources_calibrated``).
+--------------------------------------------------------------------------
+``estimate_resources()`` above is an unmeasured static heuristic (defects
+E1-E9 of the ver4-56 blueprint: ncpus unrelated to the worker layout, two
+disagreeing memory figures, a GPU requested on a CPU run, no walltime, ...).
+It is kept UNCHANGED so ``RESOURCE_ADVISOR.engine = 'legacy'`` reproduces
+today's numbers exactly. ``estimate_resources_calibrated()`` (end of this
+file) is the replacement: it prices every task of the real run with the
+per-model predictions of ``resource_calibration`` (fitted from
+``resource_telemetry`` records) and picks ONE coherent
+(batch size, workers, threads) layout, so that ``ncpus == workers x threads``,
+one memory figure covers all workers, ``ngpus == 0`` on a CPU run, and a
+walltime comes with it.
 """
 
 from __future__ import annotations
 
+import heapq
 import math
-from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
-from pipeline_utils import cheap_marker_and_sample_counts
+import numpy as np
+
+from pipeline_utils import cheap_marker_and_sample_counts, iter_ens_fit_estimate, sl_fit_estimate
 # ver4-4 Stage 6 (R3.f/R3.g blueprint §10 checklist - rewrite
 # _N_JOBS_CAPABLE_MODELS/tier logic): reused, never re-derived (the same
 # "one implementation, no drift" discipline architecture doc §8 already
@@ -431,6 +448,12 @@ HPC_RESOURCE_PROFILES: Dict[str, Dict[str, object]] = {
     'NCI Gadi': {
         'max_array_subjobs': _GADI_MAX_ARRAY_SUBJOBS,
         'ncpus_per_gpu': _GADI_GPU_NCPUS_PER_GPU,
+        # ver4-56 (R3) node limits used ONLY by estimate_resources_calibrated();
+        # None = unconstrained. Gadi figures are the 'normal'/'gpuvolta' queue
+        # values as understood when this was written - NOT authoritative:
+        # VERIFY against the current NCI documentation (blueprint risk register).
+        'cores_per_node': 48, 'mem_per_node_gb': 190.0, 'max_walltime_h': 48.0,
+        'charge_mem_per_cpu_gb': 4.0, 'gpus_per_node': 4,
         'note': (
             "NCI Gadi's gpuvolta queue requires ncpus to be a multiple of "
             f"{_GADI_GPU_NCPUS_PER_GPU} per GPU requested; PBS/NCI job arrays are capped at "
@@ -440,6 +463,10 @@ HPC_RESOURCE_PROFILES: Dict[str, Dict[str, object]] = {
     'UQ Bunya': {
         'max_array_subjobs': 1001,
         'ncpus_per_gpu': 0,
+        # ver4-56 (R3): no verified node limits yet -> unconstrained (None). Enter
+        # real values through the Custom profile inputs until they are verified.
+        'cores_per_node': None, 'mem_per_node_gb': None, 'max_walltime_h': None,
+        'charge_mem_per_cpu_gb': None, 'gpus_per_node': None,
         'note': (
             "UQ Bunya's GPU-node CPU count varies by node type (no single fixed "
             "CPUs-per-GPU ratio, unlike Gadi) - no automatic ncpus floor is applied; the "
@@ -450,6 +477,8 @@ HPC_RESOURCE_PROFILES: Dict[str, Dict[str, object]] = {
     'Generic / other HPC': {
         'max_array_subjobs': 1000,
         'ncpus_per_gpu': 0,
+        'cores_per_node': None, 'mem_per_node_gb': None, 'max_walltime_h': None,
+        'charge_mem_per_cpu_gb': None, 'gpus_per_node': None,
         'note': (
             "No cluster-specific limits are known for this profile - verify your own "
             "scheduler's job-array cap and CPUs-per-GPU ratio, or pick 'Custom' to enter "
@@ -496,6 +525,46 @@ def resolve_hpc_profile(
         else int(profile['ncpus_per_gpu'])
     )
     return max_array_subjobs, ncpus_per_gpu, str(profile.get('note', '')), resolved_name
+
+
+_HPC_LIMIT_KEYS = ('cores_per_node', 'mem_per_node_gb', 'max_walltime_h',
+                   'charge_mem_per_cpu_gb', 'gpus_per_node')
+
+
+def resolve_hpc_limits(
+    hpc_profile: Optional[str] = None,
+    overrides: Optional[Mapping[str, object]] = None,
+) -> Dict[str, object]:
+    """ver4-56 (R3): the node limits ``estimate_resources_calibrated`` plans within.
+
+    Why a separate function: ``resolve_hpc_profile()`` returns a fixed 4-tuple
+    that existing callers unpack, so the new limits are exposed here instead
+    (blueprint deviation, Change Summary section 7).
+
+    Args:
+        hpc_profile: a key of ``HPC_RESOURCE_PROFILES``; anything else falls
+            back to ``DEFAULT_HPC_PROFILE`` (same rule as ``resolve_hpc_profile``).
+        overrides: optional ``{limit: value}`` (the GUI 'Custom' inputs); a key
+            present here wins over the profile for that ONE limit, a value of
+            ``None`` means 'unconstrained'.
+
+    Returns:
+        ``{'profile', 'max_array_subjobs', 'ncpus_per_gpu', 'cores_per_node',
+        'mem_per_node_gb', 'max_walltime_h', 'charge_mem_per_cpu_gb',
+        'gpus_per_node'}``; every limit is a number or ``None`` (no limit).
+    """
+    max_array, per_gpu, _note, name = resolve_hpc_profile(
+        hpc_profile,
+        (overrides or {}).get('max_array_subjobs'),
+        (overrides or {}).get('ncpus_per_gpu'),
+    )
+    profile = HPC_RESOURCE_PROFILES[name]
+    limits: Dict[str, object] = {'profile': name, 'max_array_subjobs': max_array,
+                                 'ncpus_per_gpu': per_gpu}
+    for key in _HPC_LIMIT_KEYS:
+        value = (overrides or {})[key] if key in (overrides or {}) else profile.get(key)
+        limits[key] = float(value) if value is not None else None
+    return limits
 
 
 # Additional Requirements 9, Requirement 1 - how far around the workload-
@@ -856,23 +925,49 @@ def compute_total_tasks(
     n_ratio: int,
     sample_num: int,
     w_opt_enabled: bool = False,
+    # Requirements.md (between-prediction validation-set patch), items
+    # 1-4. ``between_validation_source`` default ``None`` ("not
+    # specified") reproduces this function's exact pre-patch behaviour
+    # (I11) - a 'between' run's task count was inferred purely from
+    # ``w_opt_enabled``. Passing an explicit source (from the new GUI
+    # checkbox/radio) makes it authoritative instead, matching
+    # ``genomic_prediction.py::GP()``'s own decoupled resolution.
+    between_validation_source: Optional[str] = None,
+    n_between_ratio: int = 1,
+    n_excluded_combinations: int = 0,
 ) -> int:
     """Total scenario count, computed purely from config (architecture doc
     §6) - zero data I/O. Mirrors ``genomic_prediction.py::GP()``'s own
-    ``sample`` table construction closely enough for an estimate (the
-    'between' population-pair/triple counting is an approximation when
-    ``n_population`` is small, since GP() enforces all-distinct triples
-    when a validation split/W_OPT is requested - see architecture doc §6);
+    ``sample`` table construction (including the between-prediction
+    validation-set patch's three ``BETWEEN_VALIDATION_SOURCE`` shapes);
     always a task-COUNT purely for resourcing purposes, never used to
     build the actual scenario list itself."""
     if scenario == 'between':
         if n_population < 2:
             return 0
-        if w_opt_enabled and n_population >= 3:
+        _source = between_validation_source
+        if _source is None:
+            # Legacy inference (I11): validation-presence (and therefore
+            # triples-vs-pairs) was decided by w_opt_enabled alone.
+            _source = 'third_population' if w_opt_enabled else None
+        if _source == 'third_population':
+            if n_population < 3:
+                return 0
             # X->Y->Z, all-distinct triples.
-            return n_phenotype * n_population * (n_population - 1) * (n_population - 2)
-        # X->Y pairs, self-pairs excluded.
-        return n_phenotype * n_population * (n_population - 1)
+            n_combos = n_population * (n_population - 1) * (n_population - 2)
+        else:
+            # No validation, or 'split_train'/'split_test' (still X->Y
+            # pairs at the population level - the validation split is
+            # carved out of one population's own individuals, not drawn
+            # from a distinct population). Self-pairs excluded.
+            n_combos = n_population * (n_population - 1)
+        n_combos = max(0, n_combos - max(0, n_excluded_combinations))
+        if _source in ('split_train', 'split_test'):
+            # Each surviving pair is replicated across every configured
+            # BETWEEN_RATIO x SAMPLE_NUM iteration, exactly like a
+            # 'within' plain-float ratio.
+            return n_phenotype * n_combos * max(1, n_between_ratio) * max(1, sample_num)
+        return n_phenotype * n_combos
     # 'within'
     return n_population * n_phenotype * n_ratio * sample_num
 
@@ -930,9 +1025,25 @@ def _estimate_resources_phase2_core(
     phenotype_file_name: Optional[str] = None,
     w_opt_enabled: bool = False,
     n_batches: int = 1,
+    # Requirements.md (between-prediction validation-set patch) - see
+    # compute_total_tasks()'s own docstring for what each of these means;
+    # forwarded straight through, same I11-preserving defaults.
+    between_validation_source: Optional[str] = None,
+    n_between_ratio: int = 1,
+    n_excluded_combinations: int = 0,
+    n_options: int = 1,
 ) -> Dict[str, object]:
     """Cheap resource estimate for one EasiGP run (or, via ``n_batches``,
     for ONE batch of a Parallel run split across that many batches).
+
+    ``n_options`` (multi-option ASReml runs): how many genotype-effect
+    options (BLUEs / BLUPs without GRM / BLUPs with GRM) the run executes
+    for EVERY scenario. ``total_tasks_*`` stay SCENARIO counts (they
+    address ``GP()``'s ``sample`` rows, which is what a Parallel batch
+    slices, so they must not change); the new ``total_task_runs_*`` keys
+    are scenarios x options - the number of task executions that actually
+    happen - and ``est_relative_cost`` scales with them. ``1`` (default)
+    reproduces the single-option output exactly.
 
     Every input here is either taken straight from the config (zero I/O)
     or a cheap header/line-count read (``n_markers``/``n_samples`` via
@@ -968,8 +1079,13 @@ def _estimate_resources_phase2_core(
         )
         n_samples = 500
 
-    total_tasks_all = compute_total_tasks(scenario, n_population, n_phenotype, n_ratio, sample_num, w_opt_enabled)
+    total_tasks_all = compute_total_tasks(
+        scenario, n_population, n_phenotype, n_ratio, sample_num, w_opt_enabled,
+        between_validation_source=between_validation_source,
+        n_between_ratio=n_between_ratio, n_excluded_combinations=n_excluded_combinations,
+    )
     n_batches = max(1, int(n_batches))
+    n_options = max(1, int(n_options))
     total_tasks = max(0, math.ceil(total_tasks_all / n_batches))
 
     units_per_task = compute_units_per_task(len(model_run), ld_prune_enabled, rf_filter_enabled)
@@ -980,7 +1096,9 @@ def _estimate_resources_phase2_core(
     any_gpu_capable = False
     for model_name in model_run:
         profile = _profile_for(model_name)
-        est_relative_cost += total_tasks * float(profile['cpu_time_factor'])
+        # Every option re-runs the whole task (multi-option wrapper), so
+        # the relative cost scales with the option count.
+        est_relative_cost += total_tasks * n_options * float(profile['cpu_time_factor'])
         mem_units += _mem_scale_factor(str(profile['mem_scaling']), n_markers, n_samples) * float(profile['cpu_time_factor'])
         if profile['gpu_capable']:
             any_gpu_capable = True
@@ -1010,6 +1128,9 @@ def _estimate_resources_phase2_core(
         'n_samples': n_samples,
         'total_tasks_per_batch': total_tasks,
         'total_tasks_all_batches': total_tasks_all,
+        'n_options': n_options,
+        'total_task_runs_per_batch': total_tasks * n_options,
+        'total_task_runs_all_batches': total_tasks_all * n_options,
         'notes': notes,
     }
 
@@ -2011,6 +2132,15 @@ def estimate_resources(
     rf_filter_cfg: Optional[Mapping[str, object]] = None,
     ld_prune_estimated_n_markers: Optional[int] = None,
     coordinated_budget_ncpus: Optional[int] = None,
+    asreml_enabled: bool = False,
+    # Requirements.md (between-prediction validation-set patch) - see
+    # compute_total_tasks()'s own docstring; forwarded straight through
+    # to _estimate_resources_phase2_core() below, same I11-preserving
+    # defaults as every other keyword-only argument on this function.
+    between_validation_source: Optional[str] = None,
+    n_between_ratio: int = 1,
+    n_excluded_combinations: int = 0,
+    n_options: int = 1,
 ) -> Dict[str, object]:
     """Cheap resource estimate for one EasiGP run (or, via ``n_batches``,
     for ONE batch of a Parallel run split across that many batches) -
@@ -2197,10 +2327,35 @@ def estimate_resources(
         scenario, n_population, n_phenotype, n_ratio, sample_num, model_run,
         _effective_ld, _effective_rf, genotype_format, genotype_file_name,
         phenotype_file_name, w_opt_enabled, n_batches,
+        between_validation_source=between_validation_source,
+        n_between_ratio=n_between_ratio, n_excluded_combinations=n_excluded_combinations,
+        n_options=n_options,
     )
     if _marker_source_note is not None:
         core = dict(core)
         core['notes'] = list(core['notes']) + [_marker_source_note]
+
+    # Update ID ver4-12, R2/R5 (design blueprint SS5 "Resource advisor"):
+    # a `MODEL_COST_PROFILE`-style cost CONTRIBUTION for the ASReml-R
+    # stage is explicitly OUT OF SCOPE for this update (a REML fit's cost
+    # depends heavily on the mixed model's own structure - fixed vs.
+    # random genotype, GRM on/off, residual structure - in a way this
+    # module's per-MODEL cost table has no analogue for). Instead, the
+    # existing "provisional, one-time-calibrated, needs recalibration"
+    # disclaimer this module already carries (module docstring, above) is
+    # extended with an explicit note whenever ASREML is enabled, so the
+    # GUI's advisor panel names the blind spot rather than silently
+    # under-estimating wall-clock time for an ASReml-enabled run.
+    if asreml_enabled:
+        core = dict(core)
+        core['notes'] = list(core['notes']) + [
+            "ASReml is enabled for this run - Step 6b's REML fit is NOT modelled by this "
+            "resource advisor at all (its cost depends heavily on the mixed model's own "
+            "structure - fixed vs. random genotype, GRM on/off, residual structure - which this "
+            "advisor has no calibrated cost table for). Treat the suggested ncpus/mem/wall-clock "
+            "figures as a floor, not an estimate of the ASReml stage itself, and pilot a small "
+            "batch before committing a large array submission."
+        ]
 
     # Additional Requirements 9, Requirement 4 - price mem_gb against how
     # many markers a NON-bio-prior model actually sees once LD pruning/RF
@@ -2330,7 +2485,14 @@ def estimate_resources(
     # phase2_core()` itself already priced above (I6 - see the
     # OTHER_MODELS_MARKER_SOURCE short-circuit note earlier in this
     # function).
-    _array_units_per_task = compute_units_per_task(len(model_run), _effective_ld, _effective_rf)
+    # Multi-option ASReml runs execute every scenario once per option, so a
+    # scenario (= one array-batch row) costs n_options x as much - the batch
+    # size is sized against that, while the layout itself still divides the
+    # SCENARIO count (batches slice GP()'s scenario table, not option runs).
+    _array_units_per_task = (
+        compute_units_per_task(len(model_run), _effective_ld, _effective_rf)
+        * max(1, int(n_options))
+    )
     _array_layout = suggest_array_layout(
         core['total_tasks_all_batches'], _array_units_per_task,
         max_array_subjobs=_max_array_subjobs,
@@ -2478,13 +2640,13 @@ def estimate_resources(
     atoms, atom_costs = _atoms_for_costing(model_run, hp_tune)
     n_atoms = len(atoms)
 
-    if w_opt_limitation:
-        notes.append(
-            "W_OPT (weighted-ensemble methods) is configured - per the ver4-3 design blueprint "
-            "(decision D1), any task with W_OPT active AND a validation split falls back to "
-            "task-level-only execution at RUN TIME regardless of N_MODEL_WORKERS. This estimate's "
-            "model-level width may therefore not be achievable for every task in this run."
-        )
+    #if w_opt_limitation:
+    #    notes.append(
+    #        "W_OPT (weighted-ensemble methods) is configured - per the ver4-3 design blueprint "
+    #        "(decision D1), any task with W_OPT active AND a validation split falls back to "
+    #       "task-level-only execution at RUN TIME regardless of N_MODEL_WORKERS. This estimate's "
+    #       "model-level width may therefore not be achievable for every task in this run."
+    #  )
 
     if n_atoms < 2:
         _n_cpu_workers_task_small = min(total_tasks_per_batch, budget_ncpus)
@@ -2671,3 +2833,1024 @@ def estimate_resources(
         'gpu_ncpus_increment': gpu_ncpus_increment,
     })
     return result
+
+
+# ===========================================================================
+# ver4-35, R1.e / R1.h - GAT step cost model and device-crossover constants.
+#
+# Why this exists (blueprint E2, E6, SS0.2): the bio-prior GAT's first-layer
+# cost scales with the node feature width F. The legacy input appends a
+# G-wide one-hot block to every node (F = S + G), so a graph with thousands
+# of nodes (the data-driven merge adds RF-selected "bare" nodes) costs
+# O(G^2) per individual in FLOPs AND memory. This module is the ONE place
+# that formula lives: ``pipeline_utils.resolve_model_device`` (device
+# placement), the arbiter's ``'auto'`` slot count, the ``[gat-shape]`` log
+# line and the pre-fit cost guard all call it, so they can never disagree.
+#
+# Pure arithmetic, no I/O, no torch import: safe to call in any process.
+# ===========================================================================
+
+#: Provisional constants of the placement policy - **calibrate with
+#: ``tools/gat_bench.py``** (blueprint R1.i question 2). They are static on
+#: purpose: placement must be a pure function of config and data shape, never
+#: of a timer or a queue, so the tuning trials and the confirmatory fit always
+#: agree (invariant I9).
+#:
+#: ``gpu_floor_s``       one GATv2 step is ~150-250 CUDA kernel launches, so a
+#:                       GPU step never costs less than this.
+#: ``gpu_flops``         effective (not peak) FLOP/s of a mid-range GPU.
+#: ``cpu_py_s``          PyG/Python dispatch overhead of one CPU step.
+#: ``cpu_flops_per_thread`` effective FLOP/s of one CPU thread.
+#: ``cpu_thread_cap``    threads beyond this give no further speed-up.
+#: ``margin``            the GPU must be this many times faster to be chosen
+#:                       (a GPU fit also waits for a slot and a CUDA context).
+TORCH_DEVICE_CROSSOVER: Dict[str, float] = {
+    'gpu_floor_s': 0.004,
+    'gpu_flops': 4.0e12,
+    'cpu_py_s': 0.003,
+    'cpu_flops_per_thread': 2.0e10,
+    'cpu_thread_cap': 16,
+    'margin': 1.25,
+}
+
+#: FLOPs per edge per channel per step (attention score, softmax, message,
+#: forward + backward). Provisional - see ``TORCH_DEVICE_CROSSOVER``.
+_GAT_EDGE_FLOP_PER_CHANNEL = 30.0
+
+#: Fixed GPU memory of one CUDA context plus the framework workspace (bytes).
+_GAT_CUDA_CONTEXT_BYTES = 0.5e9
+
+#: ver4-61, R2: how many edge-sized float32 tensors (B x E0 x HC) GATv2Conv keeps
+#: alive for one training step's backward pass (attention input, scores, softmax,
+#: messages, their gradients). Provisional - blueprint P0.2 asks for a measured
+#: value (expected 4-8) from the peak RSS of one CPU fit; update it here, in one place.
+_GAT_EDGE_TENSORS = 6
+
+#: ver4-61, R5: measured CPU cost of one (edge x channel) per training step, in
+#: nanoseconds, by threads per fit. Anchors come from the attached run's
+#: ``[gat-shape]`` lines: 7.7 ns at 20 threads (one fit alone on the node) and
+#: 25-95 ns at 2 threads with eight fits running side by side (geometric centre
+#: ~49). The edge scatter/gather is memory-bound, which is why the legacy GEMM
+#: constants (``_GAT_EDGE_FLOP_PER_CHANNEL`` over ``cpu_flops_per_thread``)
+#: under-estimate it 49x-380x. Provisional: ``tools/bio_prior_cost_report.py``
+#: fits a replacement table from your own logs; paste it here.
+CPU_EDGE_NS_PER_CHANNEL: Dict[int, float] = {2: 49.0, 20: 7.7}
+
+#: ver4-61, R5: concurrent fits one node's memory system serves before the
+#: memory-bound edge term starts to slow each of them. The 2-thread anchor above
+#: was measured with 8 concurrent fits, so up to 8 the table is used as is.
+_CPU_MEMORY_FIT_SLOTS = 8.0
+
+
+def estimate_gat_step(shape: Mapping[str, object]) -> Dict[str, float]:
+    """Cost of one training step of ``GAT_biological_prior_knowledge``.
+
+    Parameters
+    ----------
+    shape : mapping with ``G`` (nodes per graph), ``S`` (max SNPs per node)
+        and ``N_train``; optional ``N_eval`` (valid + test individuals,
+        default 0), ``E0`` (edges per graph, default ``3 * G``), ``B``
+        (batch size, default 8), ``heads`` and ``neuron`` (or ``HC`` =
+        ``heads * neuron`` directly; default 4 x 16), ``factorised`` (bool:
+        the R1.b input, default False) and ``ig_internal_batch`` (default
+        256).
+
+    Returns
+    -------
+    dict with ``flop`` (FLOP per step: ``12*B*G*F*HC + 6*B*G*HC^2 +
+    c_e*B*E0*HC`` where F = S factorised, S + G legacy), ``bytes_step``
+    (input + activation floats of one step), ``bytes_ig_batch`` (the Integrated
+    Gradients input tensor for ``ig_internal_batch`` graphs) and ``mem_fit``
+    (device bytes of one whole fit: context + staged features + step + IG).
+    ver4-61 adds ``bytes_edge_step`` (``_GAT_EDGE_TENSORS * 4 * B * E0 * HC``:
+    the edge activations kept for backward) and ``mem_trial_host`` (staged
+    features + step + edge bytes: one trial's host memory). Existing keys and
+    values are unchanged.
+
+    Raises
+    ------
+    KeyError
+        When ``G``, ``S`` or ``N_train`` is missing (a caller bug).
+    """
+    n_genes = float(shape['G'])
+    max_snp = float(shape['S'])
+    n_train = float(shape['N_train'])
+    n_eval = float(shape.get('N_eval', 0) or 0)
+    n_edges = float(shape.get('E0') or 3.0 * n_genes)
+    batch = float(shape.get('B') or 8)
+    if shape.get('HC'):
+        channels = float(shape['HC'])
+    else:
+        channels = float(shape.get('heads') or 4) * float(shape.get('neuron') or 16)
+    width = max_snp if bool(shape.get('factorised', False)) else max_snp + n_genes
+    ig_batch = float(shape.get('ig_internal_batch') or 256)
+
+    flop = (12.0 * batch * n_genes * width * channels
+            + 6.0 * batch * n_genes * channels * channels
+            + _GAT_EDGE_FLOP_PER_CHANNEL * batch * n_edges * channels)
+    bytes_step = 4.0 * batch * n_genes * (width + 8.0 * channels)
+    bytes_ig_batch = 4.0 * ig_batch * n_genes * width
+    staged = 4.0 * (n_train + n_eval) * n_genes * max_snp
+    mem_fit = _GAT_CUDA_CONTEXT_BYTES + staged + bytes_step + bytes_ig_batch
+    # ver4-61, R2: the edge activations GATv2Conv keeps for backward (B x E0 x HC
+    # floats, several tensors) dominate host memory on a large merged graph and
+    # were not counted anywhere. ``mem_trial_host`` is one trial's host footprint.
+    bytes_edge_step = _GAT_EDGE_TENSORS * 4.0 * batch * n_edges * channels
+    mem_trial_host = staged + bytes_step + bytes_edge_step
+    return {'flop': flop, 'bytes_step': bytes_step, 'bytes_ig_batch': bytes_ig_batch,
+            'mem_fit': mem_fit, 'bytes_edge_step': bytes_edge_step,
+            'mem_trial_host': mem_trial_host}
+
+
+def estimate_gat_step_seconds(shape: Mapping[str, object], cpu_threads: int) -> Tuple[float, float]:
+    """``(cpu_seconds, gpu_seconds)`` per step from the static constants in
+    :data:`TORCH_DEVICE_CROSSOVER` - the numbers behind
+    ``pipeline_utils.resolve_model_device`` and the ``est_step_ms`` field of
+    the ``[gat-shape]`` log line. An estimate, not a measurement."""
+    k = TORCH_DEVICE_CROSSOVER
+    flop = estimate_gat_step(shape)['flop']
+    threads = max(1, min(int(cpu_threads or 1), int(k['cpu_thread_cap'])))
+    cpu_s = k['cpu_py_s'] + flop / (k['cpu_flops_per_thread'] * threads)
+    gpu_s = max(k['gpu_floor_s'], flop / k['gpu_flops'])
+    return float(cpu_s), float(gpu_s)
+
+
+def _edge_ns_for_threads(threads: int) -> float:
+    """ns per (edge x channel) per step for `threads` threads per fit, by
+    log-log interpolation of :data:`CPU_EDGE_NS_PER_CHANNEL` (clamped to its
+    smallest/largest entry beyond the table, extrapolating with the end slope
+    only up to a factor of 4 in threads so a stray value cannot explode)."""
+    table = sorted((int(t), float(v)) for t, v in CPU_EDGE_NS_PER_CHANNEL.items() if v > 0)
+    if not table:
+        raise ValueError("CPU_EDGE_NS_PER_CHANNEL is empty - cannot calibrate the CPU estimate")
+    threads = max(1, int(threads or 1))
+    if len(table) == 1:
+        return table[0][1]
+    if threads <= table[0][0]:
+        (t0, v0), (t1, v1) = table[0], table[1]
+        threads = max(threads, max(1, t0 // 4))
+    elif threads >= table[-1][0]:
+        (t0, v0), (t1, v1) = table[-2], table[-1]
+        threads = min(threads, t1 * 4)
+    else:
+        for (t0, v0), (t1, v1) in zip(table[:-1], table[1:]):
+            if t0 <= threads <= t1:
+                break
+    if t1 == t0:
+        return v0
+    slope = (math.log(v1) - math.log(v0)) / (math.log(t1) - math.log(t0))
+    return float(math.exp(math.log(v0) + slope * (math.log(threads) - math.log(t0))))
+
+
+def estimate_gat_step_seconds_calibrated(shape: Mapping[str, object], cpu_threads: int,
+                                         concurrent: int = 1) -> float:
+    """Calibrated CPU seconds per training step of the bio-prior GAT.
+
+    ver4-61, R5. The legacy :func:`estimate_gat_step_seconds` prices the edge
+    scatter/gather like a dense GEMM; on CPU it is memory-bound and was off by
+    49x-380x on the attached run. This adds the measured per-(edge x channel)
+    cost of :data:`CPU_EDGE_NS_PER_CHANNEL` to the node term at the legacy
+    rate. It is for log lines and the cost guard only - device placement keeps
+    using the legacy estimate so ``torch_device_policy='auto'`` is unchanged.
+
+    Parameters
+    ----------
+    shape : the same mapping :func:`estimate_gat_step` takes (``G``, ``S``,
+        ``N_train``, ``E0``, ``B``, ``HC`` or ``heads``/``neuron``, ...).
+    cpu_threads : threads one fit uses.
+    concurrent : fits running at once on the node; beyond
+        ``_CPU_MEMORY_FIT_SLOTS`` the memory-bound edge term is scaled up
+        linearly.
+
+    Returns
+    -------
+    float - estimated seconds for one step (an estimate, not a measurement).
+    """
+    k = TORCH_DEVICE_CROSSOVER
+    n_genes = float(shape['G'])
+    max_snp = float(shape['S'])
+    n_edges = float(shape.get('E0') or 3.0 * n_genes)
+    batch = float(shape.get('B') or 8)
+    if shape.get('HC'):
+        channels = float(shape['HC'])
+    else:
+        channels = float(shape.get('heads') or 4) * float(shape.get('neuron') or 16)
+    width = max_snp if bool(shape.get('factorised', False)) else max_snp + n_genes
+    node_flop = (12.0 * batch * n_genes * width * channels
+                 + 6.0 * batch * n_genes * channels * channels)
+    threads = max(1, min(int(cpu_threads or 1), int(k['cpu_thread_cap'])))
+    node_s = node_flop / (k['cpu_flops_per_thread'] * threads)
+    contention = max(1.0, float(max(1, int(concurrent or 1))) / _CPU_MEMORY_FIT_SLOTS)
+    edge_ns = _edge_ns_for_threads(int(cpu_threads or 1))
+    edge_s = edge_ns * 1e-9 * batch * n_edges * channels * contention
+    return float(k['cpu_py_s'] + node_s + edge_s)
+
+
+def estimate_gat_fit_seconds_calibrated(shape: Mapping[str, object], cpu_threads: int,
+                                        concurrent: int = 1) -> float:
+    """Calibrated CPU seconds for the training loop of one whole fit:
+    ``epochs * ceil(N_train / B)`` steps of :func:`estimate_gat_step_seconds_calibrated`
+    (``epochs`` defaults to 1 and ``B`` to 8 when the shape lacks them). Excludes
+    explainer/evaluation passes."""
+    batch = max(1.0, float(shape.get('B') or 8))
+    steps = max(1.0, float(shape.get('epochs') or 1)) * math.ceil(float(shape['N_train']) / batch)
+    return float(steps * estimate_gat_step_seconds_calibrated(shape, cpu_threads, concurrent))
+
+
+# ==========================================================================
+# ver4-56 (R3) - calibrated, coherent resource recommendation.
+#
+# Everything below is NEW and independent of ``estimate_resources()``: the
+# legacy advisor above is untouched, so ``RESOURCE_ADVISOR.engine='legacy'``
+# stays a config-only rollback. Calibration comes from ``resource_calibration``
+# (fitted from ``resource_telemetry`` records of earlier runs and pilots).
+#
+# The recommendation is ONE layout - (batch size, task workers
+# ``N_CPU_WORKERS_TASK``, threads per worker ``N_JOBS``) - chosen by pricing
+# every task of the real run. Consequences (the blueprint's defects):
+#   E1  ncpus == workers x threads (raised only to a GPU queue's per-GPU floor);
+#   E2/E3  ONE memory figure: parent + workers x per-worker peak, at a quantile;
+#   E5  ngpus == 0 whenever the resolved device is not CUDA;
+#   E6  a walltime comes with the layout (quantile of the busiest subjob);
+#   E7  batch size is chosen by time, not abstract units;
+#   E8  ASReml and joint optimisation are priced from their own measurements;
+#   E9  the task list is GP()'s own ``sample`` table (``build_sample_table``).
+# ==========================================================================
+
+from resource_calibration import (  # noqa: E402  (grouped with the code that uses them)
+    Calibration, P_REF, THREAD_CAP, normal_ppf, pool_signature,
+)
+
+_WORKER_LADDER = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64)
+_THREAD_LADDER = (1, 2, 4, 8)
+_BATCH_LADDER = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024)
+_DEFAULT_MAX_WORKERS = 64            # worker ceiling when the profile gives no core count
+_WALLTIME_ROUND_S = 900.0            # requests are rounded UP to 15 minutes
+_MIN_WALLTIME_S = 900.0
+_PARENT_PROCESS_GB = 1.0             # the coordinating process of a multi-worker job
+_MEM_SLACK_GB = 1.0                  # headroom added on top of the quantile
+_MIN_CPU_EFF_TURNAROUND = 0.7        # 'turnaround' objective: ignore layouts below this
+_TIER_RANK = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
+
+# Tier-D guesses (seconds) for the non-model costs, used ONLY when no telemetry
+# exists for them. Provisional, like every constant in this module; the first
+# measured run replaces them.
+_DEFAULT_POOL_BASE_S = 5.0
+_DEFAULT_POOL_PER_MEGA_NP_S = 8.0     # per 1e6 (n x p) cells
+_DEFAULT_ASREML_S = 120.0
+_DEFAULT_JOINT_FACTOR = 2.0           # x the summed model seconds of the task
+_DEFAULT_STARTUP_S = 60.0
+_DEFAULT_TAIL_S = 5.0
+
+
+def _lpt_makespan(durations: Sequence[float], n_workers: int) -> float:
+    """Makespan (seconds) of running ``durations`` on ``n_workers`` identical
+    workers with longest-processing-time-first assignment.
+
+    Why LPT: it is what a pool that hands the next task to the first free
+    worker approaches when long tasks are queued first, and it is within 4/3
+    of the optimum. ``n_workers <= 1`` or no tasks degenerate to the plain sum.
+    """
+    if not durations:
+        return 0.0
+    n_workers = max(1, min(int(n_workers), len(durations)))
+    if n_workers == 1:
+        return float(sum(durations))
+    loads = [0.0] * n_workers
+    for duration in sorted(durations, reverse=True):
+        heapq.heapreplace(loads, loads[0] + float(duration))
+    return float(max(loads))
+
+
+def _worst_concurrent_sum(values: np.ndarray, starts: np.ndarray, batch_size: int,
+                          workers: int) -> float:
+    """Largest, over the batches, of the sum of the ``workers`` biggest ``values``
+    inside one batch.
+
+    Why: at most ``workers`` tasks of a batch are in memory at once, and the
+    batches are consecutive slices of the task table, so the memory a subjob
+    needs depends on WHICH tasks it holds (their sizes) and on how many run
+    together - not on the largest task of the whole run times ``workers``.
+    """
+    if values.size == 0:
+        return 0.0
+    k = max(1, min(int(workers), int(batch_size)))
+    if float(values.min()) == float(values.max()):
+        return float(values[0]) * k
+    if k >= batch_size:
+        return float(np.add.reduceat(values, starts).max())
+    best = 0.0
+    for start in starts:
+        chunk = values[start:start + batch_size]
+        take = min(k, chunk.size)
+        top = np.partition(chunk, chunk.size - take)[chunk.size - take:]
+        best = max(best, float(top.sum()))
+    return best
+
+
+def _layout_candidates(
+    n_tasks: int, cores_per_node: Optional[float], max_array_subjobs: int,
+    thread_options: Sequence[int], fixed: Optional[Mapping[str, Any]] = None,
+) -> List[Tuple[int, int, int]]:
+    """Every ``(batch_size, workers, threads)`` worth evaluating.
+
+    Batch sizes are the balanced sizes (:func:`_best_balanced_batch_size`)
+    nearest a geometric ladder, so every batch holds (almost) the same task
+    count; sizes that would need more subjobs than the array cap are dropped.
+    Workers never exceed the batch size or the node's cores. ``fixed`` may pin
+    ``batch_size``, ``n_cpu_workers_task`` / ``w`` and ``n_jobs`` / ``t``.
+    """
+    fixed = dict(fixed or {})
+    pinned_batch = fixed.get('batch_size')
+    pinned_w = fixed.get('n_cpu_workers_task', fixed.get('w'))
+    pinned_t = fixed.get('n_jobs', fixed.get('t'))
+    if n_tasks <= 0:
+        return []
+    if pinned_batch:
+        batch_sizes = [max(1, min(int(pinned_batch), n_tasks))]
+    else:
+        sizes = {n_tasks}
+        for rung in _BATCH_LADDER:
+            if rung < n_tasks:
+                sizes.add(_best_balanced_batch_size(n_tasks, rung, 1, n_tasks)[0])
+        floor_size = max(1, math.ceil(n_tasks / max(1, int(max_array_subjobs))))
+        batch_sizes = sorted(b for b in sizes if b >= floor_size)
+        if not batch_sizes:
+            batch_sizes = [min(n_tasks, floor_size)]
+    ceiling = int(cores_per_node) if cores_per_node else _DEFAULT_MAX_WORKERS
+    out: List[Tuple[int, int, int]] = []
+    for batch_size in batch_sizes:
+        if pinned_w:
+            workers = [max(1, int(pinned_w))]
+        else:
+            workers = [w for w in _WORKER_LADDER if w <= min(batch_size, ceiling)] or [1]
+        threads = [max(1, int(pinned_t))] if pinned_t else list(thread_options)
+        for w in workers:
+            for t in threads:
+                if not pinned_w and not pinned_t and cores_per_node and w * t > cores_per_node:
+                    continue
+                out.append((batch_size, w, t))
+    return out
+
+
+def _n_asreml_options(cfg: Mapping[str, Any]) -> int:
+    """Number of ASReml genotype-effect options of ``cfg`` (0 when ASReml is
+    off). Never raises: an invalid ASReml block is reported elsewhere."""
+    if not cfg.get('ASREML'):
+        return 0
+    try:
+        import asreml_syntax
+        return max(1, len(asreml_syntax.resolve_strategy_list(cfg.get('ASREML'))))
+    except Exception:  # noqa: BLE001 - advisory path; any failure means "one option"
+        return 1
+
+
+def _task_shape(row: Tuple[Any, Any, Any], sizes: Mapping[Tuple[str, str], int],
+                scenario: str, source: Optional[str], fallback_n: float
+                ) -> Tuple[float, int, bool]:
+    """``(n_task, n_train, has_valid)`` of one task row ``(population, phenotype,
+    ratio)``, following GP()'s split rules (ratio semantics: a float is the train
+    fraction; a 3-tuple is (train, valid, test); between-validation per ``source``)."""
+    population, phenotype, ratio = row
+    parts = str(population).split('->') if scenario == 'between' else [str(population)]
+    counts = [float(sizes.get((part, str(phenotype)), fallback_n)) for part in parts]
+    n_task = sum(counts)
+    if scenario == 'between':
+        n_first = counts[0]
+        if source in ('split_train',):
+            return n_task, int(math.floor(float(ratio) * n_first)), True
+        if source == 'split_test':
+            return n_task, int(n_first), True
+        return n_task, int(n_first), source == 'third_population'
+    if isinstance(ratio, (tuple, list)):
+        return n_task, int(math.floor(float(ratio[0]) * n_task)), True
+    return n_task, int(math.floor(float(ratio) * n_task)), False
+
+
+def _model_params(hparameters: Mapping[str, Any], model: str, phenotype: str) -> Optional[Sequence]:
+    """The configured hyper-parameter list of ``model`` for ``phenotype``."""
+    params = hparameters.get(model)
+    if params is None:
+        params = hparameters.get(_base_of(model))
+    if isinstance(params, Mapping):
+        params = params.get(phenotype)
+    return params
+
+
+def load_calibration(dirs: Sequence[str], machine_key: Optional[str] = None,
+                     verbose: bool = False) -> Calibration:
+    """Fit a :class:`Calibration` from the telemetry folders ``dirs``.
+
+    Args:
+        dirs: telemetry folders (``Result/<name>/logs/resource_telemetry``);
+            missing ones are skipped. An empty list gives a tier-D calibration.
+        machine_key: the machine the prediction is FOR (default: this machine).
+            Pass the cluster node's key when advising from a laptop.
+        verbose: print the loader's notes (skipped lines, failed tasks, ...).
+
+    Returns:
+        A calibration; on any fitting error an EMPTY one (tier D) after a
+        ``[resource]`` log line - the advisor then still answers, with wide
+        uncertainty, instead of failing (blueprint R3 failure modes).
+    """
+    from resource_calibration import fit, load_telemetry
+    from resource_telemetry import machine_key as _this_machine_key
+    key = machine_key or _this_machine_key()
+    priors = {base: {'cpu_time_factor': float(v['cpu_time_factor']),
+                     'peak_mem_gb_per_worker': float(v['peak_mem_gb_per_worker'])}
+              for base, v in MODEL_COST_PROFILE.items()}
+    notes: List[str] = []
+    records = load_telemetry([d for d in dirs if d], notes)
+    try:
+        calibration = fit(records, key, priors)
+    except (ValueError, TypeError, KeyError, ArithmeticError, np.linalg.LinAlgError) as exc:
+        print(f"[resource] calibration fit failed ({type(exc).__name__}: {exc}) - "
+              f"falling back to prior-only (tier D) predictions.")
+        calibration = fit([], key, priors)
+    calibration.notes.extend(notes)
+    if verbose:
+        for note in calibration.notes:
+            print(f"[resource] calibration: {note}")
+    return calibration
+
+
+def estimate_resources_calibrated(
+    cfg: Mapping[str, Any],
+    calibration: Optional[Calibration],
+    *,
+    hpc_profile: str = DEFAULT_HPC_PROFILE,
+    objective: str = 'cost',
+    target_walltime_h: float = 12.0,
+    walltime_quantile: float = 0.90,
+    mem_quantile: float = 0.95,
+    margin_w: float = 1.10,
+    fixed: Optional[Mapping[str, Any]] = None,
+    profile_limits: Optional[Mapping[str, Any]] = None,
+    task_sizes: Optional[Mapping[Tuple[str, str], int]] = None,
+    sample_table: Any = None,
+    ld_prune_estimated_n_markers: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Recommend ncpus, memory, GPU, walltime, batch size and the worker/thread
+    split for the run described by ``cfg``, from measured per-model costs.
+
+    Why (blueprint R3): the legacy advisor is an unmeasured static heuristic whose
+    numbers do not agree with each other (defects E1-E9). This prices every task
+    of the real run with ``calibration`` and returns one self-consistent layout.
+
+    Args:
+        cfg: the run's config dict (the same keys ``run_step1_batch`` reads).
+        calibration: from :func:`load_calibration`; ``None`` means no telemetry
+            (every prediction is tier D, with wide uncertainty and a note).
+        hpc_profile: key of ``HPC_RESOURCE_PROFILES`` (node limits, array cap).
+        objective: ``'cost'`` = fewest core-hours among layouts meeting
+            ``target_walltime_h``; ``'turnaround'`` = shortest walltime among
+            layouts with predicted CPU efficiency >= 0.7.
+        target_walltime_h: preferred walltime of one subjob (``'cost'`` only).
+        walltime_quantile / mem_quantile: how conservative the request is.
+        margin_w: extra multiplier on the walltime (scheduler/IO jitter).
+        fixed: pin ``batch_size``, ``n_cpu_workers_task`` (or ``w``) and/or
+            ``n_jobs`` (or ``t``); the rest is optimised around them.
+        profile_limits: node-limit overrides (see :func:`resolve_hpc_limits`).
+        task_sizes: ``{(population, phenotype): n}``; default reads the phenotype
+            file (``pipeline_utils.cheap_task_sizes``).
+        sample_table: a prebuilt task table (default ``build_sample_table_from_cfg``).
+        ld_prune_estimated_n_markers: markers left after LD pruning, if known.
+
+    Returns:
+        A dict. Legacy-compatible keys: ``ncpus``, ``mem_gb``, ``ngpus``,
+        ``suggested_batch_size``, ``suggested_n_batches``, ``total_tasks_all_batches``,
+        ``total_tasks_per_batch``, ``n_markers``, ``n_samples``, ``notes``. New keys:
+        ``engine='calibrated'``, ``walltime_s``, ``walltime_hms``, ``walltime_mean_s``,
+        ``n_cpu_workers_task``, ``n_jobs``, ``su_total`` (core-hours of the whole
+        array, memory-charge aware), ``cpu_eff_pred``, ``per_model``, ``tier_min``,
+        ``infeasible`` / ``binding``, and ``prediction`` (what the audit tool stores).
+
+    Raises:
+        ValueError: unknown ``objective`` or an invalid quantile.
+    """
+    if objective not in ('cost', 'turnaround'):
+        raise ValueError(f"objective must be 'cost' or 'turnaround', got {objective!r}.")
+    for name, value in (('walltime_quantile', walltime_quantile), ('mem_quantile', mem_quantile)):
+        if not 0.5 <= float(value) < 1.0:
+            raise ValueError(f"{name} must be in [0.5, 1), got {value!r}.")
+    notes: List[str] = []
+    limits = resolve_hpc_limits(hpc_profile, profile_limits)
+    if calibration is None:
+        calibration = Calibration(machine_key='-', priors={})
+    z_wall, z_mem = normal_ppf(walltime_quantile), normal_ppf(mem_quantile)
+
+    # ---- the tasks: GP()'s own table, with per-task sizes ------------------
+    from pipeline_utils import build_sample_table_from_cfg, cheap_task_sizes, resolve_task_axes
+    table = sample_table if sample_table is not None else build_sample_table_from_cfg(cfg)
+    n_tasks = int(len(table))
+    scenario = cfg.get('SCENARIO', 'within')
+    from pipeline_utils import resolve_between_validation_source
+    source = resolve_between_validation_source(cfg)
+    n_markers, n_samples = cheap_marker_and_sample_counts(
+        cfg.get('GENOTYPE_FORMAT', 'csv'), cfg.get('GENOTYPE_FILE_NAME', ''),
+        cfg.get('PHENOTYPE_FILE_NAME'))
+    if n_markers is None:
+        n_markers = int(P_REF)
+        notes.append("Marker count unknown (genotype file not readable) - assuming "
+                     f"{n_markers}; every prediction is extrapolated.")
+    sizes = dict(task_sizes) if task_sizes is not None else cheap_task_sizes(cfg)
+    axes = resolve_task_axes(cfg)
+    n_pop = max(1, len(axes[0]) if axes else len(cfg.get('POPULATION') or [1]))
+    fallback_n = float(n_samples) / n_pop if n_samples else 500.0
+    if not sizes:
+        notes.append("Per-population sizes unknown (phenotype file not readable) - assuming "
+                     f"{fallback_n:.0f} individuals per population.")
+    result: Dict[str, Any] = {
+        'engine': 'calibrated', 'hpc_profile': limits['profile'], 'objective': objective,
+        'n_markers': n_markers, 'n_samples': n_samples, 'total_tasks_all_batches': n_tasks,
+        'notes': notes,
+    }
+    if n_tasks == 0:
+        notes.append("The configuration produces no tasks - nothing to estimate.")
+        result.update({'infeasible': True, 'binding': 'no tasks', 'ncpus': 0, 'mem_gb': 0,
+                       'ngpus': 0, 'walltime_s': 0.0, 'walltime_hms': '00:00:00',
+                       'suggested_batch_size': 0, 'suggested_n_batches': 0,
+                       # Every key a caller (the GUI panel, the CLI, the audit) reads, so an
+                       # empty run is reported instead of raising KeyError.
+                       'walltime_mean_s': 0.0, 'n_cpu_workers_task': 0, 'n_jobs': 0,
+                       'su_total': 0.0, 'cpu_eff_pred': 0.0, 'per_model': [], 'tier_min': 'D',
+                       'worker_peak_gb': 0.0, 'machine_key': calibration.machine_key
+                       if calibration is not None else '',
+                       'calibration_records': int(calibration.n_records)
+                       if calibration is not None else 0,
+                       'prediction': None})
+        return result
+
+    rows = list(zip(table['population'].tolist(), table['phenotype'].tolist(),
+                    table['ratio'].tolist()))
+    key_of: Dict[Tuple[Any, Any, Any], int] = {}
+    row_key = np.empty(n_tasks, dtype=np.int64)
+    for index, row in enumerate(rows):
+        row_key[index] = key_of.setdefault((row[0], row[1], row[2]), len(key_of))
+    keys = [None] * len(key_of)
+    for row, k in key_of.items():
+        keys[k] = row
+    shapes = [_task_shape(row, sizes, scenario, source, fallback_n) for row in keys]
+
+    # ---- the run's modelling choices ---------------------------------------
+    models = [str(m) for m in (cfg.get('MODEL') or [])]
+    hparameters = cfg.get('HPARAMETERS') or {}
+    hp_tune = cfg.get('HP_TUNE') or {}
+    rf_enabled, ld_enabled = cfg.get('RF_FILTER') is not None, cfg.get('LD_PRUNE') is not None
+    p_filtered, _uncertain, p_notes = estimate_post_filter_markers(
+        n_markers, ld_enabled, rf_enabled, cfg.get('RF_FILTER'), ld_prune_estimated_n_markers)
+    notes.extend(p_notes)
+    device_cfg = str(cfg.get('TORCH_DEVICE') or '')
+    device = device_cfg if device_cfg.lower().startswith('cuda') else 'cpu'
+    gpu_models = [m for m in models if _profile_for(m).get('gpu_capable')]
+    use_gpu = bool(gpu_models) and device.startswith('cuda')
+    if gpu_models and not device_cfg:
+        notes.append("TORCH_DEVICE is not set: planned as a CPU-only run (no GPU requested). "
+                     "Set TORCH_DEVICE='cuda' to plan for a GPU.")
+    n_asreml = _n_asreml_options(cfg)
+    joint_on = bool(cfg.get('JOINT_W_OPT')) and len(models) >= 2
+    # ver4-57 (R5): the opt-in Iterative ensemble adds `expected` refits of the marker-channel
+    # members per task (explainability off). Priced as expected x the task's mean member seconds,
+    # a deliberate over-estimate for a tuned model (its seconds include the search).
+    iter_cfg = cfg.get('ITERATIVE_ENSEMBLE') if isinstance(cfg.get('ITERATIVE_ENSEMBLE'), dict) \
+        else None
+    iter_n_bio = sum(1 for m in models if _base_of(m).startswith('GAT_biological_prior'))
+    iter_expected = 0
+    if iter_cfg is not None and len(models) >= 2:
+        iter_expected, _iter_max = iter_ens_fit_estimate(
+            iter_cfg, len(models), iter_n_bio)
+        notes.append(
+            f"Iterative ensemble: about {iter_expected} extra model fit(s) per task with a "
+            f"validation split (at most {_iter_max}), priced at the members' mean calibrated "
+            f"fit time; this stage has no calibration records of its own yet (tier D).")
+    # ver4-77 (R2): the opt-in Super learner adds K x folds out-of-fold fits (+ K refits with a
+    # validation split) of the marker-channel members per task, explainability off. Priced like
+    # the iterative ensemble (fits x the task's mean member seconds, a deliberate over-estimate
+    # for a tuned model); it has no calibration records of its own yet (tier D).
+    sl_cfg = cfg.get('SUPER_LEARNER') if isinstance(cfg.get('SUPER_LEARNER'), dict) else None
+    sl_n_bio = sum(1 for m in models if _base_of(m).startswith('GAT_biological_prior'))
+    if sl_cfg is not None and len(models) >= 2:
+        notes.append(
+            f"Super learner: about {sl_fit_estimate(sl_cfg, len(models), sl_n_bio, True)} extra "
+            f"model fit(s) per task with a validation split ("
+            f"{sl_fit_estimate(sl_cfg, len(models), sl_n_bio, False)} without one), priced at "
+            f"the members' mean calibrated fit time; this stage has no calibration records of "
+            f"its own yet (tier D).")
+        # ver4-85: out-of-fold hyperparameter tuning scores every candidate with `folds` fits.
+        if sl_cfg.get('oof_tuning') and hp_tune:
+            _fast = bool(sl_cfg.get('oof_tuning_fast', True))
+            notes.append(
+                f"Out-of-fold hyperparameter tuning: each tuning candidate costs up to "
+                f"{int(sl_cfg.get('folds', 5))} fits (one per fold) instead of 1"
+                + (" - with the faster settings search fits run at the cheap search "
+                   "length (MCMC models), rrBLUP / RKHS folds use the closed-form engine "
+                   "(cheaper than holdout tuning) and fold racing skips about 16% of the other "
+                   "fold fits, so for other models the search costs about 0.84 x folds times "
+                   "a holdout search"
+                   if _fast else
+                   ", so the search part of a tuned model takes about that many times longer "
+                   "than its calibrated (holdout-tuned) time")
+                + "; not yet calibrated (tier D).")
+    pool_sig = pool_signature(cfg.get('LD_PRUNE'), cfg.get('RF_FILTER'),
+                              cfg.get('OTHER_MODELS_MARKER_SOURCE', 'full_or_filtered'),
+                              cfg.get('GENOTYPE_FORMAT', 'csv'), cfg.get('ASREML'),
+                              cfg.get('JOINT_W_OPT'))
+    thread_options = [t for t in _THREAD_LADDER
+                      if t == 1 or any(THREAD_CAP.get(_base_of(m), 1) >= t for m in models)]
+    max_cap = max((THREAD_CAP.get(_base_of(m), 1) for m in models), default=1)
+    if max_cap > 1 and max_cap not in thread_options and max_cap < 64:
+        thread_options.append(max_cap)
+        thread_options.sort()
+    if limits['cores_per_node']:
+        thread_options = [t for t in thread_options if t <= limits['cores_per_node']] or [1]
+
+    def model_p(model: str) -> int:
+        # Bio-prior models see the raw marker set (I6); all others the filtered one.
+        return n_markers if _base_of(model).startswith('GAT_biological_prior') else p_filtered
+
+    # ---- per-(workers, threads) predictions --------------------------------
+    cache: Dict[Tuple[int, int], Dict[str, Any]] = {}
+
+    def predict_layout(w: int, t: int) -> Dict[str, Any]:
+        hit = cache.get((w, t))
+        if hit is not None:
+            return hit
+        key_sec = np.zeros(len(keys))
+        key_common = np.zeros(len(keys))
+        key_idio2 = np.zeros(len(keys))
+        model_sec = {m: np.zeros(len(keys)) for m in models}
+        model_pred: Dict[str, List[Any]] = {m: [] for m in models}
+        for k, (row, (n_task, n_train, has_valid)) in enumerate(zip(keys, shapes)):
+            phenotype = str(row[1])
+            parts: List[Tuple[float, float, float]] = []   # (seconds, sd_common, sd_idio)
+            for model in models:
+                base = _base_of(model)
+                tuned_cfg = hp_tune.get(base) if isinstance(hp_tune, Mapping) else None
+                tuned = bool(tuned_cfg) and bool(tuned_cfg.get('enabled')) and has_valid
+                pred = calibration.predict(
+                    model, _model_params(hparameters, model, phenotype),
+                    tuned_cfg if tuned else None, device, int(n_train), model_p(model), t, w)
+                model_sec[model][k] = pred.sec_mu
+                model_pred[model].append(pred)
+                parts.append((pred.sec_mu, pred.sd_common, pred.sd_idio))
+            model_total = sum(s for s, _, _ in parts)
+            extras = [calibration.predict_pseudo('__pool__', pool_sig, n_task, n_markers, w,
+                                                 (1.0 + (_POOL_COST_LD_PRUNE if ld_enabled else 0.0)
+                                                  + (_POOL_COST_RF_FILTER if rf_enabled else 0.0))
+                                                 * (_DEFAULT_POOL_BASE_S + _DEFAULT_POOL_PER_MEGA_NP_S
+                                                    * n_task * n_markers / 1.0e6)),
+                      calibration.predict_pseudo('__tail__', pool_sig, n_task, n_markers, w,
+                                                 _DEFAULT_TAIL_S)]
+            if n_asreml:
+                one = calibration.predict_pseudo('__asreml__', pool_sig, n_task, n_markers, w,
+                                                 _DEFAULT_ASREML_S)
+                extras.append(one)
+                parts.append((one.sec_mu * (n_asreml - 1), one.sd_common, one.sd_idio))
+            if joint_on and has_valid:
+                extras.append(calibration.predict_pseudo(
+                    '__joint__', pool_sig, n_task, n_markers, w,
+                    _DEFAULT_JOINT_FACTOR * model_total))
+            if iter_expected > 0 and has_valid and models:
+                extras.append(calibration.predict_pseudo(
+                    '__iter__', pool_sig, n_task, n_markers, w,
+                    iter_expected * model_total / len(models)))
+            sl_expected = (sl_fit_estimate(sl_cfg, len(models), sl_n_bio, has_valid)
+                           if sl_cfg is not None else 0)
+            if sl_expected > 0 and models:
+                extras.append(calibration.predict_pseudo(
+                    '__sl__', pool_sig, n_task, n_markers, w,
+                    sl_expected * model_total / len(models)))
+            for pred in extras:
+                parts.append((pred.sec_mu, pred.sd_common, pred.sd_idio))
+            total = sum(s for s, _, _ in parts)
+            key_sec[k] = total
+            if total > 0:
+                # Shared-parameter uncertainty is fully correlated across the pieces
+                # (a share-weighted mean); task-to-task scatter is independent.
+                key_common[k] = sum(s * c for s, c, _ in parts) / total
+                key_idio2[k] = sum((s * i) ** 2 for s, _, i in parts) / total ** 2
+        row_sec = key_sec[row_key]
+        weights = row_sec / max(float(row_sec.sum()), 1e-9)
+        # Share of the t allocated threads that does useful work: a model uses at
+        # most THREAD_CAP of them; the pool, ASReml, joint and tail stages use one.
+        used = sum(float(model_sec[m][row_key].sum()) * min(t, THREAD_CAP.get(_base_of(m), 1))
+                   for m in models)
+        modelled = sum(float(model_sec[m][row_key].sum()) for m in models)
+        used += max(float(row_sec.sum()) - modelled, 0.0)
+        value = {
+            'thread_use': used / (max(float(row_sec.sum()), 1e-9) * t),
+            'row_sec': row_sec,
+            'sd_common': float(np.dot(weights, key_common[row_key])),
+            'sd_idio': math.sqrt(float(np.dot(weights, key_idio2[row_key]))),
+            'model_sec': model_sec, 'model_pred': model_pred,
+            'startup': calibration.predict_pseudo('__startup__', pool_sig, 1.0, 1.0, w,
+                                                  _DEFAULT_STARTUP_S).sec_mu,
+        }
+        cache[(w, t)] = value
+        return value
+
+    # ---- memory: one figure per task (a worker's own peak) -----------------
+    # The request is assembled per layout below from the tasks each batch really
+    # holds; here only the single-worker peak and mean of every distinct task shape.
+    base_pred = predict_layout(1, 1)
+    key_peak_gb, key_mean_gb, mem_measured = np.zeros(len(keys)), np.zeros(len(keys)), True
+    for k, (row, (n_task, n_train, has_valid)) in enumerate(zip(keys, shapes)):
+        r_inc = o_inc = 0.0
+        sd_max = 0.0
+        for model in models:
+            pred = base_pred['model_pred'][model][k]
+            sd_max = max(sd_max, pred.mem_sd)
+            if _base_of(model) in _R_ACCUMULATING_MODELS:
+                r_inc += pred.mem_mu      # R sessions keep memory between models (arch §9.1)
+            else:
+                o_inc = max(o_inc, pred.mem_mu)
+        baseline, measured = calibration.baseline_gb(n_train, p_filtered)
+        mem_measured = mem_measured and measured
+        key_mean_gb[k] = baseline + r_inc + o_inc
+        key_peak_gb[k] = baseline + (r_inc + o_inc) * math.exp(z_mem * sd_max)
+    row_peak_gb, row_mean_gb = key_peak_gb[row_key], key_mean_gb[row_key]
+    worker_peak_gb = float(row_peak_gb.max())
+    if not mem_measured:
+        notes.append("Memory baseline is an assumption (no measured runs on this machine) - "
+                     "the pilot job replaces it with a measurement.")
+    mem_cache: Dict[Tuple[int, int], Tuple[float, float]] = {}
+
+    # ---- enumerate and evaluate layouts ------------------------------------
+    candidates = _layout_candidates(
+        n_tasks, limits['cores_per_node'], int(limits['max_array_subjobs']), thread_options, fixed)
+    per_gpu_floor = int(limits['ncpus_per_gpu'] or 0) if use_gpu else 0
+    charge_gb = limits['charge_mem_per_cpu_gb']
+    target_s = float(target_walltime_h) * 3600.0
+    evaluated: List[Dict[str, Any]] = []
+    for batch_size, w, t in candidates:
+        layout = predict_layout(w, t)
+        row_sec = layout['row_sec']
+        starts = np.arange(0, n_tasks, batch_size)
+        sums = np.add.reduceat(row_sec, starts)
+        worst = np.argsort(sums)[-2:]
+        makespan, tasks_in_worst = 0.0, batch_size
+        for b in worst:
+            chunk = row_sec[starts[b]:starts[b] + batch_size]
+            span = _lpt_makespan(chunk.tolist(), w)
+            if span >= makespan:
+                makespan, tasks_in_worst = span, len(chunk)
+        per_worker = max(1.0, tasks_in_worst / float(w))
+        spread = math.sqrt(layout['sd_common'] ** 2 + layout['sd_idio'] ** 2 / per_worker)
+        wall_mean = layout['startup'] + makespan
+        wall_req = (layout['startup'] + makespan * math.exp(z_wall * spread)) * float(margin_w)
+        wall_req = max(_MIN_WALLTIME_S, math.ceil(wall_req / _WALLTIME_ROUND_S) * _WALLTIME_ROUND_S)
+        n_batches = int(math.ceil(n_tasks / batch_size))
+        mem_key = (batch_size, w)
+        if mem_key not in mem_cache:
+            mem_cache[mem_key] = (
+                _worst_concurrent_sum(row_peak_gb, starts, batch_size, w),
+                _worst_concurrent_sum(row_mean_gb, starts, batch_size, w))
+        held_peak, held_mean = mem_cache[mem_key]
+        parent_gb = 0.0 if w == 1 else _PARENT_PROCESS_GB
+        mem_req = float(math.ceil(parent_gb + held_peak + _MEM_SLACK_GB))
+        mem_pred = parent_gb + held_mean
+        ncpus = max(w * t, per_gpu_floor)
+        ngpus = 1 if use_gpu else 0
+        charged = max(float(ncpus), (mem_req / float(charge_gb)) if charge_gb else 0.0)
+        su = n_batches * (wall_req / 3600.0) * charged
+        # Efficiency = useful core-seconds / allocated core-seconds. A task holds t cores
+        # for its wall time but only the share `thread_use` of them does useful work.
+        busy = float(row_sec[starts[worst[-1]]:starts[worst[-1]] + batch_size].sum())
+        cpu_eff = min(1.0, busy * layout['thread_use'] / (w * makespan)) if makespan > 0 else 0.0
+        violations = []
+        if limits['max_walltime_h'] and wall_req > limits['max_walltime_h'] * 3600.0:
+            violations.append('max_walltime_h')
+        if limits['mem_per_node_gb'] and mem_req > limits['mem_per_node_gb']:
+            violations.append('mem_per_node_gb')
+        if limits['cores_per_node'] and ncpus > limits['cores_per_node']:
+            violations.append('cores_per_node')
+        if n_batches > int(limits['max_array_subjobs']):
+            violations.append('max_array_subjobs')
+        if limits['gpus_per_node'] is not None and ngpus > limits['gpus_per_node']:
+            violations.append('gpus_per_node')
+        evaluated.append({
+            'batch_size': batch_size, 'w': w, 't': t, 'n_batches': n_batches,
+            'wall_req': wall_req, 'wall_mean': wall_mean, 'mem_req': mem_req,
+            'mem_pred': mem_pred, 'ncpus': ncpus, 'ngpus': ngpus, 'su': su,
+            'cpu_eff': cpu_eff, 'violations': violations, 'tasks_in_worst': tasks_in_worst,
+        })
+
+    feasible = [e for e in evaluated if not e['violations']]
+    infeasible, binding = False, None
+    if not feasible:
+        infeasible = True
+        pool = evaluated
+        counts: Dict[str, int] = {}
+        for e in evaluated:
+            for v in e['violations']:
+                counts[v] = counts.get(v, 0) + 1
+        binding = max(counts, key=counts.get) if counts else None
+        chosen = min(pool, key=lambda e: (len(e['violations']), e['wall_req'], e['su']))
+        notes.append(f"No layout satisfies every limit of profile {limits['profile']!r} "
+                     f"(binding: {binding}); showing the one that violates the fewest. "
+                     f"Reduce the work per subjob, or adjust the limits (Custom profile).")
+    elif objective == 'turnaround':
+        efficient = [e for e in feasible if e['cpu_eff'] >= _MIN_CPU_EFF_TURNAROUND]
+        if not efficient:
+            notes.append(f"No layout reaches CPU efficiency {_MIN_CPU_EFF_TURNAROUND:.0%}; "
+                         f"choosing the shortest walltime regardless.")
+        chosen = min(efficient or feasible, key=lambda e: (e['wall_req'], e['su']))
+    else:
+        within = [e for e in feasible if e['wall_req'] <= target_s]
+        if within:
+            chosen = min(within, key=lambda e: (e['su'], e['wall_req']))
+        else:
+            chosen = min(feasible, key=lambda e: (e['wall_req'], e['su']))
+            notes.append(f"No layout meets the {target_walltime_h:g} h target; "
+                         f"choosing the shortest walltime ({chosen['wall_req'] / 3600.0:.2f} h).")
+
+    # ---- report the chosen layout ------------------------------------------
+    layout = predict_layout(chosen['w'], chosen['t'])
+    per_model: List[Dict[str, Any]] = []
+    total_sec = float(layout['row_sec'].sum())
+    for model in models:
+        preds = layout['model_pred'][model]
+        seconds = layout['model_sec'][model][row_key]
+        worst_tier = max((p.tier for p in preds), key=lambda x: _TIER_RANK.get(x, 3), default='D')
+        per_model.append({
+            'model': model, 'tier': worst_tier, 'n_obs': min((p.n_obs for p in preds), default=0),
+            'sec_per_task': float(seconds.mean()),
+            'share': float(seconds.sum() / total_sec) if total_sec > 0 else 0.0,
+            'mem_gb': float(max((p.mem_mu for p in preds), default=0.0)),
+        })
+    tier_min = max((m['tier'] for m in per_model), key=lambda x: _TIER_RANK.get(x, 3), default='D')
+    if tier_min in ('C', 'D'):
+        notes.append(f"Lowest confidence tier is {tier_min}: some predictions rest on priors or "
+                     f"another machine. Run the pilot job (run_step1_batch.py --pilot) to measure.")
+    hours, rem = divmod(int(chosen['wall_req']), 3600)
+    result.update({
+        'ncpus': int(chosen['ncpus']), 'mem_gb': int(chosen['mem_req']), 'ngpus': int(chosen['ngpus']),
+        'suggested_batch_size': int(chosen['batch_size']),
+        'suggested_n_batches': int(chosen['n_batches']),
+        'total_tasks_per_batch': int(chosen['batch_size']),
+        'walltime_s': float(chosen['wall_req']),
+        'walltime_hms': f"{hours:02d}:{rem // 60:02d}:{rem % 60:02d}",
+        'walltime_mean_s': float(chosen['wall_mean']),
+        'n_cpu_workers_task': int(chosen['w']), 'n_jobs': int(chosen['t']),
+        'su_total': float(chosen['su']), 'cpu_eff_pred': float(chosen['cpu_eff']),
+        'per_model': per_model, 'tier_min': tier_min,
+        'infeasible': infeasible, 'binding': binding, 'n_layouts_evaluated': len(evaluated),
+        'worker_peak_gb': float(worker_peak_gb), 'machine_key': calibration.machine_key,
+        'calibration_records': int(calibration.n_records),
+    })
+    if chosen['ncpus'] > chosen['w'] * chosen['t']:
+        notes.append(f"ncpus raised from {chosen['w'] * chosen['t']} to {chosen['ncpus']} to meet "
+                     f"the GPU queue's {per_gpu_floor} CPUs per GPU.")
+    if not use_gpu and gpu_models:
+        notes.append("GPU-capable models run on the CPU (TORCH_DEVICE is not CUDA): ngpus=0.")
+    result['prediction'] = {
+        'engine': 'calibrated', 'hpc_profile': limits['profile'], 'objective': objective,
+        'ncpus': result['ncpus'], 'mem_gb_req': result['mem_gb'],
+        'mem_gb_pred': float(chosen['mem_pred']), 'ngpus': result['ngpus'],
+        'walltime_s_req': result['walltime_s'], 'walltime_s_pred_mean': result['walltime_mean_s'],
+        'batch_size': result['suggested_batch_size'], 'n_batches': result['suggested_n_batches'],
+        'n_cpu_workers_task': result['n_cpu_workers_task'], 'n_jobs': result['n_jobs'],
+        'cpu_eff_pred': result['cpu_eff_pred'], 'tier_min': tier_min,
+        'walltime_quantile': float(walltime_quantile), 'mem_quantile': float(mem_quantile),
+        'calibration_records': result['calibration_records'], 'machine_key': calibration.machine_key,
+        'total_tasks': n_tasks,
+    }
+    return result
+
+
+def calibration_dirs(cfg: Mapping[str, Any], extra: Optional[Sequence[str]] = None) -> List[str]:
+    """Telemetry folders the advisor should calibrate from, for the run ``cfg``.
+
+    Sources are taken from ``cfg['RESOURCE_ADVISOR']['calibration_sources']``
+    (default: the run's own ``RESULT_NAME`` and its ``<name>/_pilot``), then
+    ``extra`` (CLI ``--telemetry`` / the GUI's free-text path). Each entry may be
+    a Result name, a ``Result/<name>`` folder or the telemetry folder itself;
+    only folders that exist are returned, de-duplicated, order preserved.
+
+    Why one function: the GUI panel and ``tools/resource_advise.py`` must feed
+    the estimator identical telemetry so they print identical numbers (AC3.8).
+    """
+    import os
+    from pipeline_utils import telemetry_dir_for
+    from resource_telemetry import TELEMETRY_SUBDIR
+    advisor = cfg.get('RESOURCE_ADVISOR') or {}
+    result_name = str(cfg.get('RESULT_NAME') or '')
+    sources = advisor.get('calibration_sources')
+    if sources is None:
+        sources = [result_name, f"{result_name}/_pilot"] if result_name else []
+    out: List[str] = []
+    for source in list(sources) + list(extra or []):
+        source = str(source).strip()
+        if not source:
+            continue
+        candidates = [source, os.path.join(source, 'logs', TELEMETRY_SUBDIR),
+                      os.path.join(source, TELEMETRY_SUBDIR), telemetry_dir_for(source)]
+        for path in candidates:
+            if os.path.isdir(path) and any(name.endswith('.jsonl') for name in os.listdir(path)):
+                if path not in out:
+                    out.append(path)
+                break
+    return out
+
+
+def estimate_resources_static_from_cfg(
+    cfg: Mapping[str, Any], hpc_profile: Optional[str] = None,
+    ld_prune_estimated_n_markers: Optional[int] = None,
+) -> Dict[str, Any]:
+    """The STATIC (legacy) advisor's answer for the run ``cfg``, called the way the GUI's static
+    panel calls :func:`estimate_resources` (same keyword arguments, same two-call batch-size
+    pattern), so a headless caller and the panel print the same numbers.
+
+    Why it exists (ver4-95): while no telemetry exists the calibrated advisor has only priors
+    and is far less accurate than this heuristic, so ``tools/resource_advise.py`` falls back on
+    it exactly as the GUI panel does (``main_app._render_calibrated_advisor``).
+
+    Returns:
+        The ``estimate_resources`` dict (``ncpus``, ``mem_gb``, ``ngpus``,
+        ``suggested_batch_size``, ``suggested_n_batches``, ``notes``, ...) plus
+        ``engine='static'``. It has no walltime and no worker/thread split.
+
+    Raises:
+        ValueError / KeyError: ``cfg`` lacks what the estimate needs (SCENARIO, MODEL, ...);
+        the caller reports it.
+    """
+    from pipeline_utils import (build_sample_table_from_cfg, count_unique_populations,
+                                resolve_trait_columns)
+    n_population = count_unique_populations(
+        cfg.get('PHENOTYPE_FILE_NAME'), cfg.get('POPULATION_SOURCE')) or 1
+    phenotype = cfg.get('PHENOTYPE', 'all')
+    n_phenotype = len(phenotype) if phenotype != 'all' else max(
+        1, len(resolve_trait_columns(dict(cfg), cfg.get('PHENOTYPE_FILE_NAME', ''))))
+    kwargs = dict(
+        scenario=cfg['SCENARIO'], n_population=n_population, n_phenotype=n_phenotype,
+        n_ratio=len(cfg.get('RATIO', [1])), sample_num=cfg.get('ITER_NUM', 1),
+        model_run=cfg['MODEL'], ld_prune_enabled=cfg.get('LD_PRUNE') is not None,
+        rf_filter_enabled=cfg.get('RF_FILTER') is not None,
+        genotype_format=cfg.get('GENOTYPE_FORMAT', 'csv'),
+        genotype_file_name=cfg.get('GENOTYPE_FILE_NAME', ''),
+        phenotype_file_name=cfg.get('PHENOTYPE_FILE_NAME'),
+        w_opt_enabled=cfg.get('W_OPT') is not None,
+        between_validation_source=(cfg.get('BETWEEN_VALIDATION_SOURCE')
+                                   if cfg.get('BETWEEN_VALIDATION') else None),
+        n_between_ratio=max(1, len(cfg.get('BETWEEN_RATIO') or [1])),
+        n_excluded_combinations=len(cfg.get('EXCLUDED_POPULATION_COMBINATIONS') or []),
+        n_options=_n_asreml_options(cfg),
+        model_parallel_enabled=False, budget_ncpus=None, budget_ngpus=None, budget_mem_gb=None,
+        hparameters=cfg.get('HPARAMETERS'), hp_tune=cfg.get('HP_TUNE'),
+        other_models_marker_source=cfg.get('OTHER_MODELS_MARKER_SOURCE', 'full_or_filtered'),
+        pool_cost_in_headline=cfg.get('POOL_COST_IN_HEADLINE', True),
+        gpu_cpu_calibration_in_headline=cfg.get('GPU_CPU_CALIBRATION_IN_HEADLINE', True),
+        hpc_profile=hpc_profile or DEFAULT_HPC_PROFILE,
+        max_array_subjobs_override=None, ncpus_per_gpu_override=None,
+        rf_filter_cfg=cfg.get('RF_FILTER'),
+        ld_prune_estimated_n_markers=ld_prune_estimated_n_markers)
+    batch_size = (cfg.get('PARALLEL') or {}).get('batch_size')
+    n_batches = 1
+    if batch_size:
+        try:
+            total = len(build_sample_table_from_cfg(dict(cfg)))
+        except (ValueError, KeyError, TypeError):
+            total = n_population * n_phenotype * kwargs['n_ratio'] * kwargs['sample_num']
+        n_batches = max(1, int(math.ceil(max(1, total) / int(batch_size))))
+    estimate = estimate_resources(n_batches=n_batches, **kwargs)
+    if not batch_size and estimate.get('suggested_n_batches'):
+        estimate = estimate_resources(
+            n_batches=max(1, int(estimate['suggested_n_batches'])), **kwargs)
+    estimate = dict(estimate)
+    estimate['engine'] = 'static'
+    return estimate
+
+
+def estimate_pilot_resources(
+    cfg: Mapping[str, Any], k: int = 4, *, hpc_profile: str = DEFAULT_HPC_PROFILE,
+    profile_limits: Optional[Mapping[str, Any]] = None, max_walltime_h: float = 4.0,
+    calibration: Optional[Calibration] = None,
+) -> Dict[str, Any]:
+    """Resources for the pilot job of ``cfg`` (``run_step1_batch.py --pilot K``).
+
+    Prices exactly the ``k`` rows the pilot will run (``select_pilot_rows``) with
+    the layout already in the config (``N_CPU_WORKERS`` x ``N_JOBS``), using
+    ``calibration`` when given and tier-D priors otherwise, then doubles the
+    walltime (the pilot is the first look at a run, so its own prediction is the
+    least certain) and caps it at ``max_walltime_h``.
+
+    Returns:
+        ``{'ncpus', 'mem_gb', 'ngpus', 'walltime_s', 'walltime_hms', 'n_tasks', 'rows', 'tier_min'}``.
+    """
+    from pipeline_utils import build_sample_table_from_cfg, cheap_task_sizes, select_pilot_rows
+    table = build_sample_table_from_cfg(cfg)
+    sizes = cheap_task_sizes(cfg)
+    rows = select_pilot_rows(table, sizes, int(k))
+    workers = max(1, min(int(cfg.get('N_CPU_WORKERS_TASK', cfg.get('N_CPU_WORKERS', 1)) or 1),
+                         max(1, len(rows))))
+    threads = max(1, int(cfg.get('N_JOBS', 1) if int(cfg.get('N_JOBS', 1) or 1) > 0 else 1))
+    estimate = estimate_resources_calibrated(
+        cfg, calibration, hpc_profile=hpc_profile, objective='turnaround',
+        fixed={'batch_size': max(1, len(rows)), 'n_cpu_workers_task': workers, 'n_jobs': threads},
+        profile_limits=profile_limits, task_sizes=sizes, sample_table=table.iloc[rows])
+    walltime_s = min(2.0 * float(estimate['walltime_s']), float(max_walltime_h) * 3600.0)
+    walltime_s = max(_MIN_WALLTIME_S, math.ceil(walltime_s / _WALLTIME_ROUND_S) * _WALLTIME_ROUND_S)
+    hours, rest = divmod(int(walltime_s), 3600)
+    return {'ncpus': estimate['ncpus'], 'mem_gb': estimate['mem_gb'], 'ngpus': estimate['ngpus'],
+            'walltime_s': walltime_s, 'walltime_hms': f"{hours:02d}:{rest // 60:02d}:{rest % 60:02d}",
+            'n_tasks': len(rows), 'rows': rows, 'tier_min': estimate['tier_min']}

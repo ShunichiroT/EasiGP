@@ -40,6 +40,7 @@ Workflow
 """
 
 import argparse
+import plot_style as _plot_style   # ver4-31 R15
 import json
 import sys
 import time
@@ -48,14 +49,20 @@ import pandas as pd
 
 import checkpoint_utils as _ckpt
 from pipeline_utils import (
-    configure_r_environment, init_rpy2_conversion, restore_ratio,
+    configure_r_environment, init_rpy2_conversion, restore_ratio, iterative_labels,
+    super_learner_labels,   # ver4-77
     TimestampedWriter, make_run_log_path, apply_scratch_tmp_dir,
     # ver4-4 Stage 6 (R3.g): cheap, header/column-only reads used SOLELY to
     # compute an authoritative total-task count BEFORE calling GP() at all
     # (never a substitute for GP()'s own, real POPULATION/PHENOTYPE
     # resolution) - see the SEQUENTIAL_INTRA_BATCH branch below for why
     # this must be exact, not a best-effort estimate.
-    count_unique_populations, list_phenotype_columns,
+    count_unique_populations, list_phenotype_columns, resolve_trait_columns,
+    # ver4-25, R14: log-only check for fan-out/CPU-threading keys the GUI
+    # can no longer produce (see pipeline_utils.PINNED_FANOUT_DEFAULTS).
+    log_pinned_fanout_deviations,
+    # ver4-33: ACCELERATION dict (+ engine-only keys) to forward into GP().
+    acceleration_from_cfg,
 )
 # ver4-4 Stage 6 (R3.g): resource_profiles.py imports nothing Streamlit-
 # specific (see its own module-level imports - just pipeline_utils and the
@@ -94,6 +101,10 @@ def main():
 
     with open(args.config, 'r', encoding='utf-8-sig') as f:
         cfg = json.load(f)
+
+    # ver4-54 (R6): a Tool config belongs to run_tool.py - refuse it here, before any run.
+    if cfg.get('RUN_KIND') == 'tool':
+        sys.exit("This is a Tool config - run it with run_tool.py")
 
     # Update ID 2 (R1): intra-task model-level parallelism
     # (intra_task_parallel.py) is a Parallel-mode-only feature - it fans
@@ -146,6 +157,8 @@ def main():
               f"this run will be redone from scratch rather than resumed.")
         _ckpt.clear_checkpoint(cfg['RESULT_NAME'], 0, False)
         _ckpt.clear_result_files(cfg['RESULT_NAME'], 0, False)
+        from pipeline_utils import clear_memo_dir as _clear_memo_dir
+        _clear_memo_dir(cfg['RESULT_NAME'])
 
     configure_r_environment(cfg.get('R_PATH'), r_max_ppsize=cfg.get('R_MAX_PPSIZE', 500000))
     init_rpy2_conversion()
@@ -154,6 +167,7 @@ def main():
     from genomic_prediction import GP
     from metric_summary import write_metric_summary
     from metric_plot import metric_plot
+    from accuracy_metrics_plot import accuracy_metrics_plot, any_plot_requested as any_accuracy_plot_requested
     from scatter_plot import scatter_plot
     from circos_plot import circos_plot, _broadcast_population_info, _clean_population_label
     from attention_histogram import attention_distribution
@@ -171,6 +185,9 @@ def main():
     ratio = restore_ratio(cfg['RATIO'], cfg['SCENARIO'])
 
     print(f"[run_sequential] RESULT_NAME={cfg['RESULT_NAME']} models={cfg['MODEL']}")
+    # ver4-25, R14: purely informational - see log_pinned_fanout_deviations()'s
+    # own docstring. Never changes cfg or how GP() is called below.
+    log_pinned_fanout_deviations(cfg, log_prefix='[run_sequential]')
 
     # ver4-4 R7.g/R7.h: resolved once, here, and reused at every plotting
     # call below - PLOT_EFFECT_FLOAT32 (default True) and PLOT_DPI - see
@@ -213,6 +230,15 @@ def main():
         GENOTYPE_FORMAT=cfg.get('GENOTYPE_FORMAT', 'csv'), GENOTYPE_PLINK_PATH=cfg.get('GENOTYPE_PLINK_PATH', 'plink2'),
         OTHER_MODELS_MARKER_SOURCE=cfg.get('OTHER_MODELS_MARKER_SOURCE', 'full_or_filtered'),
         HP_TUNE=cfg.get('HP_TUNE'), HP_TUNE_ENSEMBLE_MODE=cfg.get('HP_TUNE_ENSEMBLE_MODE', 'per_method'),
+        # ver4-26, R4 (design blueprint `EasiGP_ver4-26_Design_Blueprint.md`
+        # hand-off checklist): forward the two new joint-search keys into
+        # GP() - None/absent for every pre-ver4-26 config (I11), matching
+        # this dict's own established "forward the new keys into GP()"
+        # precedent (see ver4-4 Stage 5's identical note just below).
+        JOINT_W_OPT=cfg.get('JOINT_W_OPT'), HYPERPARAMETERS_JOINT_OPT=cfg.get('HYPERPARAMETERS_JOINT_OPT'),
+        ITERATIVE_ENSEMBLE=cfg.get('ITERATIVE_ENSEMBLE'),  # ver4-57: opt-in, None = off
+        SUPER_LEARNER=cfg.get('SUPER_LEARNER'),  # ver4-77: opt-in, None = off
+        SEED_BAG=cfg.get('SEED_BAG'),  # ver4-102 (P4): opt-in, None = off
         MIN_DATA_POINTS=cfg.get('MIN_DATA_POINTS', 100),
         # Update ID 2 (R2) - Test Report D1 fix: forward GPU_SLOTS_PER_DEVICE
         # from the config JSON through to GP() (-> resolve_compute_resources()),
@@ -274,6 +300,9 @@ def main():
         # resolve_compute_resources()'s own docstring for each key's full
         # meaning.
         HP_TUNE_BAYES_DOMAIN_REDUCTION=cfg.get('HP_TUNE_BAYES_DOMAIN_REDUCTION', 'auto'),
+        HP_TUNE_BAYES_MULTI_FIDELITY=cfg.get('HP_TUNE_BAYES_MULTI_FIDELITY', False),
+        HP_TUNE_FAST=cfg.get('HP_TUNE_FAST'),   # ver4-40 R1 (None = legacy tuning)
+        HP_TUNE_PRESET_FILE=cfg.get('HP_TUNE_PRESET_FILE'),   # ver4-61 R6 (None = no preset)
         HP_TUNE_WARM_START=cfg.get('HP_TUNE_WARM_START', False),
         HP_TUNE_SELECTION_MARGIN=cfg.get('HP_TUNE_SELECTION_MARGIN', 0.02),
         HP_TUNE_VALID_REPEATS=cfg.get('HP_TUNE_VALID_REPEATS', 1),
@@ -288,6 +317,39 @@ def main():
         # default 'gzip' matches GP()'s own default and every other new
         # RESULT_COMPRESSION-aware entry point in this codebase.
         RESULT_COMPRESSION=cfg.get('RESULT_COMPRESSION', 'gzip'),
+        # Update ID ver4-12 (design blueprint SS4 config schema delta) -
+        # five further keys, same forward-every-new-key discipline, same
+        # legacy-preserving defaults (I11): a ver4-11 sequential_config.json
+        # lacking every one of these reproduces ver4-11 behaviour exactly -
+        # ASREML off, phenotype file handling and population derivation
+        # both unchanged.
+        ASREML=cfg.get('ASREML'),
+        ASREML_STRICT=cfg.get('ASREML_STRICT', True),
+        # Requirements.md item 4: per-phenotype 'higher'/'lower' direction for the
+        # always-computed Top-k Coincidence / Czekanowski metrics (independent of ASReml).
+        METRIC_DIRECTIONS=cfg.get('METRIC_DIRECTIONS'),
+        # ver4-33 (design blueprint SS4): None for every pre-ver4-33 config
+        # (-> ver4-32 behaviour, I11).
+        ACCELERATION=acceleration_from_cfg(cfg),
+        PHENOTYPE_FILE_MODE=cfg.get('PHENOTYPE_FILE_MODE', 'analysed'),
+        PHENOTYPE_TRAIT_COLUMNS=cfg.get('PHENOTYPE_TRAIT_COLUMNS'),
+        POPULATION_SOURCE=cfg.get('POPULATION_SOURCE'),
+        # Requirements.md (between-prediction validation-set patch),
+        # items 1-4 - same forward-every-new-key discipline. Every
+        # default reproduces GP()'s own pre-patch behaviour exactly
+        # (I11): BETWEEN_VALIDATION absent -> None -> validation-presence
+        # for a 'between' run is still inferred from W_OPT alone, and
+        # EXCLUDED_POPULATION_COMBINATIONS absent -> None -> excludes
+        # nothing.
+        BETWEEN_VALIDATION=cfg.get('BETWEEN_VALIDATION'),
+        BETWEEN_VALIDATION_SOURCE=cfg.get('BETWEEN_VALIDATION_SOURCE'),
+        BETWEEN_RATIO=cfg.get('BETWEEN_RATIO'),
+        EXCLUDED_POPULATION_COMBINATIONS=cfg.get('EXCLUDED_POPULATION_COMBINATIONS'),
+        # ver4-56 (blueprint R1): log-only usage records; an absent key means True (I11,
+        # justified in the blueprint: log-only, overhead < 0.1 %). Resolved + logged by
+        # pipeline_utils.resolve_compute_resources().
+        RESOURCE_TELEMETRY=cfg.get('RESOURCE_TELEMETRY', True),
+        RESOURCE_TELEMETRY_INTERVAL_S=cfg.get('RESOURCE_TELEMETRY_INTERVAL_S', 0.5),
     )
 
     # ver4-4 Stage 6 (blueprint §2.3.2 R3.g, "Sequential intra-batch
@@ -332,25 +394,36 @@ def main():
         # attempt fan-out (falling back to the always-correct legacy path
         # instead, with a clear NOTE) whenever any input to that formula
         # can't be determined cheaply and reliably.
-        if cfg.get('GENOTYPE_FORMAT', 'csv') == 'plink':
-            # GP() itself resolves POPULATION from the PHENOTYPE file for
-            # PLINK genotype input (see genomic_prediction.py's own
-            # GENOTYPE_FORMAT == 'plink' branch) - phenotype files are
-            # always CSV regardless of genotype format, so the same
-            # column-1-only reader applies.
-            _n_population = count_unique_populations(cfg['PHENOTYPE_FILE_NAME'])
-        else:
-            _n_population = count_unique_populations(cfg['GENOTYPE_FILE_NAME'])
+        # Update ID ver4-12, R2 (design blueprint SS2.2, Appendix A finding
+        # A3): GP() now resolves POPULATION from the PHENOTYPE file's own
+        # (possibly DERIVED) population column for BOTH genotype formats -
+        # previously CSV read it from the GENOTYPE file. Reading the
+        # genotype file's own column here (the pre-ver4-12 'else' branch)
+        # would now silently MISCOUNT population whenever POPULATION_SOURCE
+        # derives population from something other than a literal
+        # 'population' column - exactly the under-count this whole block's
+        # own comment warns is worse than falling back to the legacy path.
+        # `count_unique_populations()`'s own `population_source` argument
+        # (`None` reproduces ver4-11 exactly - I11) is the SAME single
+        # authority GP() itself calls via `derive_population_series()`.
+        _n_population = count_unique_populations(cfg['PHENOTYPE_FILE_NAME'], cfg.get('POPULATION_SOURCE'))
 
         if isinstance(cfg['PHENOTYPE'], list):
             _n_phenotype = len(cfg['PHENOTYPE'])
         else:
-            # PHENOTYPE == 'all' - GP() itself resolves this to
-            # list(data_phenotype_original.columns[2:]); list_phenotype_
-            # columns() reads the SAME phenotype file's header the SAME
-            # way (columns 3+, in file order) to get an identical count
-            # without reading a single data row.
-            _n_phenotype = len(list_phenotype_columns(cfg['PHENOTYPE_FILE_NAME']))
+            # PHENOTYPE == 'all' - GP() itself resolves this via
+            # resolve_trait_columns() (R3), which is list_phenotype_
+            # columns() unchanged under the default PHENOTYPE_FILE_MODE=
+            # 'analysed' (I11), and PHENOTYPE_TRAIT_COLUMNS under 'raw'.
+            # Falls back to 0 (triggering the always-correct legacy path
+            # just below) rather than raising, since a headless config
+            # error here should not crash resource sizing - GP() itself
+            # will raise with a much more specific message when it
+            # actually loads the file.
+            try:
+                _n_phenotype = len(resolve_trait_columns(cfg, cfg['PHENOTYPE_FILE_NAME']))
+            except Exception:
+                _n_phenotype = 0
 
         if _n_population is None or _n_population == 0 or _n_phenotype == 0:
             print(f"[run_sequential] NOTE: SEQUENTIAL_INTRA_BATCH=True but this run's own total "
@@ -424,11 +497,34 @@ def main():
         population = result.population
         phenotype = result.phenotype
         attention = result.attention()
+        asreml_varcomp_for_summary = result.asreml_varcomp()
     else:
         (metrics, predicted_result_train, predicted_result_test, effect,
          interactions, population, phenotype, attention) = GP(**gp_kwargs)
+        # ver4-25, R10 (design blueprint stage 3): `GP()`'s own return
+        # contract (architecture doc SS7) is an 8-tuple and is NOT
+        # extended here - `ASReml_variance_components.csv` is instead
+        # read back from disk exactly like the SEQUENTIAL_INTRA_BATCH
+        # branch above already does via `ResultSet`, since `GP()` itself
+        # already wrote it (or an empty placeholder) before returning.
+        # Cheap even here - `ResultSet.__init__` only eagerly reads the
+        # small `Metric.csv`; `asreml_varcomp()` is read lazily, on this
+        # one call, and never again.
+        asreml_varcomp_for_summary = ResultSet(cfg['RESULT_NAME'], source='combined').asreml_varcomp()
     print(f'[run_sequential] Genomic prediction finished (took {time.time() - _t0:.1f}s). '
           f'See the [GP] lines above for LD-pruning and per-model detail.')
+
+    # Requirements.md item 3 (multi-option update): two or more selected
+    # genotype-effect options -> every result file carries the leading
+    # option column and the reporting chain runs once per option (own
+    # sub-folder) plus the cross-option plots. A single-option run takes
+    # the unchanged chain below (I11).
+    from reporting_pipeline import is_multi_option_run, run_multi_option_reports
+    if is_multi_option_run(cfg):
+        from batch_reader import ResultSet
+        run_multi_option_reports(cfg, ResultSet(cfg['RESULT_NAME'], source='combined'),
+                                 log=lambda m: print(f'[run_sequential] {m}'))
+        return
 
     # Update ID 3, R3: the Metric_summary.xlsx workbook (or its CSV
     # degrade), written immediately once GP() returns and before the first
@@ -455,11 +551,14 @@ def main():
         model_labels = pd.unique(metrics['model']).tolist()
     else:
         model_labels = cfg['MODEL'] + cfg['W_OPT'] if cfg['W_OPT'] is not None else cfg['MODEL']
+        model_labels = list(model_labels) + iterative_labels(cfg)   # ver4-57
+        model_labels = list(model_labels) + super_learner_labels(cfg)   # ver4-77
 
     _t0 = time.time()
     _summary_paths = write_metric_summary(
         metrics, cfg['RESULT_NAME'], create=cfg.get('METRIC_SUMMARY_CREATE', True),
-        model_order=model_labels,
+        model_order=model_labels, asreml_varcomp=asreml_varcomp_for_summary,
+        label_style=cfg.get('MODEL_LABEL_STYLE', 'full'),
     )
     if _summary_paths:
         print(f"[run_sequential] Metric summary written: {', '.join(_summary_paths)} "
@@ -475,10 +574,30 @@ def main():
     # what GP() actually wrote, regardless of which route (ordinary
     # serial loop or SEQUENTIAL_INTRA_BATCH) produced it.
     _t0 = time.time()
+    # ver4-25, R8 (design blueprint SS2, Stage 6; Stage 6 completion for
+    # 'full' mode): build a per-scenario BLUE-reliability weight resolver
+    # from the SAME resume-safe sidecar `models/ensemble.py`'s own
+    # naive-ensemble finalisation already reads
+    # (`asreml_accuracy_metrics.ctx_resolver_from_frame()`), PLUS the
+    # 'full'-mode test-weight-matrix accumulator (only ever non-empty for
+    # a 'full'-mode run); `None` whenever NEITHER sidecar was ever
+    # written at all (ASReml/blue_weighting off for this whole run),
+    # which keeps `build_dpt_terms()` a byte-identical, unweighted
+    # computation (I11).
+    _asreml_accuracy_ctx_for_dpt = load_combined(cfg['RESULT_NAME'], 'asreml_accuracy_ctx')
+    _asreml_test_weights_for_dpt = load_combined(cfg['RESULT_NAME'], 'asreml_test_weights')
+    _dpt_weight_resolver = None
+    if ((_asreml_accuracy_ctx_for_dpt is not None and _asreml_accuracy_ctx_for_dpt.shape[0] != 0)
+            or (_asreml_test_weights_for_dpt is not None and _asreml_test_weights_for_dpt.shape[0] != 0)):
+        import asreml_accuracy_metrics as _aam
+        _dpt_weight_resolver = _aam.ctx_resolver_from_frame(
+            _asreml_accuracy_ctx_for_dpt, _asreml_test_weights_for_dpt)
+
     _dpt_terms = build_dpt_terms(
         load_combined(cfg['RESULT_NAME'], 'result_test'),
         load_combined(cfg['RESULT_NAME'], 'weight'),
         metrics,
+        sample_weight_resolver=_dpt_weight_resolver,
     )
     _dpt_paths = write_dpt_summary(
         _dpt_terms, cfg['RESULT_NAME'], create=cfg.get('DPT_SUMMARY_CREATE', True),
@@ -488,10 +607,16 @@ def main():
         # plots) would otherwise reintroduce a permanently-blank column
         # per single-prediction model.
         model_order=dpt_model_order(model_labels),
+        label_style=cfg.get('MODEL_LABEL_STYLE', 'full'),
     )
     if _dpt_paths:
         print(f"[run_sequential] Diversity Prediction Theorem summary written: "
               f"{', '.join(_dpt_paths)} (took {time.time() - _t0:.1f}s).")
+
+    # ver4-99 (R2) / ver4-103 (X03): marker / pair stability across iterations. Off unless
+    # STABILITY_SUMMARY_CREATE is true; never fatal (the call logs and returns on any failure).
+    from stability_summary import run_stability_report as _run_stability_report
+    _run_stability_report(cfg, cfg['RESULT_NAME'], lambda: load_combined(cfg['RESULT_NAME'], 'effect'), print)
 
     # Requirement 6: once every prediction scenario has finished, average
     # every per-scenario LD decay CSV (written above, inside GP(), if the
@@ -511,8 +636,24 @@ def main():
 
     if cfg.get('METRIC_PLOT_CREATE', True):
         _t0 = time.time()
-        metric_plot(metrics.copy(), model_labels, cfg['RESULT_NAME'], cfg['SCENARIO'], cfg.get('METRIC_PLOT_CONFIG'), PLOT_DPI=_metric_plot_dpi)
+        metric_plot(metrics.copy(), model_labels, cfg['RESULT_NAME'], cfg['SCENARIO'], _plot_style.with_extra_formats(cfg.get('METRIC_PLOT_CONFIG'), cfg), PLOT_DPI=_metric_plot_dpi)
         print(f'[run_sequential] Metric plots generated (took {time.time() - _t0:.1f}s).')
+
+    # Requirements.md (BLUEs/BLUPs accuracy-metrics phase), item 8 - the
+    # five accuracy-metric visualisations, gated on their own dedicated
+    # Tab 5 checkbox (default False - a new plot type, opt-in rather than
+    # appearing unannounced, mirroring WEIGHT_PLOT_CREATE's own default-
+    # off precedent). A no-op regardless if Metric.csv never gained the
+    # new columns in the first place (accuracy_metrics_plot()'s own
+    # column-presence checks).
+    if any_accuracy_plot_requested(cfg):
+        _t0 = time.time()
+        accuracy_metrics_plot(metrics.copy(), model_labels, cfg['RESULT_NAME'], cfg['SCENARIO'],
+                               cfg.get('ACCURACY_METRICS_PLOT_CONFIG'),
+                               ACCURACY_BUBBLE_PLOT_CREATE=cfg.get('ACCURACY_BUBBLE_PLOT_CREATE', False),
+                               prediction_test=predicted_result_test, cfg=cfg,
+                               effect=effect)
+        print(f'[run_sequential] Accuracy-metric plots generated (took {time.time() - _t0:.1f}s).')
 
     # Update ID ver4-9, R6: WEIGHT_PLOT_CREATE default False when absent
     # (a standalone/legacy JSON config predating this key) - a
@@ -531,7 +672,7 @@ def main():
         _naive_for_plot = next((info['models'] for info in _members_for_plot.values() if info['is_naive']), None)
         _weight_plot_paths = weight_plot(
             _weight_for_plot, model_labels, cfg['RESULT_NAME'], cfg['SCENARIO'],
-            cfg.get('WEIGHT_PLOT_CONFIG'), PLOT_DPI=cfg.get('WEIGHT_PLOT_DPI', 300),
+            _plot_style.with_extra_formats(cfg.get('WEIGHT_PLOT_CONFIG'), cfg), PLOT_DPI=cfg.get('WEIGHT_PLOT_DPI', 300),
             naive_models=_naive_for_plot,
         )
         if _weight_plot_paths:
@@ -566,7 +707,11 @@ def main():
         # change, so those are filtered back out here to match that existing
         # scope exactly.
         if cfg.get('HP_TUNE'):
-            _wopt_prefixes = ('Linear transformation', 'Nelder Mead', 'Bayesian optimisation', 'Analytic least-squares')
+            # ver4-57: 'Iterative ensemble' joins the weighted labels filtered out here - with HP_TUNE
+            # model_labels is read from Metric.csv, which now carries that label when it is on.
+            # ver4-77: 'Super learner' joins them for the same reason.
+            _wopt_prefixes = ('Linear transformation', 'Nelder Mead', 'Bayesian optimisation', 'Analytic least-squares',
+                              'Iterative ensemble', 'Super learner')
             scatter_models = [m for m in model_labels
                                if not any(m == p or m.startswith(p + '__') for p in _wopt_prefixes)]
         else:
@@ -579,11 +724,20 @@ def main():
         # CIRCOS_CREATE-gated validation) - passed through unconditionally;
         # it's a no-op for a legacy 2-column QTL file or QTL=None.
         scatter_plot(scatter_models, phenotype, predicted_result_test, effect_for_plots,
-                     cfg['QTL'], cfg['SCATTER_CONFIG'], cfg['RESULT_NAME'],
+                     cfg['QTL'], _plot_style.with_extra_formats(cfg['SCATTER_CONFIG'], cfg), cfg['RESULT_NAME'],
                      MARKER_INFO=cfg.get('MARKER_INFO'),
                      QTL_WINDOW=cfg.get('QTL_WINDOW', 0.0),
                      QTL_WINDOW_MODE=cfg.get('QTL_WINDOW_MODE', 'all_in_window'),
-                     PLOT_DPI=_scatter_plot_dpi)
+                     PLOT_DPI=_scatter_plot_dpi,
+                     # Requirements.md item 4: cfg.get(...) with a False
+                     # default reproduces a pre-existing sequential_config.json's
+                     # exact (level-based) colouring unchanged.
+                     COLOR_BY_POPULATION=cfg.get('SCATTER_COLOR_BY_POPULATION', False),
+                     # Requirements.md item 5 (this session): cfg.get(...)
+                     # with a True default reproduces a pre-existing
+                     # sequential_config.json's exact (always-normalised)
+                     # marker-effect scaling unchanged.
+                     NORMALIZE_MARKER_EFFECT=cfg.get('SCATTER_NORMALIZE_MARKER_EFFECT', True))
         print(f'[run_sequential] Scatter plot matrix generated (took {time.time() - _t0:.1f}s).')
 
     if cfg.get('CIRCOS_CREATE', True):
@@ -610,11 +764,26 @@ def main():
                 _gene_info_path = _broadcast_population_info(_gene_info_path, _target_pops, 'gene')
             print(f"[run_sequential] Broadcast target populations: {_target_pops} | "
                   f"broadcast chrom file: {_chrom_info_path} | broadcast gene file: {_gene_info_path}")
+        # Update ID ver4-25, R12: `interactions` above is GP()'s own
+        # in-memory accumulator, which never carries k>=3 rows (see
+        # genomic_prediction.py's own comment on why GP()'s positional
+        # return tuple was NOT extended) - read the durable-only
+        # Interaction_higher_order.csv off disk here via load_combined(),
+        # the SAME pattern this script already uses for Weight.csv (see
+        # `_weight_for_plot` above) for the identical reason.
+        _interactions_hok = load_combined(cfg['RESULT_NAME'], 'interactions_hok')
         circos_plot(effect_for_plots, interactions, cfg['MARKER_INFO'], _chrom_info_path,
-                    _gene_info_path, population, phenotype, cfg['CIRCOS_CONFIG'],
+                    _gene_info_path, population, phenotype, _plot_style.with_extra_formats(cfg['CIRCOS_CONFIG'], cfg),
                     cfg['END_ADJUST'], cfg['WINDOW'], cfg['CYTOBAND_COLORMAP'],
                     cfg['RESULT_NAME'], attention, cfg['SCENARIO'], cfg['ASCENDING'],
                     gene_adjust=cfg.get('GENE_ADJUST', 0), plot_dpi=_circos_plot_dpi,
+                    interactions_hok=_interactions_hok,
+                    # Update ID ver4-25, R12: absent from every config that
+                    # predates this feature, so `.get(..., (2,))`/
+                    # `.get(..., 'per_order')` reproduce today's k=2-only,
+                    # unconditional render exactly (I11/AC12.3).
+                    interaction_orders=cfg.get('CIRCOS_INTERACTION_ORDERS', (2,)),
+                    higher_order_layout=cfg.get('CIRCOS_HIGHER_ORDER_LAYOUT', 'per_order'),
                     # Performance (multi-CPU circos-plot rendering): absent
                     # from every config that predates this feature, so
                     # `.get(..., 1)` reproduces today's fully-serial
@@ -622,7 +791,12 @@ def main():
                     # _resolve_circos_plot_workers()'s own docstring for
                     # the daemon-safety/capping this value is still
                     # subject to even when set above 1.
-                    n_workers=cfg.get('CIRCOS_PLOT_WORKERS', 1))
+                    n_workers=cfg.get('CIRCOS_PLOT_WORKERS'),
+                    # N_JOBS fix: when CIRCOS_PLOT_WORKERS is absent
+                    # (None), circos_plot() now takes its worker count
+                    # from N_JOBS instead of silently rendering serially
+                    # - see circos_plot._resolve_circos_plot_workers().
+                    n_jobs=cfg.get('N_JOBS'))
         print(f'[run_sequential] Circos plot generated (took {time.time() - _t0:.1f}s).')
     print('[run_sequential] Pipeline completed successfully.')
 

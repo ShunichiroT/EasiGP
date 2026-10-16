@@ -527,6 +527,36 @@ dependencies:
       # published minor version.
       - xgboost==3.2.*
       - interpret==0.7.*
+      # shapiq - Tier 2 OPTIONAL explainability package (ver4-25, Stage 7/8,
+      # design blueprint R11/R13). Entirely opt-in: every 'Marker effect
+      # method'/'Marker interaction method' field that offers a shapiq-based
+      # choice (rrBLUP/BayesB/GBLUP/RKHS/RF/SVR/KNN's own 'closed_form'/
+      # 'shapiq_predictor'/'surrogate_shapiq'/'shapiq_tree'/'shapiq' choices)
+      # still defaults to (or falls back to, on any shapiq failure, with a
+      # printed NOTE - see pipeline_utils.py's own shapiq-helpers header
+      # comment) an existing, unchanged, already-verified route that needs
+      # no optional package at all - so a node without shapiq installed
+      # keeps working exactly as before this update (I11/I12).
+      #
+      # Pinned to 1.4.1, NOT the newest release, because shapiq 1.5.0
+      # (2026-05-29) dropped Python 3.10/3.11 support and now requires
+      # Python>=3.12, which conflicts with this file's own python=3.11.11
+      # pin (itself driven by numba's own tested-support ceiling - see the
+      # numpy note above). 1.4.1 (2025-11-10) is the newest release that
+      # still supports Python 3.11. Revisit this pin (both shapiq AND the
+      # python= pin above) together if this environment is ever rebased
+      # onto Python 3.12+.
+      #
+      # DISCLOSED LIMITATION: shapiq could not be installed in the sandbox
+      # this update was authored in (no PyPI network access there) - every
+      # shapiq-dependent function in this codebase (pipeline_utils.py's
+      # shapiq_marker_effects()/shapiq_pairwise_interactions()/
+      # shapiq_tree_interactions()) was written directly against shapiq's
+      # own public documentation/API surface, not verified by actually
+      # running it. Recommended before production use: install this pin,
+      # run one task with a shapiq-based method selected, and confirm no
+      # fallback NOTE is printed.
+      - shapiq==1.4.1
 
 # ---------------------------------------------------------------------------
 # Update ID ver4-5, R2 Stage 11 (decision D2, invariant I12): 'XGBoost' and
@@ -543,5 +573,49 @@ dependencies:
 # Phase 2 preparation - see the ver4-5 Change Summary's own Appendix-B-
 # style evidence log; a compatible newer release should also work, but
 # has not been separately verified.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Update ID ver4-12, R13 (design blueprint SS2.13, invariant I12): 'asreml'
+# (Preprocess/asreml_blup.py, Preprocess/asreml_fit.R - the optional
+# ASReml-R BLUE/BLUP-substitution stage, Step 6b of GP()'s per-task flow) is
+# a COMMERCIAL, licensed R package - it is NOT listed above, and must NEVER
+# be added to this file's own 'dependencies:'/'pip:' lists, because:
+#   - it is not distributed on CRAN, conda-forge, or any channel already
+#     configured above (it is not `conda install`-able or `pip install`-
+#     able at all);
+#   - even once manually installed, it additionally requires a per-machine
+#     licence activation (see Preprocess/asreml_license.py) before it can
+#     fit a single model - something no package manager can express.
+#
+# EasiGP's ASReml-R integration is entirely OPTIONAL (ASREML=None, the
+# default, disables Step 6b completely - see the ver4-12 design blueprint's
+# rollback plan) - every other model/feature in this codebase works fully
+# without 'asreml' ever being installed, exactly like the Tier 2 xgboost/
+# interpret packages above degrade gracefully when absent (though, unlike
+# those two, there is no `is_available()`-style silent skip for 'asreml' -
+# it fails FAST and LOUDLY, before task 0, via
+# Preprocess.asreml_license.preflight_check(), if ASREML is enabled but the
+# package turns out to be missing or unlicensed).
+#
+# To use the ASReml-R stage, INSTALL AND LICENSE ASReml-R MANUALLY, into the
+# SAME R installation this conda environment's own R_PATH points at
+# (rrBLUP/GBLUP/BayesB/RKHS's R installation - see configure_r_environment()
+# in pipeline_utils.py):
+#   1. Obtain a licensed copy of ASReml-R 4 from VSNi
+#      (https://www.vsni.co.uk/software/asreml-r/) - a commercial purchase
+#      or an academic/trial licence, per VSNi's own terms.
+#   2. Install the package into this environment's own R library path,
+#      following VSNi's own installation instructions for your platform
+#      (typically `install.packages("path/to/asreml_x.y.z.tar.gz", repos =
+#      NULL, type = "source")` from within THIS conda environment's R).
+#   3. Activate your licence, either from an R session
+#      (`asreml::asreml.license.activate("<your code>")`) or via EasiGP's
+#      own GUI (Tab 2's ASReml-R section - Preprocess/asreml_license.py).
+#      Activation is PER-MACHINE - a submission/login host and an HPC
+#      compute node are typically separate machines and each needs its own
+#      activation.
+#   4. Confirm with `Preprocess.asreml_license.license_status()` (or the
+#      GUI's own live status badge) before enabling ASREML on a real run.
 # ---------------------------------------------------------------------------
 

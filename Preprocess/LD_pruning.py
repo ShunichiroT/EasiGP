@@ -610,6 +610,72 @@ def _pairwise_r2(x: np.ndarray, y: np.ndarray) -> float:
     return ld_kernels.pairwise_r2(x, y, degenerate=0.0)
 
 
+_CM_BAND_BLOCK = 512    # anchors per block of the banded cM pruning (ver4-35, R1.g1)
+
+
+def _cm_window_end(cms: np.ndarray, i: int, window_cm: float) -> int:
+    """Exclusive end index of anchor `i`'s window: the first ``j > i`` whose
+    ``cms[j] - cms[i] > window_cm`` (or ``len(cms)``). `cms` is ascending.
+
+    ``searchsorted`` finds the end quickly; the two small loops then apply the
+    legacy test ``(cms[j] - cms[i]) <= window_cm`` itself, so a window edge
+    that floating-point addition would place one marker off is decided exactly
+    as the per-pair loop decides it."""
+    n = len(cms)
+    end = int(np.searchsorted(cms, cms[i] + window_cm, side='right'))
+    end = min(max(end, i + 1), n)
+    while end > i + 1 and not (cms[end - 1] - cms[i]) <= window_cm:
+        end -= 1
+    while end < n and (cms[end] - cms[i]) <= window_cm:
+        end += 1
+    return end
+
+
+def _cm_prune_banded(block: np.ndarray, cms: np.ndarray, window_cm: float,
+                     r2_threshold: float, device: str,
+                     block_size: int = _CM_BAND_BLOCK) -> np.ndarray:
+    """Keep-mask of the greedy cM pruning of ONE chromosome, computed with a
+    banded r^2 instead of the whole ``n x n`` matrix (ver4-35, R1.g1).
+
+    Why: ``pairwise_r2_matrix(block)`` is O(n^2) in time AND memory
+    (a 40,000-marker chromosome needs about 13 GB), although the greedy loop
+    only ever reads values inside a cM window. Here anchors are taken in
+    blocks of `block_size`; for each block one rectangular
+    ``ld_kernels.pairwise_r2_cross(block_anchors, block_columns_up_to_the_
+    furthest_window_end)`` is computed - memory O(block_size x window).
+
+    Same decisions as the per-pair loop: for an anchor that is still kept,
+    every later marker inside its window whose ``r^2 > r2_threshold`` and that
+    is still kept is dropped. Within one anchor that decision for marker j
+    depends only on r^2(i, j) and on whether j was dropped by an EARLIER
+    anchor, so the inner loop becomes one vectorised mask operation without
+    changing the anchor order (invariant I7). The r^2 values come from
+    differently shaped matrix products than the full matrix, so they agree
+    with it to floating-point summation order, not bit for bit - which is why
+    this path is opt-in (``ACCELERATION['ld_cm_banded']``).
+
+    `block` must contain no ``NaN`` (the caller keeps the exact per-pair path
+    for a chromosome with missing calls). Returns a boolean array of length
+    ``len(cms)``."""
+    n = len(cms)
+    keep = np.ones(n, dtype=bool)
+    for first in range(0, n, block_size):
+        last = min(n, first + block_size)
+        reach = max(_cm_window_end(cms, last - 1, window_cm), last)
+        r2 = ld_kernels.pairwise_r2_cross(
+            block[:, first:last], block[:, first:reach], device=device)
+        for i in range(first, last):
+            if not keep[i]:
+                continue
+            end = _cm_window_end(cms, i, window_cm)
+            if end <= i + 1:
+                continue
+            later = np.arange(i + 1, end)
+            drop = keep[later] & (r2[i - first, later - first] > r2_threshold)
+            keep[later[drop]] = False
+    return keep
+
+
 def _cm_prune(
     genotype_df: pd.DataFrame,
     snp_info: pd.DataFrame,
@@ -637,12 +703,16 @@ def _cm_prune(
     Two internal changes only:
 
       1. Per chromosome, WHEN that chromosome's genotype block has no
-         missing (``NaN``) calls at all, the within-window r^2 values are
-         precomputed ONCE as a banded matrix
+         missing (``NaN``) calls at all, the r^2 values are precomputed ONCE
+         as the FULL ``n x n`` chromosome matrix
          (``ld_kernels.pairwise_r2_matrix(block, pairwise_complete=True)``
          - the SAME shared kernel R4.g introduces for GPU LD r^2), and the
          greedy left-to-right decision loop below simply looks values up
-         in it instead of calling ``_pairwise_r2()`` per pair. This is a
+         in it instead of calling ``_pairwise_r2()`` per pair. (Earlier
+         versions of this docstring called that matrix "banded"; it never
+         was - it is O(n^2) in time and memory. The really banded variant is
+         ``_cm_prune_banded()`` below, opt-in via
+         ``ACCELERATION['ld_cm_banded']``, ver4-35 R1.g1.) This is a
          byte-for-byte-equivalent (verified to float-rounding tolerance,
          not merely reasoned about - see the ver4-4 Stage 5 design
          record's own test evidence) substitution: the DECISION SEQUENCE
@@ -717,12 +787,22 @@ def _cm_prune(
         col_positions = np.array([col_index[snp_id] for snp_id in ids])
         block = geno_all[:, col_positions]  # this chromosome only, already in cM order
         block_has_nan = bool(np.isnan(block).any())
-        if block_has_nan:
+        if _banded and not block_has_nan:
+            # ver4-35, R1.g1: banded r^2 (opt-in) - same greedy decisions,
+            # memory O(block x window) instead of O(n^2).
+            keep_mask = _cm_prune_banded(block, cms, window_cm, r2_threshold, _resolved_device)
             r2_matrix = None
+            block_done = True
+        elif block_has_nan:
+            r2_matrix = None
+            block_done = False
         else:
             r2_matrix = ld_kernels.pairwise_r2_matrix(block, device=_resolved_device, pairwise_complete=True)
+            block_done = False
 
-        for i in range(n):
+        # The banded path above already produced `keep_mask`; the exact loop
+        # below runs only for the legacy matrix path and the NaN fallback.
+        for i in (range(0) if block_done else range(n)):
             if not keep_mask[i]:
                 continue
             gi = None if r2_matrix is not None else geno_all[:, col_index[ids[i]]]
@@ -748,6 +828,7 @@ def _cm_prune(
         return chrom, ids[keep_mask].tolist()
 
     _active_resources = get_active_compute_resources()
+    _banded = bool(_active_resources.get('accel_ld_cm_banded', False))
     _n_jobs = n_jobs if n_jobs is not None else _active_resources['n_jobs']
     # ver4-4 R4.g completion fix: resolved ONCE here (outside
     # _process_one_chromosome, mirroring _n_jobs immediately above) so

@@ -43,7 +43,7 @@ import pandas as pd
 import numpy as np
 import shap
 
-from pipeline_utils import get_active_compute_resources
+from pipeline_utils import get_active_compute_resources, shapiq_marker_effects
 from models.interaction_extraction import tree_shap_interactions, top_select
 
 # Not user-configurable this pass (disclosed scope simplification, ver4-5
@@ -53,9 +53,15 @@ from models.interaction_extraction import tree_shap_interactions, top_select
 # shortlist to (500).
 _EFFECT_SHORTLIST_CAP = 500
 _EFFECT_PERMUTATION_REPEATS = 5
+# Requirements.md item 2 (this update): how many test individuals the new
+# 'shapiq' marker-effect route (below) explains - not user-configurable,
+# same disclosed-scope-simplification convention as the two constants
+# above (GBDT is engine-only/hidden from the GUI - see hparam_specs.py's
+# own comment on this model's new 'Marker effect method' field).
+_EFFECT_SHAPIQ_ROW_COUNT = 30
 
 
-def GBDT(train, valid, test, params):
+def GBDT(train, valid, test, params, *, sample_weight_ctx=None):
 
     max_iter = params[0]
     learning_rate = params[1]
@@ -67,11 +73,23 @@ def GBDT(train, valid, test, params):
     shapley_num = params[7]
     threshold = params[8]
     max_interaction_features = params[9]
+    # Requirements.md item 2 (this update) - see models/RF.py's identical
+    # fields (and hparam_specs.py's own comment on this model's new
+    # 'Marker effect method' field for why there is no master 'Return
+    # marker effect?' toggle here, unlike RF/ExtraTrees/XGBoost). Appended,
+    # read defensively (I5) - a config predating these four fields keeps
+    # this model's previous, permutation-importance-only behaviour exactly.
+    effect_method = params[10] if len(params) > 10 else 'permutation_importance'
+    effect_max_shapiq_features = params[11] if len(params) > 11 else 500
+    effect_shapiq_background = params[12] if len(params) > 12 else 50
+    effect_shapiq_budget = params[13] if len(params) > 13 else 200
 
     train_x, train_y = train.iloc[:, :-1], train.iloc[:, -1]
     if valid.shape[0] != 0:
         valid_x, valid_y = valid.iloc[:, :-1], valid.iloc[:, -1]
     test_x, test_y = test.iloc[:, :-1], test.iloc[:, -1]
+    # ver4-25, R8 - see models/RF.py's identical comment.
+    _w_fit = sample_weight_ctx.w_fit if sample_weight_ctx is not None else None
 
     # Requirement 6 precedent: n_jobs (HistGradientBoostingRegressor
     # threads its own histogram-building step) resolved from the run's
@@ -85,7 +103,7 @@ def GBDT(train, valid, test, params):
         max_leaf_nodes=max_leaf_nodes, min_samples_leaf=min_samples_leaf,
         l2_regularization=l2_regularization, random_state=0,
     )
-    gbdt.fit(train_x, train_y)
+    gbdt.fit(train_x, train_y, sample_weight=_w_fit)
 
     predicted = np.asarray(gbdt.predict(test_x)).ravel()
     if valid.shape[0] != 0:
@@ -117,7 +135,7 @@ def GBDT(train, valid, test, params):
             max_leaf_nodes=max_leaf_nodes, min_samples_leaf=min_samples_leaf,
             l2_regularization=l2_regularization, random_state=0,
         )
-        gbdt_effect.fit(train_x[effect_features], train_y)
+        gbdt_effect.fit(train_x[effect_features], train_y, sample_weight=_w_fit)
         effect_test_x = test_x[effect_features]
     else:
         gbdt_effect = gbdt
@@ -128,9 +146,67 @@ def GBDT(train, valid, test, params):
         gbdt_effect, effect_test_x, test_y, n_repeats=_EFFECT_PERMUTATION_REPEATS,
         random_state=0, n_jobs=_resources['n_jobs'],
     )
-    effect_full = pd.Series(0.0, index=train_x.columns)
-    effect_full.loc[effect_features] = _perm.importances_mean
-    effect = pd.DataFrame(effect_full).T
+
+    def _permutation_importance_effect():
+        effect_full = pd.Series(0.0, index=train_x.columns)
+        effect_full.loc[effect_features] = _perm.importances_mean
+        return pd.DataFrame(effect_full).T
+
+    # Requirements.md item 2 (this update): 'shapiq' - a model-agnostic
+    # order-1 Shapley marker effect (pipeline_utils.shapiq_marker_
+    # effects()), a genuinely DIFFERENT quantity from permutation
+    # importance (not merely an exact/approximate variant of the same
+    # thing, unlike RF/ExtraTrees/XGBoost's own 'shap' vs 'shapiq', which
+    # are index-equivalent) - optionally replaces the RETURNED effect
+    # vector below. The permutation-importance step above is ALWAYS
+    # computed regardless of this choice: the interaction section further
+    # down reuses its own shortlist/ranking (_perm.importances_mean,
+    # effect_features, gbdt_effect) as its importance proxy, exactly as
+    # before this field existed (I11) - only the vector actually RETURNED
+    # as this task's marker effect changes. Falls back to permutation
+    # importance (with a printed NOTE) on any shapiq failure, never
+    # letting an optional-dependency issue fail this task.
+    if effect_method == 'shapiq':
+        try:
+            n_shapiq_features = len(effect_features)
+            if effect_max_shapiq_features != 'all' and n_shapiq_features > effect_max_shapiq_features:
+                shapiq_features = pd.Index(effect_features)[
+                    np.argsort(_perm.importances_mean)[::-1][:effect_max_shapiq_features]
+                ]
+                gbdt_shapiq_effect = HistGradientBoostingRegressor(
+                    max_iter=max_iter, learning_rate=learning_rate, max_depth=max_depth,
+                    max_leaf_nodes=max_leaf_nodes, min_samples_leaf=min_samples_leaf,
+                    l2_regularization=l2_regularization, random_state=0,
+                )
+                gbdt_shapiq_effect.fit(train_x[shapiq_features], train_y, sample_weight=_w_fit)
+                shapiq_train_x = train_x[shapiq_features]
+                shapiq_test_x = test_x[shapiq_features]
+            else:
+                # Reuse the already-fitted permutation-importance model/
+                # shortlist directly - no extra refit needed.
+                gbdt_shapiq_effect = gbdt_effect
+                shapiq_features = effect_features
+                shapiq_train_x = train_x[effect_features]
+                shapiq_test_x = effect_test_x
+
+            effect_scores = shapiq_marker_effects(
+                gbdt_shapiq_effect.predict, shapiq_train_x,
+                shap.sample(shapiq_test_x, min(_EFFECT_SHAPIQ_ROW_COUNT, shapiq_test_x.shape[0])),
+                background_size=min(effect_shapiq_background, shapiq_train_x.shape[0]),
+                budget=effect_shapiq_budget,
+            )
+            effect_full = pd.Series(0.0, index=train_x.columns)
+            effect_full.loc[shapiq_features] = effect_scores
+            effect = pd.DataFrame(effect_full).T
+        except Exception as exc:
+            print(f"[GBDT] NOTE: shapiq marker-effect computation failed ({exc!r}) - falling "
+                  f"back to this model's own permutation-importance route for this task instead. "
+                  f"('shapiq' is an optional dependency - 'pip install shapiq' if not yet "
+                  f"installed; this may also mean this shapiq version's API differs from what "
+                  f"this codebase expects.)")
+            effect = _permutation_importance_effect()
+    else:
+        effect = _permutation_importance_effect()
 
     # Extract interactions - same shared TreeSHAP route as RF.py/ExtraTrees.py.
     if get_interaction == True:
@@ -146,7 +222,7 @@ def GBDT(train, valid, test, params):
                 max_leaf_nodes=max_leaf_nodes, min_samples_leaf=min_samples_leaf,
                 l2_regularization=l2_regularization, random_state=0,
             )
-            gbdt_interaction.fit(train_x[top_features], train_y)
+            gbdt_interaction.fit(train_x[top_features], train_y, sample_weight=_w_fit)
             interaction_test_x = test_x[top_features]
         elif max_interaction_features != 'all' and n_features > max_interaction_features:
             # More markers overall than max_interaction_features, but the
@@ -163,7 +239,7 @@ def GBDT(train, valid, test, params):
                 max_leaf_nodes=max_leaf_nodes, min_samples_leaf=min_samples_leaf,
                 l2_regularization=l2_regularization, random_state=0,
             )
-            gbdt_interaction.fit(train_x[top_features], train_y)
+            gbdt_interaction.fit(train_x[top_features], train_y, sample_weight=_w_fit)
             interaction_test_x = test_x[top_features]
         else:
             # 'all' - use every marker already in the effect shortlist

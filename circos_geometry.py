@@ -694,3 +694,189 @@ def suggest_chrom_label_size(chrom_names, chrom_lengths: dict, *, start: float, 
             return round(size, 1)
         size -= step
     return lo
+
+
+# --------------------------------------------------------------------------
+# Update ID ver4-25, R12 (blueprint §"Glyph geometry"): hub-and-spoke glyph
+# geometry for k>=3 interaction hyperedges - Option A ("one circos per k;
+# hyperedges as hub-and-spoke glyphs", chosen over chord-decomposition
+# (ambiguous - ties for k=3 read identically to 3 independent pairs) and
+# filled-polygon ribbons (occlusion on genome-spanning sets)). Pure
+# geometry, same discipline as every function above: no Streamlit/project
+# import, single authority shared by whichever renderer draws the glyph
+# (`circos_plot.py`, Layer 3c, lateral import - see module docstring).
+# --------------------------------------------------------------------------
+
+def hyperedge_hub(rads, r_link: float) -> "tuple[float, float]":
+    """The hub position `(hub_rad, r_hub)` for one k>=3 interaction
+    hyperedge, given its members' own angular positions `rads` (radians,
+    one per member marker - the SAME angle `circos_plot.py` already
+    resolves for that marker's ordinary pairwise ring position) and the
+    ring radius `r_link` every member's own spoke starts from.
+
+    `hub_rad`: the circular mean of `rads` - `atan2(mean(sin), mean(cos))`
+    - the angle-aware average that correctly handles wraparound at the
+    0/2*pi seam (a plain arithmetic mean of raw radians would be wrong for
+    a hyperedge whose members straddle that seam; circular mean is not).
+
+    `hub_rad` alone doesn't say how TIGHTLY clustered the members are
+    around it, so a second quantity - the mean resultant length `R̄ =
+    hypot(mean(cos), mean(sin))`, always in `[0, 1]` (1.0 = every member
+    at the exact same angle; 0.0 = members spread so evenly around the
+    circle their directions cancel) - sets the hub's RADIUS:
+    `r_hub = r_link * (0.25 + 0.55 * R̄)`. A tight cluster (large `R̄`,
+    members physically close together on the genome or at least angularly
+    close on this ring) gets a hub sitting close to the ring itself
+    (`r_hub` near `0.80 * r_link`); a genome-spanning set (small `R̄`,
+    members scattered around the whole circle) gets a hub pulled toward
+    the plot's centre (`r_hub` near `0.25 * r_link`) - exactly the visual
+    cue the blueprint's own design intends: hub position communicates
+    hyperedge "spread" at a glance, without reading every spoke.
+
+    `R̄` is clamped to `<= 1.0` before use (mathematically it can never
+    exceed 1.0, but summing many small floating-point cosines/sines can
+    round a hair past it, e.g. `1.0000000000000002`, which would push
+    `r_hub` a hair past `0.80 * r_link` - harmless numerically but not
+    worth leaving unclamped when a one-line `min()` removes the question
+    entirely).
+
+    Parameters
+    ----------
+    rads : Sequence[float]
+        Member marker angles, in radians - length k (the hyperedge's own
+        order), k >= 2 in principle though this glyph is only ever drawn
+        for k >= 3 (k=2 stays a plain chord, unchanged, per R12's own
+        `Interaction.csv`-schema-unchanged contract).
+    r_link : float
+        The ring radius (r-units) every member's own spoke starts from -
+        typically the interaction ring's own `r_centre` from
+        `ring_geometry()`, matching how `circos_plot.py` already anchors
+        its existing pairwise chords.
+
+    Returns
+    -------
+    (hub_rad, r_hub) - hub_rad in radians (NOT normalised to `[0, 2*pi)` -
+    `atan2`'s own `(-pi, pi]` range is preserved unchanged, since
+    matplotlib's polar axes accept any real radian value), r_hub in the
+    same r-units as `r_link`.
+
+    Raises
+    ------
+    ValueError
+        If `rads` is empty - a hub position is undefined with zero
+        members.
+    """
+    rads = list(rads)
+    if not rads:
+        raise ValueError("hyperedge_hub: rads must be a non-empty sequence of member angles (radians).")
+    n = len(rads)
+    mean_cos = sum(math.cos(a) for a in rads) / n
+    mean_sin = sum(math.sin(a) for a in rads) / n
+    hub_rad = math.atan2(mean_sin, mean_cos)
+    r_bar = min(1.0, math.hypot(mean_cos, mean_sin))
+    r_hub = r_link * (0.25 + 0.55 * r_bar)
+    return hub_rad, r_hub
+
+
+def bezier_spoke_path(member_rad: float, r_link: float, hub_rad: float, r_hub: float):
+    """One hyperedge spoke, as a `matplotlib.path.Path` ready to hand
+    directly to `matplotlib.patches.PathPatch` on `fig.axes[0]` once
+    `circos.plotfig()` has run (blueprint's own guidance: public
+    matplotlib API, not pyCirclize's private `_patches` - and its own
+    V12.1 confirms polar-axes data coordinates are literally `(theta, r)`
+    in the same r-unit scale `circos_plot.py` already uses everywhere
+    else, so no conversion is needed between this module's r-units and
+    what gets plotted).
+
+    A quadratic Bezier curve, per the blueprint's own glyph-geometry spec:
+    starts at the member's own position on the ring (`member_rad`,
+    `r_link`), ends at the hyperedge's hub (`hub_rad`, `r_hub` - from
+    `hyperedge_hub()` above), with a SINGLE control point fixed at
+    `(member_rad, r_hub + 0.5 * (r_link - r_hub))` - i.e. the control
+    point sits at the member's OWN angle (not the hub's), halfway in
+    radius between the ring and the hub. This anchors the curve's initial
+    direction radially inward from each member (so many spokes converging
+    on one busy hub fan out cleanly near the ring rather than all
+    pointing straight at one pixel from the outset) and only bends toward
+    the hub's own angle in the second half of the curve.
+
+    `matplotlib.path.Path`'s vertex/code encoding for a quadratic Bezier
+    is exactly 3 vertices - `MOVETO` (start), `CURVE3` (control point),
+    `CURVE3` (end point, consumed together with the preceding control
+    point) - `CURVE3` is matplotlib's own code for a quadratic segment,
+    distinct from `CURVE4`'s two-control-point cubic.
+
+    Parameters
+    ----------
+    member_rad : float
+        This spoke's own member marker angle, in radians.
+    r_link : float
+        The ring radius (r-units) this spoke starts from - same value
+        passed to `hyperedge_hub()` for this hyperedge.
+    hub_rad, r_hub : float
+        This hyperedge's hub position, as returned by `hyperedge_hub()`.
+
+    Returns
+    -------
+    matplotlib.path.Path
+    """
+    from matplotlib.path import Path
+
+    control_r = r_hub + 0.5 * (r_link - r_hub)
+    vertices = [
+        (member_rad, r_link),
+        (member_rad, control_r),
+        (hub_rad, r_hub),
+    ]
+    codes = [Path.MOVETO, Path.CURVE3, Path.CURVE3]
+    return Path(vertices, codes)
+
+
+def spread_labels(angles_deg, min_sep_deg, *, lo=None, hi=None):
+    """Nudge label angles so neighbouring labels are at least `min_sep_deg`
+    apart, keeping their left-to-right ORDER (ver4-31 R14). Pure.
+
+    The result is the least-squares-closest set of positions to `angles_deg`
+    subject to the separation constraint (pool-adjacent-violators: labels that
+    would collide are merged into a block centred on their mean and spaced
+    evenly), returned in the ORIGINAL input order. Ties in the input keep
+    their input order. With `lo` / `hi` the labels are additionally kept
+    inside [lo, hi] (a block pushed past an end is slid back); when the
+    labels cannot fit at all (n*sep > hi-lo) they are spread evenly over
+    [lo, hi] instead, which is the closest the constraint can be met."""
+    n = len(angles_deg)
+    if n == 0:
+        return []
+    sep = max(float(min_sep_deg), 0.0)
+    order = sorted(range(n), key=lambda i: (float(angles_deg[i]), i))
+    a = [float(angles_deg[i]) for i in order]
+    # blocks of consecutive labels: [start_position_of_first_label, count]
+    blocks = []
+    for k, ang in enumerate(a):
+        blocks.append([ang, 1, ang])            # [first label's position, label count, unused]
+        while len(blocks) > 1:
+            prev, cur = blocks[-2], blocks[-1]
+            if prev[0] + prev[1] * sep > cur[0] + 1e-12:
+                total_count = prev[1] + cur[1]
+                # mean of (a_j - offset_j) over the merged block, offsets 0..count-1
+                first_index = k + 1 - total_count
+                mean = sum(a[first_index + t] - t * sep for t in range(total_count)) / total_count
+                blocks[-2:] = [[mean, total_count, mean]]
+            else:
+                break
+    pos = []
+    for start, count, _ in blocks:
+        pos.extend(start + t * sep for t in range(count))
+    if lo is not None and hi is not None and n > 1 and n * sep > (hi - lo) + 1e-12:
+        pos = [lo + (hi - lo) * t / (n - 1) for t in range(n)]
+    else:
+        if lo is not None:
+            for k in range(n):
+                pos[k] = max(pos[k], lo + k * sep)
+        if hi is not None:
+            for k in range(n - 1, -1, -1):
+                pos[k] = min(pos[k], hi - (n - 1 - k) * sep)
+    out = [0.0] * n
+    for k, i in enumerate(order):
+        out[i] = pos[k]
+    return out

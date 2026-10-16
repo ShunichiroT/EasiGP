@@ -81,7 +81,97 @@ RESULT_FILE_NAMES = {
     'weight': 'Weight.csv',
     'hp_record': 'hyperparameter.csv',
     'stats': 'Basic_stats.csv',
+    # Update ID ver4-12, R10 (design blueprint SS2.10): two new keys, with
+    # SUBFOLDER-EMBEDDED names - this is the decision that makes streaming
+    # assembly, ResultSet reading, checkpoint save/append/load and
+    # clear_result_files() all work for these two files with NO change to
+    # any of those generic, RESULT_FILE_NAMES-keyed loops (see this
+    # module's own updated docstrings on those functions).
+    # result_file_paths() below already handles a subfolder-embedded name
+    # correctly (os.path.splitext('ASReml/ASReml_phenotype.csv') yields
+    # ('ASReml/ASReml_phenotype', '.csv')) - the ONLY extra requirement is
+    # that every WRITE site creates the file's own parent directory, not
+    # just the top-level result folder (see save_partial_results()/
+    # append_partial_results() below).
+    'asreml_pheno': os.path.join('ASReml', 'ASReml_phenotype.csv'),
+    'asreml_varcomp': os.path.join('ASReml', 'ASReml_variance_components.csv'),
+    # Update ID ver4-25, R9-S0 (design blueprint stage 3): one row per R
+    # fit call GP() actually makes through Preprocess/asreml_blup.py -
+    # role, trait, scope hash, row/level counts, seconds, iterations,
+    # converged. Purely diagnostic/instrumentation - never read back by
+    # any other part of this codebase - so it is written UNCONDITIONALLY
+    # whenever ASREML is enabled at all (static_write_flags_for()), the
+    # same "log the fact, not just the number" discipline architecture
+    # doc SS18 already documents, applied to timing.
+    'asreml_fit_timing': os.path.join('ASReml', 'ASReml_fit_timing.csv'),
+    # Update ID ver4-25, R3 (design blueprint stage 3 - the naive-
+    # ensemble accuracy-metrics bugfix): persists EVERY task's own
+    # resolved accuracy-metrics context (heritability, direction,
+    # accuracy_numerator_mode, and the per-individual BLUE/reference
+    # value lookups compute_accuracy_metrics_row() needs) the FIRST time
+    # it is computed - see asreml_accuracy_metrics.ctx_to_rows()/
+    # ctx_resolver_from_frame(). This is what lets the naive ensemble's
+    # own finalisation step (genomic_prediction.py, and
+    # intra_task_parallel.finalise_task_from_merged()) resolve a task's
+    # context from a plain accumulator lookup - exactly like every other
+    # accumulator, durable across resume and across process boundaries -
+    # instead of a process-local, in-memory-only registry that silently
+    # returned nothing (and, for a masked run, was previously refit from
+    # scratch at finalisation time) for any task this exact process
+    # never itself dispatched.
+    'asreml_accuracy_ctx': os.path.join('ASReml', 'ASReml_accuracy_context.csv'),
+    # ver4-25, R8 Stage 6 completion (design blueprint SS2 R8, "Persisting
+    # test weights"): the 'full'-mode counterpart to 'asreml_accuracy_ctx'
+    # 's own role='test_weight' rows (which only ever carry a DIAGONAL,
+    # one-scalar-per-individual weight) - a dense per-scenario N x N
+    # matrix cannot fit that same one-value-per-row shape, so it gets its
+    # own accumulator/file: the long upper-triangle form `blue_weights.
+    # weight_matrix_from_frame()` already knew how to read (written, but
+    # never wired up, in Part 3.1/3.2 of the ver4-25 delivery). This is
+    # what lets the naive ensemble's own finalisation row
+    # (models/ensemble.py::_metric()) and diversity_summary.py's own DPT
+    # terms recover a 'full'-mode run's per-scenario weighting after the
+    # task that computed it has long since finished (possibly in a
+    # different process - Width-1/2/3 parallelism, or a resumed run) -
+    # exactly the problem the R3 sidecar already solved for 'diagonal'
+    # mode and for accuracy-metrics context.
+    'asreml_test_weights': os.path.join('ASReml', 'ASReml_test_weight_matrix.csv'),
+    # ver4-25, Stage 9 (design blueprint R12): k>=3 (higher-order) marker-
+    # SET interactions - a SEPARATE file from 'interactions' (Interaction.
+    # csv, k=2 only, schema UNCHANGED - I11), since a k>=3 row's own
+    # 'markers' cell holds a variable-length tuple of names rather than a
+    # fixed 'marker1'/'marker2' pair. Written only by a model whose
+    # 'Marker interaction method' is a shapiq-based route AND whose
+    # 'Interaction orders to search for' includes an order >= 3 (see
+    # static_write_flags_for() below) - every other run never creates
+    # this file at all (R12's own "k=2 unchanged" scope limit, AC12.3).
+    'interactions_hok': 'Interaction_higher_order.csv',
+    # ver4-7, R1 ("Per-Set GRM Generation for GBLUP") - the 3 GRM matrices
+    # `Preprocess/asreml_blup.py::fit_per_set_grm_adjustment()` builds
+    # (one per split), persisted as diagnostics - long, upper-triangle
+    # form, mirroring 'asreml_test_weights''s own established shape for a
+    # dense per-scenario matrix (never a wide N x N CSV). Written only
+    # when `ASREML['per_set_grm']=True` (static_write_flags_for()'s own
+    # new gate) - every other run never creates these files at all.
+    'grm_train': os.path.join('ASReml', 'GRM_train.csv'),
+    'grm_valid': os.path.join('ASReml', 'GRM_valid.csv'),
+    'grm_test': os.path.join('ASReml', 'GRM_test.csv'),
+    # ver4-57, R4 (design blueprint): per-round diagnostics of the opt-in Iterative ensemble -
+    # one row per (task, ensemble group, round tried, plus round 0). Written only when
+    # ITERATIVE_ENSEMBLE is set and its `write_rounds` is on (static_write_flags_for()); every
+    # other run never creates the file (I11). Test metrics in it are diagnostic only.
+    'iter_rounds': 'Iterative_ensemble_rounds.csv',
 }
+
+# ver4-36, R2.d: names of DIAGNOSTIC sidecar folders under Result/<name>/.
+# This is NOT an accumulator: nothing here is snapshotted, rolled back, appended,
+# merged, compressed or assembled, and it must never appear in any loop over
+# RESULT_FILE_NAMES (I8). The joint search's `library_dump` writes one
+# `<result_dir>/Joint_library/<task_tag>.npz` per task through an atomic
+# (temp file + os.replace) write; a resumed task overwrites its own file. The
+# name lives here so that "where do result files go" stays in the one
+# naming-authority module.
+DIAGNOSTIC_DIR_NAMES = {'joint_library': 'Joint_library'}
 
 # Update ID ver4-9, R7 (design blueprint SS2.4.2): a sibling of
 # RESULT_FILE_NAMES (same module, same keys - the same "never let two
@@ -109,6 +199,45 @@ RESULT_FILE_COMPRESSION = {
     'weight': None,
     'hp_record': None,
     'stats': None,
+    # Update ID ver4-12, R10: 'asreml_pheno' is one row per (scenario x
+    # individual) - potentially large on a many-individual run - so it
+    # compresses like the other six large, per-individual/per-marker/
+    # per-pair files above. 'asreml_varcomp' is one row per (scenario x
+    # split x component) - small, like Basic_stats.csv/Metric.csv - and is
+    # left uncompressed for the same reason those are: it is exactly the
+    # file a breeder is most likely to `head`/open directly to read off a
+    # heritability estimate.
+    'asreml_pheno': 'gzip',
+    'asreml_varcomp': None,
+    # ver4-25, R9-S0: one row per fit CALL (not per individual/marker) -
+    # small even for a many-task HPC run - left uncompressed for the same
+    # 'head'/'cat'-able reason Metric.csv/Basic_stats.csv are.
+    'asreml_fit_timing': None,
+    # ver4-25, R3: one row per (scenario x role x individual), the same
+    # order of magnitude 'asreml_pheno' used to be - compresses like the
+    # other large, per-individual files.
+    'asreml_accuracy_ctx': 'gzip',
+    # ver4-25, R8 Stage 6 completion: one row per (scenario x individual
+    # PAIR, upper triangle) - the largest of every ASReml accumulator by
+    # a wide margin for a many-individual test split (O(n^2) rows vs
+    # 'asreml_accuracy_ctx's own O(n)) - compresses like the other large,
+    # per-individual/per-pair files.
+    'asreml_test_weights': 'gzip',
+    # ver4-25, Stage 9 (R12): one row per (population, phenotype, model,
+    # ratio, sample, order, markers) - the same order of magnitude
+    # 'interactions' (Interaction.csv) already is, so it compresses the
+    # same way.
+    'interactions_hok': 'gzip',
+    # ver4-7, R1: one row per (scenario x individual PAIR, upper
+    # triangle) per split - the same O(n^2)-per-split shape
+    # 'asreml_test_weights' already established, so it compresses the
+    # same way.
+    'grm_train': 'gzip',
+    'grm_valid': 'gzip',
+    'grm_test': 'gzip',
+    # ver4-57, R4: one row per round (a handful per task) - small, left as plain CSV so the
+    # gate tool and a person can `head` it, like Metric.csv / Weight.csv.
+    'iter_rounds': None,
 }
 
 _COMPRESSION_EXT = {None: '', 'none': '', 'gzip': '.gz'}
@@ -142,6 +271,171 @@ _INCOMPLETE_FILE_ERRORS = (pd.errors.EmptyDataError, EOFError, gzip.BadGzipFile)
 # `static_write_flags` - see that function's own docstring for why this
 # split exists.
 ALWAYS_WRITTEN_KEYS = ('record', 'result_train', 'result_valid', 'result_test', 'stats')
+
+# Bugfix (weighted-ensemble combining weights not properly stored after a
+# checkpoint/resume - or any multi-task run - once column-set/order drift
+# was involved): every accumulator EXCEPT 'weight' has a schema that is
+# fixed for the whole run (the same named columns every task's own row
+# uses), so append_partial_results()'s own defensive "reindex a delta to
+# the existing on-disk header, dropping whatever the delta has that the
+# header doesn't" safety net (below) is the right response to a mismatch
+# there - a genuine, unexpected schema drift for one of THOSE keys really
+# would indicate a bug upstream. 'weight' (Weight.csv) is different by
+# design: its own columns are one column PER BASE MODEL actually selected
+# into a given task's/method's ensemble (see models/{Bayesian_optimisation,
+# Analytic_least_squares,Nelder_Mead,Linear_transformation}.py's own
+# `weight_extracted`), which legitimately varies from task to task (and
+# even in column ORDER between two weighted-ensemble methods run for the
+# SAME task) - this is expected, per-scenario data, not schema drift.
+# Reindexing every later delta down to whichever task happened to be
+# appended FIRST therefore silently discarded every real combining-weight
+# value that first task's own model selection didn't happen to include -
+# confirmed by direct reproduction. Keys listed here are reconciled by
+# WIDENING the on-disk file in place (backfilling earlier rows with blank
+# values for a newly-seen column) instead of dropping the new delta's own
+# columns - see _append()'s own comment for the full mechanism.
+_DYNAMIC_SCHEMA_KEYS = frozenset({'weight'})
+
+# Requirements.md item 1 fix ("Released files do not have a heading for
+# the columns at the top - seen in other output file types too"). Root
+# cause: every one of GP()'s accumulator DataFrames starts life as a bare
+# `pd.DataFrame()` - zero rows AND zero columns - and only gains real
+# column names once the FIRST task successfully contributes a row to it.
+# `save_partial_results()` below writes every key in ALWAYS_WRITTEN_KEYS
+# (and every OTHER key `static_write_flags` marks as relevant to this
+# run - 'interactions'/'attention_total'/'weight'/'asreml_pheno'/
+# 'asreml_varcomp') UNCONDITIONALLY, regardless of row count - which is
+# exactly right (a "ran, but produced nothing yet" file is meaningful and
+# expected), but `frame.to_csv(index=False)` on a DataFrame with NO
+# COLUMNS AT ALL produces a genuinely EMPTY (zero-byte) file, not a
+# header-only one - there is no schema left for pandas to write a header
+# row FROM. This is most visible whenever the very FIRST task in a batch
+# raises before contributing anything (e.g. an ASReml-R fit failing on
+# task 1/N - see genomic_prediction.py's own per-task rollback, which
+# calls save_partial_results() on a caught exception): every "always
+# written" (and every relevant conditional) file for that batch is left
+# as a bare, unlabelled zero-byte file instead of one that at least
+# documents its own intended schema.
+#
+# Fixed by substituting a HEADER-ONLY placeholder (`pd.DataFrame(columns=
+# RESULT_FILE_BASE_COLUMNS[key])`) whenever a key's accumulator has zero
+# columns at write time - `to_csv(index=False)` on THAT produces a proper
+# header row and zero data rows, exactly the state `batch_reader.
+# header_union()`'s own docstring already documents as a normal, expected
+# "header-only file" case ("a header-only file's header still counts"),
+# and exactly the same fallback `weight_plot.py`'s own `_WEIGHT_METADATA_
+# COLS` already uses for the identical reason on the READ side. Every
+# entry here is the FIXED, guaranteed-present subset of that key's real
+# columns - never the full set for a key whose width also depends on
+# per-run model selection (result_train/valid/test gain one prediction
+# column per `MODEL_RUN` entry; weight gains one column per contributing
+# model) - a header-only placeholder only ever needs to be RECOGNISABLE,
+# not exhaustive, since no data ever accompanies it anyway.
+#
+# 'effect' and 'hp_record' are deliberately absent: both are written only
+# when genuinely non-empty (see save_partial_results()'s own docstring on
+# the "purely data-driven condition" split) - an empty one produces NO
+# file at all, not a zero-byte one, so there is nothing to fix for them.
+RESULT_FILE_BASE_COLUMNS = {
+    'record': ['population', 'phenotype', 'model', 'ratio', 'sample',
+               'Pearson correlation', 'MSE'],
+    'result_train': ['id', 'population', 'ratio', 'phenotype', 'sample', 'actual'],
+    'result_valid': ['id', 'population', 'ratio', 'phenotype', 'sample', 'actual'],
+    'result_test': ['id', 'population', 'ratio', 'phenotype', 'sample', 'actual'],
+    'stats': ['population', 'phenotype', 'ratio', 'sample',
+              'n_train', 'n_valid', 'n_test', 'n_total', 'n_markers', 'blue_weighting'],
+    'interactions': ['population', 'phenotype', 'model', 'ratio', 'sample',
+                      'marker1', 'marker2', 'value'],
+    'attention_total': ['population', 'phenotype', 'model', 'ratio', 'sample',
+                         'marker1', 'marker2', 'value'],
+    'weight': ['population', 'phenotype', 'model', 'ratio', 'sample'],
+    'asreml_pheno': ['population', 'phenotype', 'ratio', 'sample',
+                      'id', 'split', 'value', 'estimand', 'std_error'],
+    # Update ID ver4-25, R10 (design blueprint SS "Chosen approach" item
+    # 3): REDEFINED schema. There is now exactly ONE fit behind this
+    # file - the training-only, genotype-random-iid side model
+    # (Preprocess/asreml_blup.py::fit_concurrent_variance_model(),
+    # promoted from an opt-in, blue_fixed-only side computation to an
+    # always-on one for every strategy) - so the old 'split'/
+    # 'genotype_effect_strategy'/'response_unit'/'model_source'/
+    # 'mask_valid_test'/'use_entire_dataset'/'n_genotypes_total_in_raw_
+    # file'/'n_genotypes_included'/'n_genotypes_excluded_no_marker_data'
+    # columns (which existed to disambiguate WHICH of several possible
+    # fits a row came from) no longer have anything to disambiguate.
+    # 'component' is the CANONICAL name (asreml_blup._classify_
+    # vparameter()); 'component_raw' preserves ASReml-R's own free-text
+    # label unchanged, so nothing is lost. 'proportion_of_total' is each
+    # row's own variance estimate as a fraction of the SUM of every
+    # row's variance estimate for this task. 'h2_plot'/'H2_classic'/
+    # 'H2_cullis_train' are the SAME value repeated on every one of a
+    # task's own component rows (a scenario-constant statistic, exactly
+    # like heritability's replacement `Heritability` Metric.csv column -
+    # R2 - is), since a long-format file has nowhere else to put a
+    # once-per-fit scalar.
+    'asreml_varcomp': ['population', 'phenotype', 'ratio', 'sample', 'component',
+                        'component_raw', 'estimate', 'std_error', 'bound',
+                        'proportion_of_total', 'converged', 'iterations',
+                        'n_train_genotypes', 'n_train_records', 'reps_harmonic_mean',
+                        'h2_plot', 'H2_classic', 'H2_cullis_train'],
+    # ver4-25, R9-S0: one row per R fit call.
+    'asreml_fit_timing': ['population', 'phenotype', 'ratio', 'sample', 'role',
+                           'scope_hash', 'n_rows', 'n_levels', 'seconds',
+                           'iterations', 'converged'],
+    # ver4-25, R3: long-format persisted accuracy-metrics context - see
+    # asreml_accuracy_metrics.ASREML_ACCURACY_CTX_COLUMNS (this module's
+    # own copy exists only as the zero-row HEADER fallback used by
+    # _with_header_fallback()/save_partial_results() - the two lists are
+    # kept identical by inspection, since asreml_accuracy_metrics.py's
+    # own "zero project imports" discipline means it cannot import THIS
+    # module to share the constant, and this module already avoids
+    # importing it back for the same reason model_registry.py's zero
+    # project imports are one-way).
+    'asreml_accuracy_ctx': ['population', 'phenotype', 'ratio', 'sample', 'direction',
+                             'heritability', 'accuracy_numerator_mode', 'role', 'id', 'value'],
+    # ver4-25, R8 Stage 6 completion - see RESULT_FILE_NAMES' own comment
+    # for this key. Matches blue_weights.weight_matrix_from_frame()'s own
+    # expected read shape exactly.
+    'asreml_test_weights': ['population', 'phenotype', 'ratio', 'sample', 'id1', 'id2', 'value'],
+    # ver4-25, Stage 9 (design blueprint R12) - see RESULT_FILE_NAMES' own
+    # comment for this key. 'markers' is a ';'-joined string of marker
+    # NAMES (see genomic_prediction.py::_split_interaction_by_order()'s
+    # own docstring for why a string, not a raw tuple); 'order' is
+    # len(markers.split(';')).
+    'interactions_hok': ['population', 'phenotype', 'model', 'ratio', 'sample',
+                          'order', 'markers', 'value'],
+    # ver4-7, R1 - see RESULT_FILE_NAMES' own comment for these 3 keys.
+    # Long, upper-triangle form, matching 'asreml_test_weights''s own
+    # established shape for a dense per-scenario matrix.
+    'grm_train': ['population', 'phenotype', 'ratio', 'sample', 'id1', 'id2', 'value'],
+    'grm_valid': ['population', 'phenotype', 'ratio', 'sample', 'id1', 'id2', 'value'],
+    'grm_test': ['population', 'phenotype', 'ratio', 'sample', 'id1', 'id2', 'value'],
+    # ver4-57, R4: the full, fixed schema of Iterative_ensemble_rounds.csv (every column is
+    # always written; 'kept_markers' is empty unless write_kept_markers is on). 'valid_*'
+    # columns drive the acceptance decision; the two 'test_*_diagnostic' columns are never
+    # seen by the module and never used for a decision.
+    'iter_rounds': ['population', 'phenotype', 'model', 'ratio', 'sample', 'round',
+                    'n_markers_kept', 'n_reentered', 'kept_markers', 'accepted', 'selected',
+                    'valid_pearson', 'valid_gain', 'valid_gain_sd', 'test_pearson_diagnostic',
+                    'test_mse_diagnostic', 'n_fits', 'seconds'],
+}
+
+
+def _with_header_fallback(key: str, df: "pd.DataFrame") -> "pd.DataFrame":
+    """Requirements.md item 1 fix - `df` unchanged whenever it already has
+    at least one column (the overwhelming common case - some task already
+    contributed real data); otherwise a header-only, zero-row placeholder
+    built from `RESULT_FILE_BASE_COLUMNS[key]`, so `to_csv(index=False)`
+    always writes a recognisable header row instead of silently producing
+    a bare, zero-byte file. Falls back to `df` itself (unchanged) for any
+    key not in `RESULT_FILE_BASE_COLUMNS` - never raises - so a future new
+    key that forgets to register a fallback here degrades to today's
+    pre-fix behaviour rather than crashing a save."""
+    if df.shape[1] != 0:
+        return df
+    base_columns = RESULT_FILE_BASE_COLUMNS.get(key)
+    if not base_columns:
+        return df
+    return pd.DataFrame(columns=base_columns)
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +487,78 @@ MODEL_GROUP_MERGE_SPEC: Dict[str, Dict[str, object]] = {
     'result_train':    {'axis': 'columns', 'key': ('id', 'population', 'ratio', 'phenotype', 'sample', 'actual')},
     'result_valid':    {'axis': 'columns', 'key': ('id', 'population', 'ratio', 'phenotype', 'sample', 'actual')},
     'result_test':     {'axis': 'columns', 'key': ('id', 'population', 'ratio', 'phenotype', 'sample', 'actual')},
+    # Update ID ver4-12, R10 (design blueprint SS2.10, Appendix A finding
+    # A12): 'dedup_rows' is correct for the SAME reason it's correct for
+    # 'stats' - Step 6b (now folded into Steps 1-8) runs IDENTICALLY in
+    # every model group, so every group emits the identical ASReml rows
+    # for this task; concat-then-dedup avoids G copies of the same row.
+    # (In practice, ASReml-enabled tasks are ineligible for model-level
+    # fan-out by default - intra_task_parallel.task_is_model_fanout_
+    # eligible() - so this is normally never exercised; specified anyway
+    # so this dict stays complete for every RESULT_FILE_NAMES key, and
+    # for the ASREML['allow_model_fanout']=True override.)
+    'asreml_pheno':    {'axis': 'dedup_rows',
+                        'key': ('population', 'phenotype', 'ratio', 'sample', 'id', 'split')},
+    # Update ID ver4-25, R10: 'model_source'/'split' no longer exist in
+    # the redefined schema (see RESULT_FILE_BASE_COLUMNS' own updated
+    # comment) - there is now exactly ONE fit per task, so 'component'
+    # alone (plus the scenario columns) already uniquely identifies a
+    # row; every model group in a (rare, opt-in) ASReml + model-fanout
+    # run computes the IDENTICAL training-only fit, so dedup_rows is
+    # still the correct semantics.
+    'asreml_varcomp':  {'axis': 'dedup_rows',
+                        'key': ('population', 'phenotype', 'ratio', 'sample', 'component')},
+    # ver4-25, R9-S0: a diagnostic log, not a fact table - each fit CALL
+    # is its own event, so a plain row-concat (no dedup) is correct even
+    # though every model group in an ASReml + model-fanout run performs
+    # the identical fit (and therefore logs a near-identical timing row)
+    # - the small amount of duplication is accepted rather than treated
+    # as a correctness problem, since this file is read by a human, not
+    # by any other part of this codebase.
+    'asreml_fit_timing': {'axis': 'rows',
+                           'key': ('population', 'phenotype', 'ratio', 'sample', 'role', 'scope_hash')},
+    # ver4-25, R3: every model group resolves the IDENTICAL scenario-
+    # level accuracy context (Steps 1-8/Step 6b are byte-identical across
+    # groups - architecture doc SS7 Step 8), so dedup_rows is correct,
+    # exactly like 'asreml_varcomp'/'asreml_pheno' above.
+    'asreml_accuracy_ctx': {'axis': 'dedup_rows',
+                             'key': ('population', 'phenotype', 'ratio', 'sample', 'role', 'id')},
+    # ver4-25, R8 Stage 6 completion: the matrix rows are derived from the
+    # SAME main-fit `vcov` every model group's own (byte-identical, per
+    # architecture doc SS7 Step 8) Step 6b would resolve to for this
+    # task, so every group emits the identical set of upper-triangle
+    # rows - 'dedup_rows' is correct for the exact same reason it already
+    # is for 'asreml_varcomp'/'asreml_accuracy_ctx' above, avoiding G
+    # copies of an O(n^2)-sized table on the (rare, opt-in - ASReml tasks
+    # are ineligible for model-fanout by default, D1) occasion this is
+    # ever actually exercised.
+    'asreml_test_weights': {'axis': 'dedup_rows',
+                             'key': ('population', 'phenotype', 'ratio', 'sample', 'id1', 'id2')},
+    # ver4-25, Stage 9 (R12): mirrors 'interactions' exactly (a plain row
+    # concat, ordered back to MODEL_RUN order) - 'markers' (a ';'-joined
+    # marker-name string, see RESULT_FILE_BASE_COLUMNS' own comment on
+    # this key) plus 'order' stands in for 'marker1'/'marker2' as the
+    # per-row identity, since a k>=3 row has no fixed pair of columns.
+    'interactions_hok': {'axis': 'rows', 'key': ('population', 'phenotype', 'model', 'ratio', 'sample',
+                                                   'order', 'markers')},
+    # ver4-7, R1 ("Per-Set GRM Generation for GBLUP") - each split's own
+    # GRM is derived from the SAME main-fit genotype universe every model
+    # group's own (byte-identical) Step 6b would resolve to for this
+    # task, so every group emits the identical set of upper-triangle
+    # rows - 'dedup_rows' is correct for the exact same reason it already
+    # is for 'asreml_test_weights' above.
+    'grm_train': {'axis': 'dedup_rows',
+                  'key': ('population', 'phenotype', 'ratio', 'sample', 'id1', 'id2')},
+    'grm_valid': {'axis': 'dedup_rows',
+                  'key': ('population', 'phenotype', 'ratio', 'sample', 'id1', 'id2')},
+    'grm_test': {'axis': 'dedup_rows',
+                 'key': ('population', 'phenotype', 'ratio', 'sample', 'id1', 'id2')},
+    # ver4-57, R4: each model group would contribute its own rounds (never populated by a
+    # fan-out unit - a task with ITERATIVE_ENSEMBLE and a validation split is ineligible for
+    # model-level fan-out, see intra_task_parallel.py) - a plain row concat is the correct
+    # rule, specified so this dict stays complete for every RESULT_FILE_NAMES key (I8).
+    'iter_rounds': {'axis': 'rows', 'key': ('population', 'phenotype', 'model', 'ratio',
+                                              'sample', 'round')},
 }
 
 
@@ -327,8 +693,80 @@ def _is_bio_prior_model(name: str) -> bool:
     return name == 'GAT_biological_prior_knowledge' or name.startswith('GAT_biological_prior_knowledge_')
 
 
-def static_write_flags_for(model_run: list, w_opt) -> dict:
-    """The 3 model-selection-driven (not data-driven) 'should this
+# ver4-25, Stage 9 (design blueprint R12): (interaction-method field
+# index, orders field index, {shapiq-valued choices for that field}) for
+# every model whose 'Marker interaction method' field can select a
+# shapiq-based route capable of searching an order above 2 - indices
+# verified directly against hparam_specs.py's own field lists for each
+# of these four models (RF/SVR/KNN/RKHS), not assumed; every other model
+# has no such field at all and is simply absent from this dict.
+_SHAPIQ_INTERACTION_FIELD_INDEX = {
+    'RF': (9, 14, {'shapiq_tree'}),
+    # ExtraTrees / XGBoost gained RF's 'Marker interaction method' block
+    # (hparam_specs._append_rf_style_interaction_fields): method field at
+    # 16 / 17, 'Interaction orders to search for' at 21 / 22. Omitting
+    # these would silently skip Interaction_higher_order.csv for a run
+    # that DOES produce order>=3 rows.
+    'ExtraTrees': (16, 21, {'shapiq_tree'}),
+    'XGBoost': (17, 22, {'shapiq_tree'}),
+    'SVR': (18, 19, {'shapiq'}),
+    'KNN': (15, 16, {'shapiq'}),
+    # Requirements.md item 1: RKHS's own field 18 choices were renamed
+    # from 'surrogate_friedman_h'/'surrogate_shapiq' to plain
+    # 'friedman_h'/'shapiq' (see genomic_prediction.py's own dispatch
+    # comment) - both the new 'shapiq' and the OLD 'surrogate_shapiq'
+    # spelling (still possible from a checkpoint/config written before
+    # this rename) are accepted here so a pre-rename saved run's own
+    # higher-order-interaction detection is unaffected (I11).
+    # This update: 'shapiq_predictor' (genomic_prediction.py::
+    # _apply_rkhs_predictor_interaction()) is a THIRD shapiq-based choice
+    # on this same field, alongside 'shapiq'/'surrogate_shapiq' - it can
+    # search order>=3 exactly the same way (the SAME 'Interaction orders
+    # to search for' field, index 19), so it must be recognised here too;
+    # omitting it would silently skip writing Interaction_higher_order.csv
+    # for a run that DOES produce order>=3 rows through this route.
+    'RKHS': (18, 19, {'shapiq', 'surrogate_shapiq', 'shapiq_predictor'}),
+}
+
+
+def _model_requests_higher_order_interactions(base_name, params) -> bool:
+    """True if `params` (this model's own HPARAMETERS[base_name] entry -
+    a flat params list, OR a per-phenotype dict of such lists, handled
+    defensively even though none of the four models this actually
+    applies to use that shape today) selects a shapiq-based 'Marker
+    interaction method' AND its own 'Interaction orders to search for'
+    field lists an order >= 3.
+
+    NEVER RAISES - read entirely defensively (a short/old params list, a
+    malformed orders string, or a model absent from
+    `_SHAPIQ_INTERACTION_FIELD_INDEX` altogether all simply return
+    `False`) - see `static_write_flags_for()`'s own docstring for why a
+    single malformed config must never crash this check."""
+    spec = _SHAPIQ_INTERACTION_FIELD_INDEX.get(base_name)
+    if spec is None or params is None:
+        return False
+    method_idx, orders_idx, shapiq_values = spec
+    param_lists = params.values() if isinstance(params, dict) else [params]
+    for plist in param_lists:
+        try:
+            if len(plist) <= method_idx or plist[method_idx] not in shapiq_values:
+                continue
+            if len(plist) <= orders_idx:
+                continue
+            orders = [int(o.strip()) for o in str(plist[orders_idx]).split(',') if o.strip()]
+            if any(o >= 3 for o in orders):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def static_write_flags_for(model_run: list, w_opt, *, asreml_enabled: bool = False,
+                            asreml_write_phenotype: bool = False,
+                            asreml_blue_weighting: str = 'none', hparameters: "Optional[dict]" = None,
+                            asreml_per_set_grm: bool = False, joint_w_opt=None,
+                            iterative_ensemble=None, super_learner=None) -> dict:
+    """The 5 model-selection/config-driven (not data-driven) 'should this
     conditional result file be written at all' flags, computed with the
     EXACT SAME expressions GP()'s original 'Store the results' section
     used before checkpointing existed - kept here, as a single source of
@@ -338,7 +776,92 @@ def static_write_flags_for(model_run: list, w_opt) -> dict:
     own W_OPT parameter (weight.csv is written whenever a weighted-
     ensemble method was configured at all, regardless of whether any
     weight rows exist yet - matching the original unconditional-on-W_OPT
-    check, not a non-emptiness check)."""
+    check, not a non-emptiness check).
+
+    Update ID ver4-12, R10 (design blueprint SS2.10): `asreml_enabled`
+    (keyword-only, default `False` - every pre-ver4-12 call site is
+    unaffected, I11) gates the two new ASReml result keys identically -
+    both are written whenever ASREML is configured at all (GP() passes
+    `ASREML is not None`), regardless of whether either DataFrame happens
+    to be non-empty yet at a given save point - matching every other
+    config-selection-driven flag here, as opposed to a data-driven one
+    like 'effect'/'hp_record' (see save_partial_results()'s own
+    docstring for that distinction).
+
+    Update ID ver4-25, R10 (design blueprint stage 3, "Stop phenotype
+    file"): `asreml_pheno` is now gated on a SECOND, independent
+    condition - `asreml_write_phenotype` (keyword-only, default `False`)
+    - not just on ASReml being enabled at all. `ASReml_phenotype.csv`
+    duplicates data already present as `actual` in
+    `Prediction_result_*.csv` and is read by no plot/summary consumer
+    (design blueprint R10 finding), so it is no longer produced by
+    default even for a run with ASREML fully configured - GP() passes
+    `bool(ASREML.get('write_phenotype_file', False))` here, the escape
+    hatch for a caller that genuinely wants it back (I11: absent key ->
+    `False` -> file not written, a deliberate, disclosed behaviour
+    change for old configs, exactly like R6's `ACCURACY_BUBBLE_PLOT_
+    CREATE`).
+
+    Update ID ver4-25, R9-S0/R3: `asreml_fit_timing` and `asreml_
+    accuracy_ctx` are gated on `asreml_enabled` alone (like `asreml_
+    varcomp`) - both are diagnostic/durability accumulators that exist
+    whenever ASReml runs at all, independent of `write_phenotype_file`.
+
+    Update ID ver4-25, R8 Stage 6 completion: `asreml_test_weights`
+    (keyword-only, default `'none'` - I11) is gated on a THIRD,
+    independent condition beyond `asreml_enabled` - `asreml_blue_
+    weighting == 'full'` - since the dense per-scenario weight matrix
+    this file holds is only ever computed at all under `'full'`-mode
+    BLUE-reliability weighting; a `'none'`/`'diagonal'`-mode run (or
+    ASReml off entirely) never creates the file, exactly like every
+    other config-selection-driven (not data-driven) flag here.
+
+    Update ID ver4-25, Stage 9 (design blueprint R12): `hparameters`
+    (keyword-only, default `None` - I11: `None` -> `interactions_hok`
+    always `False` -> the file is never written, byte-identical to this
+    parameter not existing at all) is GP()'s own `HPARAMETERS` dict.
+    `interactions_hok` is `True` iff at least one selected model's own
+    'Marker interaction method' is a shapiq-based choice AND its own
+    'Interaction orders to search for' includes an order >= 3 - see
+    `_model_requests_higher_order_interactions()` above. Unlike
+    `interactions`/`attention_total` (gated on model_registry.py's own
+    static per-model capability flags alone), this is the first
+    conditional-file flag that also has to inspect a model's own
+    HPARAMETERS *value*, not just which models were selected - because
+    "can this model ever emit a k>=3 row" depends on a field choice, not
+    on the model's identity alone (a config with SVR selected but its
+    own 'Marker interaction method' left at 'friedman_h' must not create
+    an (empty) Interaction_higher_order.csv, any more than a config with
+    RF selected but `get_interaction=False` creates a Marker-pair-free
+    Interaction.csv).
+
+    Update ID ver4-7, R1 ("Per-Set GRM Generation for GBLUP"):
+    `asreml_per_set_grm` (keyword-only, default `False` - every
+    pre-ver4-7 call site is unaffected, I11) gates the 3 new
+    'grm_train'/'grm_valid'/'grm_test' diagnostic-matrix keys identically
+    - written whenever ASReml is enabled AND `ASREML['per_set_grm']` is
+    True (GP() passes `asreml_syntax.resolve_per_set_grm(ASREML)` here),
+    regardless of whether any of the three splits' own matrix happens to
+    be non-empty yet at a given save point.
+
+    Update ID ver4-26, R4: `joint_w_opt` (keyword-only, default `None` -
+    every pre-ver4-26 call site is unaffected, I11) is GP()'s own
+    JOINT_W_OPT parameter - OR'd into the 'weight' flag alongside `w_opt`
+    so Weight.csv is still written under joint-only mode (GP() forces
+    `w_opt` to `None` whenever JOINT_W_OPT is active - see that
+    function's own mutual-exclusion resolution near MODEL_RUN).
+
+    Update ID ver4-57, R2/R4: `iterative_ensemble` (keyword-only, default `None` - every
+    pre-ver4-57 call site is unaffected, I11) is GP()'s resolved ITERATIVE_ENSEMBLE dict.
+    When it is set, 'weight' is also True (the Iterative ensemble writes an equal-weight row
+    to Weight.csv) and 'iter_rounds' is True unless the dict's `write_rounds` is False
+    (Iterative_ensemble_rounds.csv is created only then).
+
+    Update ID ver4-77, R2: `super_learner` (keyword-only, default `None` - every pre-ver4-77 call
+    site is unaffected, I11) is GP()'s resolved SUPER_LEARNER dict. When it is set, 'weight' is
+    also True (the Super learner writes its cross-validated member weights as a Weight.csv row).
+    No other flag changes: the Super learner adds no result file of its own.
+    """
     # Update ID ver4-5, R2 (blueprint §4.4, invariant I14): both flags now
     # read model_registry.py's single source of truth instead of a
     # hardcoded 'RF'/two-name-tuple comparison - 'interactions' used to be
@@ -355,7 +878,36 @@ def static_write_flags_for(model_run: list, w_opt) -> dict:
     return {
         'interactions': any(emits_interactions(schema_key_of(base_of(m))) for m in model_run),
         'attention_total': any(emits_attention(schema_key_of(base_of(m))) for m in model_run),
-        'weight': w_opt is not None,
+        # ver4-26, R4 (design blueprint hand-off checklist item 3;
+        # Change Summary Sec.7 - genuine blueprint gap, corrected per
+        # this template's own "existing code behaviour" > blueprint
+        # authority order): GP() always forces W_OPT to None whenever
+        # JOINT_W_OPT is active (its own mutual-exclusion resolution),
+        # so `w_opt is not None` alone would silently stop Weight.csv
+        # being written under joint-only mode - `joint_w_opt` (keyword-
+        # only, default `None` - every pre-ver4-26 call site is
+        # unaffected, I11) OR'd in exactly like every other independent
+        # condition on this dict.
+        'weight': (w_opt is not None or joint_w_opt is not None
+                   or iterative_ensemble is not None or super_learner is not None),
+        'asreml_pheno': asreml_enabled and asreml_write_phenotype,
+        'asreml_varcomp': asreml_enabled,
+        'asreml_fit_timing': asreml_enabled,
+        'asreml_accuracy_ctx': asreml_enabled,
+        'asreml_test_weights': asreml_enabled and asreml_blue_weighting == 'full',
+        'interactions_hok': bool(hparameters) and any(
+            _model_requests_higher_order_interactions(base_of(m), hparameters.get(base_of(m)))
+            for m in model_run
+        ),
+        # ver4-7, R1 ("Per-Set GRM Generation for GBLUP") - written only
+        # when `ASREML['per_set_grm']=True`; every other run never
+        # creates the ASReml/GRM_{split}.csv diagnostic files at all.
+        'grm_train': asreml_enabled and asreml_per_set_grm,
+        'grm_valid': asreml_enabled and asreml_per_set_grm,
+        'grm_test': asreml_enabled and asreml_per_set_grm,
+        # ver4-57, R4: only when the iterative ensemble is on and its diagnostics are wanted.
+        'iter_rounds': (isinstance(iterative_ensemble, dict)
+                        and bool(iterative_ensemble.get('write_rounds', True))),
     }
 
 
@@ -683,6 +1235,17 @@ def append_partial_results(result_name: str, idx: int, parallel: bool, delta_fra
     paths = result_file_paths(result_name, idx, parallel, compression=compression)
     base_dir = result_dir_path(result_name)
     os.makedirs(base_dir, exist_ok=True)
+    # Update ID ver4-12, R10/R11a (Appendix A finding A9): the two new
+    # ASReml keys live under a SUBFOLDER ('ASReml/...') of the result
+    # directory - the base_dir makedirs() just above only ever created the
+    # top-level folder itself, never any subfolder a key's own filename may
+    # embed. Creating every key's own parent directory here (idempotent,
+    # and a plain no-op for the eight keys with no subfolder at all, since
+    # os.path.dirname(path) == base_dir for those) is what lets `_append()`
+    # below write straight into 'ASReml/...' without every call site having
+    # to know which keys happen to nest into a subfolder.
+    for _path in paths.values():
+        os.makedirs(os.path.dirname(_path), exist_ok=True)
 
     def _append(key: str) -> None:
         df = delta_frames[key]
@@ -690,8 +1253,128 @@ def append_partial_results(result_name: str, idx: int, parallel: bool, delta_fra
             return
         path = paths[key]
         _file_exists = os.path.isfile(path)
+        _compression = 'gzip' if path.endswith('.gz') else None
+        # ver4-25, R8 bugfix (Requirements2.md, Error #1) - defensive
+        # safety net: an append's own `header=not _file_exists` only ever
+        # writes a header ONCE, for whichever delta happens to be the
+        # FIRST one this file ever sees - every LATER delta's columns are
+        # written in ITS OWN order/width with no header at all, and
+        # pandas' `to_csv()` never checks that they still match the
+        # on-disk header. If some upstream accumulator's own column set
+        # ever drifts between tasks (the exact root cause tracked down
+        # for 'record'/Metric.csv - see genomic_prediction.py's own
+        # `_blue_weighting_extra_cols` fix - and the reason it is fixed
+        # AT THE SOURCE there, so this schema is now stable by
+        # construction), an unnoticed drift anywhere else would silently
+        # misalign a whole row's worth of values under the wrong column
+        # names, or leave a later, genuinely NEW column's values with no
+        # header for them at all - never a loud failure, just quietly
+        # wrong output. Reindexing every delta to the EXISTING on-disk
+        # header (once one exists) converts that into the loud,
+        # unconditional NOTE architecture doc SS18 already requires
+        # elsewhere in this codebase: a column this delta lacks reads
+        # back as blank/NaN (never fabricated), and a column this delta
+        # has that the on-disk header does NOT is dropped (never
+        # silently appended past the end of an established header) -
+        # both logged, once per key per process, rather than either
+        # happening invisibly. A file's FIRST-ever append (no existing
+        # header to compare against) is completely unaffected - the
+        # common case remains a zero-overhead straight `to_csv()`.
+        #
+        # Bugfix (weighted-ensemble combining weights silently lost):
+        # `key == 'weight'` is NOT a fixed-schema accumulator like
+        # 'record'/'stats' - its own columns are one column PER BASE
+        # MODEL actually selected into that task's/method's ensemble
+        # (see models/{Bayesian_optimisation,Analytic_least_squares,
+        # Nelder_Mead,Linear_transformation}.py's own `weight_extracted`),
+        # which legitimately differs from task to task (different
+        # populations/phenotypes can select different base models) and
+        # even in COLUMN ORDER between two methods run for the SAME task.
+        # Applying the drop-unknown-columns safety net above to THIS key
+        # silently discarded every real combining-weight value the very
+        # first delta's own model selection didn't happen to include -
+        # confirmed by direct reproduction: a second task selecting a
+        # different model subset had its own real weights reindexed away
+        # entirely, leaving Weight.csv with only its 5 base identity
+        # columns and no weight values at all. For keys in
+        # `_DYNAMIC_SCHEMA_KEYS`, a column-set mismatch is therefore
+        # reconciled by WIDENING the on-disk file (rewriting it in place
+        # with the union of both column sets, backfilling every earlier
+        # row's new column(s) with blank/NaN) rather than dropping the
+        # new delta's own columns - nothing with a real value is ever
+        # discarded. Every other (genuinely fixed-schema) key keeps the
+        # original drop-and-NOTE behaviour above, unchanged (I11).
+        if _file_exists:
+            try:
+                _existing_header = list(pd.read_csv(path, nrows=0).columns)
+            except _INCOMPLETE_FILE_ERRORS:
+                _existing_header = None
+            if _existing_header is not None and list(df.columns) != _existing_header:
+                _new_cols = [c for c in df.columns if c not in _existing_header]
+                _missing_cols = [c for c in _existing_header if c not in df.columns]
+                if key in _DYNAMIC_SCHEMA_KEYS and _new_cols:
+                    _widened = False
+                    if _new_cols:
+                        try:
+                            _existing_df = pd.read_csv(path)
+                        except _INCOMPLETE_FILE_ERRORS:
+                            _existing_df = None
+                        if _existing_df is not None:
+                            _union_header = _existing_header + _new_cols
+                            _existing_df.reindex(columns=_union_header).to_csv(
+                                path, index=False, compression=_compression,
+                            )
+                            _existing_header = _union_header
+                            _widened = True
+                    if _widened:
+                        print(f"[checkpoint_utils] NOTE: {os.path.basename(path)}'s own on-disk "
+                              f"header for key {key!r} did not include column(s) {_new_cols} that "
+                              f"this delta's own row(s) use (e.g. a base model newly selected for "
+                              f"this run's weighted ensemble) - WIDENED the existing file in place "
+                              f"to include them (earlier row(s) backfilled with blank values for "
+                              f"the new column(s)) rather than dropping this delta's own weight "
+                              f"values. Column(s) added: {_new_cols}. Column(s) this delta itself "
+                              f"lacks (written blank for it, as usual): {_missing_cols or 'none'}.")
+                    else:
+                        print(f"[checkpoint_utils] NOTE: {os.path.basename(path)}'s own on-disk "
+                              f"header for key {key!r} does not match this delta's columns, and "
+                              f"the existing file could not be re-read to widen it (possibly "
+                              f"incomplete/mid-write) - falling back to reindexing this delta to "
+                              f"the existing header, so the file itself never becomes ragged. "
+                              f"Column(s) only in this delta (dropped): {_new_cols or 'none'}. "
+                              f"Column(s) only in the existing header (written blank for this "
+                              f"delta): {_missing_cols or 'none'}.")
+                elif key in _DYNAMIC_SCHEMA_KEYS:
+                    # No genuinely new column - just a different column
+                    # ORDER (or this delta is missing some columns the
+                    # existing header has). Reindexing to the existing
+                    # header realigns every value under its own correct
+                    # column name; nothing is dropped, since every one of
+                    # this delta's own columns is already present in
+                    # `_existing_header` in this branch.
+                    print(f"[checkpoint_utils] NOTE: {os.path.basename(path)}'s own on-disk header "
+                          f"for key {key!r} lists this delta's own columns in a different order (or "
+                          f"this delta is missing some) - realigning this delta to the existing "
+                          f"header/order before appending; no value is dropped. Column(s) only in "
+                          f"the existing header (written blank for this delta): "
+                          f"{_missing_cols or 'none'}.")
+                else:
+                    print(f"[checkpoint_utils] NOTE: {os.path.basename(path)}'s own on-disk header "
+                          f"does not match this delta's columns for key {key!r} - reindexing this "
+                          f"delta to the existing header before appending, so the file itself never "
+                          f"becomes ragged. Column(s) only in this delta (dropped): {_new_cols or 'none'}. "
+                          f"Column(s) only in the existing header (written blank for this delta): "
+                          f"{_missing_cols or 'none'}. This should not happen under normal operation - "
+                          f"if seen repeatedly, an accumulator's own column set is drifting between "
+                          f"tasks and the ROOT CAUSE should be fixed, not just this safety net.")
+                df = df.reindex(columns=_existing_header)
+                # `_file_exists` may now point at a file this call just
+                # rewrote WITH its own header (the widen branch above) -
+                # `header=not _file_exists` below still correctly stays
+                # `False` (the file exists either way), so the freshly
+                # rewritten header is never duplicated by this append.
         df.to_csv(path, mode='a', header=not _file_exists, index=False,
-                  compression='gzip' if path.endswith('.gz') else None)
+                  compression=_compression)
 
     # ALWAYS_WRITTEN_KEYS: unlike save_partial_results() (which writes
     # these unconditionally, even when empty, purely to guarantee the
@@ -709,10 +1392,42 @@ def append_partial_results(result_name: str, idx: int, parallel: bool, delta_fra
     _append('hp_record')
     if static_write_flags.get('interactions', False):
         _append('interactions')
+    # ver4-25, Stage 9 (R12) - see RESULT_FILE_NAMES' own comment for this
+    # key.
+    if static_write_flags.get('interactions_hok', False):
+        _append('interactions_hok')
     if static_write_flags.get('attention_total', False):
         _append('attention_total')
     if static_write_flags.get('weight', False):
         _append('weight')
+    # Update ID ver4-12, R10: gated by asreml_enabled (static_write_flags_
+    # for()'s own new flags), exactly like 'interactions'/'attention_total'/
+    # 'weight' above - a run with ASREML off never creates the ASReml/
+    # subfolder at all.
+    if static_write_flags.get('asreml_pheno', False):
+        _append('asreml_pheno')
+    if static_write_flags.get('asreml_varcomp', False):
+        _append('asreml_varcomp')
+    # ver4-25, R9-S0/R3: same conditional-append pattern, gated by the
+    # same two new static_write_flags_for() keys.
+    if static_write_flags.get('asreml_fit_timing', False):
+        _append('asreml_fit_timing')
+    if static_write_flags.get('asreml_accuracy_ctx', False):
+        _append('asreml_accuracy_ctx')
+    # ver4-7, R1 ("Per-Set GRM Generation for GBLUP") - same conditional-
+    # append pattern as every other conditional ASReml key above, gated
+    # on static_write_flags_for()'s own new 'grm_train'/'grm_valid'/
+    # 'grm_test' keys.
+    if static_write_flags.get('grm_train', False):
+        _append('grm_train')
+    if static_write_flags.get('grm_valid', False):
+        _append('grm_valid')
+    if static_write_flags.get('grm_test', False):
+        _append('grm_test')
+    # ver4-57, R4: the Iterative ensemble's per-round diagnostics, only when
+    # static_write_flags_for() says the feature is on and `write_rounds` is set.
+    if static_write_flags.get('iter_rounds', False):
+        _append('iter_rounds')
 
 
 def save_partial_results(result_name: str, idx: int, parallel: bool, frames: dict,
@@ -744,22 +1459,86 @@ def save_partial_results(result_name: str, idx: int, parallel: bool, frames: dic
 
     paths = result_file_paths(result_name, idx, parallel, compression=compression)
     os.makedirs(result_dir_path(result_name), exist_ok=True)
+    # Update ID ver4-12, R10/R11a (Appendix A finding A9) - see
+    # append_partial_results()'s own identical comment; a no-op for every
+    # key with no subfolder in its own filename.
+    for _path in paths.values():
+        os.makedirs(os.path.dirname(_path), exist_ok=True)
 
+    # Requirements.md item 1 fix: every to_csv() call below that writes a
+    # key UNCONDITIONALLY (regardless of row count - ALWAYS_WRITTEN_KEYS,
+    # plus the model-selection-gated 'interactions'/'attention_total'/
+    # 'weight'/'asreml_pheno'/'asreml_varcomp' just below) now routes its
+    # frame through `_with_header_fallback()` first, so a key whose
+    # accumulator never received a single row still gets a proper header
+    # row on disk rather than a bare zero-byte file - see that function's
+    # own docstring and RESULT_FILE_BASE_COLUMNS' module-level comment for
+    # the full root-cause explanation. 'effect'/'hp_record' (written only
+    # when non-empty, further below) need no such fallback - they simply
+    # produce no file at all in that case, unaffected by this fix.
     for key in ALWAYS_WRITTEN_KEYS:
-        frames[key].to_csv(paths[key], index=False, compression=_compression_for(paths[key]))
+        _with_header_fallback(key, frames[key]).to_csv(
+            paths[key], index=False, compression=_compression_for(paths[key])
+        )
 
     if frames['effect'].shape[0] != 0:
         frames['effect'].to_csv(paths['effect'], index=False, compression=_compression_for(paths['effect']))
     if static_write_flags.get('interactions', False):
-        frames['interactions'].to_csv(paths['interactions'], index=False,
-                                       compression=_compression_for(paths['interactions']))
+        _with_header_fallback('interactions', frames['interactions']).to_csv(
+            paths['interactions'], index=False, compression=_compression_for(paths['interactions'])
+        )
+    # ver4-25, Stage 9 (R12) - see RESULT_FILE_NAMES' own comment for this
+    # key.
+    if static_write_flags.get('interactions_hok', False):
+        _with_header_fallback('interactions_hok', frames['interactions_hok']).to_csv(
+            paths['interactions_hok'], index=False, compression=_compression_for(paths['interactions_hok'])
+        )
     if static_write_flags.get('attention_total', False):
-        frames['attention_total'].to_csv(paths['attention_total'], index=False,
-                                          compression=_compression_for(paths['attention_total']))
+        _with_header_fallback('attention_total', frames['attention_total']).to_csv(
+            paths['attention_total'], index=False, compression=_compression_for(paths['attention_total'])
+        )
     if static_write_flags.get('weight', False):
-        frames['weight'].to_csv(paths['weight'], index=False, compression=_compression_for(paths['weight']))
+        _with_header_fallback('weight', frames['weight']).to_csv(
+            paths['weight'], index=False, compression=_compression_for(paths['weight'])
+        )
     if frames['hp_record'].shape[0] != 0:
         frames['hp_record'].to_csv(paths['hp_record'], index=False)
+    # Update ID ver4-12, R10: same asreml_enabled gating as
+    # append_partial_results() above.
+    if static_write_flags.get('asreml_pheno', False):
+        _with_header_fallback('asreml_pheno', frames['asreml_pheno']).to_csv(
+            paths['asreml_pheno'], index=False, compression=_compression_for(paths['asreml_pheno'])
+        )
+    if static_write_flags.get('asreml_varcomp', False):
+        _with_header_fallback('asreml_varcomp', frames['asreml_varcomp']).to_csv(
+            paths['asreml_varcomp'], index=False
+        )
+    # ver4-25, R9-S0/R3: same unconditional-on-selection, header-fallback
+    # pattern as every other conditional key above.
+    if static_write_flags.get('asreml_fit_timing', False):
+        _with_header_fallback('asreml_fit_timing', frames['asreml_fit_timing']).to_csv(
+            paths['asreml_fit_timing'], index=False
+        )
+    if static_write_flags.get('asreml_accuracy_ctx', False):
+        _with_header_fallback('asreml_accuracy_ctx', frames['asreml_accuracy_ctx']).to_csv(
+            paths['asreml_accuracy_ctx'], index=False,
+            compression=_compression_for(paths['asreml_accuracy_ctx'])
+        )
+    # ver4-7, R1 ("Per-Set GRM Generation for GBLUP") - same unconditional-
+    # on-selection, header-fallback pattern as every other conditional key
+    # above, gated on static_write_flags_for()'s own new 'grm_train'/
+    # 'grm_valid'/'grm_test' keys.
+    for _grm_key in ('grm_train', 'grm_valid', 'grm_test'):
+        if static_write_flags.get(_grm_key, False):
+            _with_header_fallback(_grm_key, frames[_grm_key]).to_csv(
+                paths[_grm_key], index=False, compression=_compression_for(paths[_grm_key])
+            )
+    # ver4-57, R4: same unconditional-on-selection, header-fallback pattern as every other
+    # conditional key above.
+    if static_write_flags.get('iter_rounds', False):
+        _with_header_fallback('iter_rounds', frames['iter_rounds']).to_csv(
+            paths['iter_rounds'], index=False
+        )
 
 
 def load_partial_results(result_name: str, idx: int, parallel: bool) -> dict:
